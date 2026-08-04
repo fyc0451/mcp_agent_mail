@@ -304,6 +304,33 @@ class ChannelReadCursor(SQLModel, table=True):
     updated_ts: datetime = Field(default_factory=_utcnow_naive)
 
 
+class MentionDelivery(SQLModel, table=True):
+    """Delivery mapping for an ``@mention`` inside a channel message.
+
+    Records that ``mentioned_agent_id`` was delivered a durable receipt
+    (``receipt_message_id``) for the channel message ``source_channel_message_id``.
+    Only successful deliveries are stored, so ``receipt_message_id`` is
+    non-nullable.
+
+    The mapping is unique per (source channel message, mentioned agent), but
+    multiple rows may reference the SAME receipt message: when several
+    mentioned agents live in the same project, one ``messages`` receipt row
+    addressed to multiple recipients is reused, so the duplicate delivery is
+    recorded once per mapping rather than once per recipient row.
+    """
+
+    __tablename__ = "mention_deliveries"
+    __table_args__ = (
+        UniqueConstraint("source_channel_message_id", "mentioned_agent_id", name="uq_mention_delivery"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    source_channel_message_id: int = Field(foreign_key="channel_messages.id")
+    mentioned_agent_id: int = Field(foreign_key="agents.id", index=True)
+    receipt_message_id: int = Field(foreign_key="messages.id")
+    created_ts: datetime = Field(default_factory=_utcnow_naive)
+
+
 class ProjectSiblingSuggestion(SQLModel, table=True):
     """LLM-ranked sibling project suggestion (undirected pair)."""
 
