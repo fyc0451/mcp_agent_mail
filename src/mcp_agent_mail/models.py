@@ -201,6 +201,47 @@ class MessageSummary(SQLModel, table=True):
     created_ts: datetime = Field(default_factory=_utcnow_naive)
 
 
+class Channel(SQLModel, table=True):
+    """Project-scoped public channel (the ``channel:<slug>`` recipient).
+
+    A channel belongs to exactly one project (project-scoped). Agents subscribe
+    via :class:`ChannelSubscription`, and may subscribe to channels of other
+    projects. Channel identity within a project is the ``name``, unique per
+    project.
+    """
+
+    __tablename__ = "channels"
+    __table_args__ = (
+        UniqueConstraint("project_id", "name", name="uq_channel_project_name"),
+        Index("idx_channels_project_created", "project_id", "created_ts"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    project_id: int = Field(foreign_key="projects.id")
+    name: str = Field(max_length=128)
+    created_ts: datetime = Field(default_factory=_utcnow_naive)
+
+
+class ChannelSubscription(SQLModel, table=True):
+    """Cross-project channel subscription (server-side subscriber table).
+
+    Associates an agent with a channel so that the agent receives the
+    channel's fanout. An agent defaults to its registration project but may
+    subscribe to channels of other projects; the subscription is uniquely
+    identified by ``(channel_id, agent_id)``.
+    """
+
+    __tablename__ = "channel_subscriptions"
+    __table_args__ = (
+        UniqueConstraint("channel_id", "agent_id", name="uq_channel_subscription"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    channel_id: int = Field(foreign_key="channels.id")
+    agent_id: int = Field(foreign_key="agents.id", index=True)
+    created_ts: datetime = Field(default_factory=_utcnow_naive)
+
+
 class ProjectSiblingSuggestion(SQLModel, table=True):
     """LLM-ranked sibling project suggestion (undirected pair)."""
 
