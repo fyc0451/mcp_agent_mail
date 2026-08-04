@@ -244,6 +244,79 @@ def sanitize_agent_name(value: str) -> Optional[str]:
     return cleaned[:128]
 
 
+# Markdown-aware @-mention extraction for channel message bodies. The accepted
+# name shape mirrors valid explicit agent ids (see _THREAD_ID_RE): ASCII
+# alphanumeric start, then [A-Za-z0-9._-], max 128 — so dot-bearing ids like
+# "alpha.one" and digit-led ids like "9-worker" are accepted. A trailing '.' is
+# trimmed so a sentence-final "@Name." still yields "Name", while a mid-name '.'
+# is kept ("@foo.bar" -> "foo.bar", never truncated to "foo"). Explicit cross-
+# project prose addressing ("@Name@project", "@project:slug#Name") is NOT
+# supported by the initial 3c and is rejected wholesale to avoid misdelivery.
+_CHANNEL_MENTION_NAME_RE = re.compile(r"(?<![\w@])@([A-Za-z0-9][A-Za-z0-9._-]{0,127})(?![A-Za-z0-9._-])")
+# A fenced block is either a closed ```...``` pair or, if never closed, code
+# through end-of-string — an unclosed fence must not leak its @ tokens.
+_FENCED_CODE_SPAN_RE = re.compile(r"```.*?(?:```|\Z)", re.DOTALL)
+_INLINE_CODE_SPAN_RE = re.compile(r"`[^`\n]*`")
+
+
+def _is_explicit_id_body_char(ch: str) -> bool:
+    """Whether a character may continue an explicit agent id body."""
+    return bool(ch) and ch.isascii() and (ch.isalnum() or ch in "._-")
+
+
+def extract_channel_mentions(body_md: str) -> list[str]:
+    """Extract @-mention name tokens from a markdown body, code/email-safe.
+
+    Pure syntax extraction only — returns first-occurrence-ordered, case-
+    insensitive-deduplicated names, preserving the first-seen spelling. Does
+    NOT resolve whether the names are registered agents; a downstream resolver
+    silently skips unknown names.
+
+    Accepted name shape mirrors valid explicit agent ids (alphanumeric start,
+    [A-Za-z0-9._-] body, max 128): "BlueLake", "opencode-main", "alpha.one",
+    "9-worker". A trailing '.' is trimmed ("@Name." -> "Name") but a mid-name
+    '.' is kept ("@foo.bar" -> "foo.bar", never truncated to "foo").
+
+    Ignored: fenced ``` (closed or unclosed-to-EOF) and inline `code` spans,
+    email like a@b.com, "@@name", and explicit cross-project prose addressing
+    ("@Name@project", "@project:slug#Name") which the initial 3c does not
+    support. Ordinary punctuation boundaries ("@Name," / "@Name!" / "@Name:"
+    before whitespace) yield the bare name.
+    """
+    if not body_md:
+        return []
+    # Strip code spans first so @tokens inside code are never extracted.
+    stripped = _FENCED_CODE_SPAN_RE.sub(" ", body_md)
+    stripped = _INLINE_CODE_SPAN_RE.sub(" ", stripped)
+    seen: set[str] = set()
+    names: list[str] = []
+    for match in _CHANNEL_MENTION_NAME_RE.finditer(stripped):
+        name = match.group(1)
+        # The trailing-dot negative-lookahead above already rejected any token
+        # whose next char is still an id-body char (so 129-char tokens, or a
+        # 128-char id followed by another id char, are NOT truncated to 128 and
+        # accepted). Here a trailing '.' that DID land inside the match is treated
+        # as sentence punctuation in prose (the id grammar permits a trailing dot,
+        # but a mention reads as a natural-language token), so trim it.
+        candidate = name.rstrip(".")
+        if not candidate or not _THREAD_ID_RE.fullmatch(candidate):
+            continue
+        # Reject explicit cross-project prose addressing so it cannot degrade
+        # into a bare mention and misdeliver: "@Name@project" (next char '@')
+        # and "@project:slug#Name" (':' followed by an id-body char).
+        end = match.end()
+        tail = stripped[end:end + 1]
+        if tail == "@":
+            continue
+        if tail == ":" and _is_explicit_id_body_char(stripped[end + 1:end + 2]):
+            continue
+        key = candidate.lower()
+        if key not in seen:
+            seen.add(key)
+            names.append(candidate)
+    return names
+
+
 def validate_thread_id_format(thread_id: str) -> bool:
     """Validate that a thread_id is safe for filenames and indexing.
 
