@@ -244,6 +244,97 @@ def sanitize_agent_name(value: str) -> Optional[str]:
     return cleaned[:128]
 
 
+_CHANNEL_MENTION_RE = re.compile(
+    r"(?<![\w@])@([A-Za-z0-9][A-Za-z0-9._-]{0,127})(?![A-Za-z0-9._-])"
+)
+_FENCE_OPEN_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
+_BACKTICK_RUN_RE = re.compile(r"`+")
+
+
+def _mask_markdown_code(text: str) -> str:
+    """Blank Markdown code while preserving offsets and line boundaries."""
+    masked_lines: list[str] = []
+    fence_char = ""
+    fence_length = 0
+    for line in text.splitlines(keepends=True):
+        content = line.rstrip("\r\n")
+        leading_spaces = len(content) - len(content.lstrip(" "))
+        stripped = content[leading_spaces:]
+        if fence_char:
+            masked_lines.append("".join(ch if ch in "\r\n" else " " for ch in line))
+            if leading_spaces <= 3 and stripped.startswith(fence_char * fence_length):
+                run_length = len(stripped) - len(stripped.lstrip(fence_char))
+                if run_length >= fence_length and not stripped[run_length:].strip():
+                    fence_char = ""
+                    fence_length = 0
+            continue
+
+        opener = _FENCE_OPEN_RE.match(content)
+        if opener and not (opener.group(1).startswith("`") and "`" in content[opener.end():]):
+            fence_char = opener.group(1)[0]
+            fence_length = len(opener.group(1))
+            masked_lines.append("".join(ch if ch in "\r\n" else " " for ch in line))
+        elif content.startswith("\t") or content.startswith("    "):
+            masked_lines.append("".join(ch if ch in "\r\n" else " " for ch in line))
+        else:
+            masked_lines.append(line)
+
+    masked = "".join(masked_lines)
+    chars = list(masked)
+    position = 0
+    while opener := _BACKTICK_RUN_RE.search(masked, position):
+        run_length = opener.end() - opener.start()
+        closer = _BACKTICK_RUN_RE.search(masked, opener.end())
+        while closer is not None and closer.end() - closer.start() != run_length:
+            closer = _BACKTICK_RUN_RE.search(masked, closer.end())
+        end = closer.end() if closer is not None else len(masked)
+        for index in range(opener.start(), end):
+            if chars[index] not in "\r\n":
+                chars[index] = " "
+        position = end
+    return "".join(chars)
+
+
+def _mention_is_in_url_or_path(text: str, start: int, end: int) -> bool:
+    token_start = start
+    while token_start > 0 and not text[token_start - 1].isspace():
+        token_start -= 1
+    prefix = text[token_start:start]
+    if "/" in prefix or "](" in prefix or any(marker in prefix for marker in ("?", "#", "&", "=")):
+        return True
+    if re.search(r"(?:https?|ftp|file|mailto):$", prefix, re.IGNORECASE):
+        return True
+    return text[end:end + 1] == "/"
+
+
+def _is_explicit_id_body_char(ch: str) -> bool:
+    return bool(ch) and ch.isascii() and (ch.isalnum() or ch in "._-")
+
+
+def extract_channel_mentions(body_md: str) -> list[str]:
+    """Extract bare @agent ids from Markdown, excluding code and URL contexts."""
+    if not body_md:
+        return []
+    text = _mask_markdown_code(body_md)
+    names: list[str] = []
+    seen: set[str] = set()
+    for match in _CHANNEL_MENTION_RE.finditer(text):
+        candidate = match.group(1).rstrip(".")
+        if not candidate or not _THREAD_ID_RE.fullmatch(candidate):
+            continue
+        end = match.end()
+        tail = text[end:end + 1]
+        if tail == "@" or (tail == ":" and _is_explicit_id_body_char(text[end + 1:end + 2])):
+            continue
+        if _mention_is_in_url_or_path(text, match.start(), end):
+            continue
+        key = candidate.lower()
+        if key not in seen:
+            seen.add(key)
+            names.append(candidate)
+    return names
+
+
 def validate_thread_id_format(thread_id: str) -> bool:
     """Validate that a thread_id is safe for filenames and indexing.
 

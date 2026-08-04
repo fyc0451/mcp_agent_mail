@@ -64,6 +64,7 @@ from .models import (
     ChannelReadCursor,
     ChannelSubscription,
     FileReservation,
+    MentionDelivery,
     Message,
     MessageRecipient,
     MessageSummary,
@@ -89,6 +90,7 @@ from .storage import (
     write_message_bundle,
 )
 from .utils import (
+    extract_channel_mentions,
     generate_agent_name,
     sanitize_agent_name,
     slugify,
@@ -185,6 +187,22 @@ class ChannelMessageDTO(TypedDict):
     body_md: str
     importance: str
     created_ts: str
+
+
+class ChannelMentionDeliveryDTO(TypedDict):
+    """Public outcome for one syntactically valid channel @mention."""
+
+    name: str
+    target_project_key: Optional[str]
+    status: str
+    receipt_message_id: Optional[int]
+    reason: Optional[str]
+
+
+class ChannelMessagePostDTO(ChannelMessageDTO):
+    """Additive post response; channel history keeps using ChannelMessageDTO."""
+
+    mention_deliveries: list[ChannelMentionDeliveryDTO]
 
 
 class ChannelMessagesFetchDTO(TypedDict):
@@ -4086,6 +4104,309 @@ async def _create_message(
     return message
 
 
+@dataclass(frozen=True)
+class _ChannelMentionResolution:
+    """Internal resolver result; only approved safe fields reach the response."""
+
+    name: str
+    agent: Agent | None = None
+    project: Project | None = None
+    reason: str | None = None
+
+
+async def _resolve_channel_mentions(
+    channel_project: Project,
+    sender: Agent,
+    names: Sequence[str],
+) -> list[_ChannelMentionResolution]:
+    """Resolve bare channel mentions using the approved local/cross-link rules."""
+    if channel_project.id is None or sender.id is None:
+        raise ValueError("Channel project and sender must have ids before resolving mentions.")
+
+    ordered_names: list[str] = []
+    seen: set[str] = set()
+    for name in names:
+        key = name.lower()
+        if key not in seen:
+            seen.add(key)
+            ordered_names.append(name)
+    if not ordered_names:
+        return []
+
+    lookup_keys = [name.lower() for name in ordered_names]
+    async with get_session() as session:
+        sender_project = await session.get(Project, sender.project_id)
+        if sender_project is None:
+            raise NoResultFound(f"Sender project id '{sender.project_id}' no longer exists.")
+
+        local_rows = await session.execute(
+            select(Agent).where(
+                cast(Any, Agent.project_id == channel_project.id),
+                func.lower(Agent.name).in_(lookup_keys),
+            )
+        )
+        local_by_name = {agent.name.lower(): agent for agent in local_rows.scalars().all()}
+
+        link_rows = await session.execute(
+            select(AgentLink, Project, Agent)
+            .join(Project, cast(Any, Project.id == AgentLink.b_project_id))
+            .join(Agent, cast(Any, Agent.id == AgentLink.b_agent_id))
+            .where(
+                cast(Any, AgentLink.a_project_id == sender.project_id),
+                cast(Any, AgentLink.a_agent_id == sender.id),
+                cast(Any, AgentLink.b_project_id != sender.project_id),
+                func.lower(Agent.name).in_(lookup_keys),
+                _active_approved_agent_link_clause(),
+            )
+        )
+        cross_by_name: dict[str, list[tuple[Project, Agent]]] = defaultdict(list)
+        cross_seen: dict[str, set[int]] = defaultdict(set)
+        for _link, project, agent in link_rows.all():
+            key = agent.name.lower()
+            if agent.id is None or agent.id in cross_seen[key]:
+                continue
+            cross_seen[key].add(agent.id)
+            cross_by_name[key].append((project, agent))
+
+    resolutions: list[_ChannelMentionResolution] = []
+    sender_key = sender.name.lower()
+    for name in ordered_names:
+        key = name.lower()
+        if key == sender_key:
+            resolutions.append(_ChannelMentionResolution(name=name, agent=sender, project=sender_project))
+            continue
+
+        cross_matches = cross_by_name.get(key, [])
+        if len(cross_matches) > 1:
+            resolutions.append(_ChannelMentionResolution(name=name, reason="ambiguous"))
+            continue
+        if cross_matches:
+            project, agent = cross_matches[0]
+        else:
+            agent = local_by_name.get(key)
+            project = channel_project if agent is not None else None
+        if agent is None or project is None:
+            resolutions.append(_ChannelMentionResolution(name=name, reason="unknown"))
+        elif agent.contact_policy == "block_all":
+            resolutions.append(_ChannelMentionResolution(name=name, agent=agent, project=project, reason="block_all"))
+        else:
+            resolutions.append(_ChannelMentionResolution(name=name, agent=agent, project=project))
+    return resolutions
+
+
+async def _delete_mention_receipt(message_id: int) -> None:
+    """Best-effort compensation for a receipt whose archive write failed."""
+    async with get_session() as session:
+        await session.execute(
+            delete(MentionDelivery).where(cast(Any, MentionDelivery.receipt_message_id == message_id))
+        )
+        await session.execute(
+            delete(MessageRecipient).where(cast(Any, MessageRecipient.message_id == message_id))
+        )
+        await session.execute(delete(Message).where(cast(Any, Message.id == message_id)))
+        await session.commit()
+
+
+async def _write_channel_mention_receipt(
+    target_project: Project,
+    sender: Agent,
+    source: ChannelMessage,
+    recipients: Sequence[Agent],
+) -> dict[int, tuple[str, int | None]]:
+    """Atomically create one receipt group, then archive or compensate it.
+
+    The returned mapping is agent id -> (delivered status, receipt id). Existing
+    mappings are reported as already_delivered. A caller turns archive or DB
+    failures into target_failed without exposing exception details.
+    """
+    if target_project.id is None or sender.id is None or source.id is None:
+        raise ValueError("Target project, sender, and source message must have ids.")
+
+    by_id = {agent.id: agent for agent in recipients if agent.id is not None}
+    if not by_id:
+        return {}
+    agent_ids = list(by_id)
+    settings = get_settings()
+    archive = await ensure_archive(settings, target_project.slug)
+    sender_project = (
+        target_project if sender.project_id == target_project.id else await _get_project_by_id(sender.project_id)
+    )
+
+    async with _archive_write_lock(archive):
+        existing: dict[int, int] = {}
+        message: Message | None = None
+        new_recipients: list[Agent] = []
+        for attempt in range(3):
+            async with get_session() as session:
+                existing_rows = await session.execute(
+                    select(MentionDelivery).where(
+                        cast(Any, MentionDelivery.source_channel_message_id == source.id),
+                        cast(Any, MentionDelivery.mentioned_agent_id).in_(agent_ids),
+                    )
+                )
+                existing = {
+                    row.mentioned_agent_id: row.receipt_message_id
+                    for row in existing_rows.scalars().all()
+                }
+                new_recipients = [agent for agent_id, agent in by_id.items() if agent_id not in existing]
+                if not new_recipients:
+                    return {
+                        agent_id: ("already_delivered", receipt_id)
+                        for agent_id, receipt_id in existing.items()
+                    }
+
+                message = Message(
+                    project_id=target_project.id,
+                    sender_id=sender.id,
+                    subject=source.subject,
+                    body_md=source.body_md,
+                    importance=source.importance,
+                    ack_required=False,
+                    attachments=list(source.attachments),
+                )
+                session.add(message)
+                await session.flush()
+                assert message.id is not None
+                for recipient in new_recipients:
+                    assert recipient.id is not None
+                    session.add(
+                        MessageRecipient(message_id=message.id, agent_id=recipient.id, kind="mention")
+                    )
+                    session.add(
+                        MentionDelivery(
+                            source_channel_message_id=source.id,
+                            mentioned_agent_id=recipient.id,
+                            receipt_message_id=message.id,
+                        )
+                    )
+                try:
+                    await session.commit()
+                    await session.refresh(message)
+                    break
+                except IntegrityError:
+                    await session.rollback()
+                    message = None
+                    # A concurrent uq_mention_delivery winner is resolved by
+                    # the next query. Other integrity failures safely exhaust
+                    # the bounded retries and become target_failed upstream.
+                    if attempt == 2:
+                        raise
+        if message is None or message.id is None:
+            raise RuntimeError("Mention receipt was not created.")
+
+        frontmatter = _message_frontmatter(
+            message,
+            target_project,
+            sender,
+            sender_project,
+            new_recipients,
+            [],
+            [],
+            list(source.attachments),
+        )
+        recipients_for_archive = [agent.name for agent in new_recipients]
+        sender_archive_label = _sender_display_name(
+            message_project_id=target_project.id,
+            sender_name=sender.name,
+            sender_project_id=sender_project.id,
+            sender_project_slug=sender_project.slug,
+        )
+        try:
+            await write_message_bundle(
+                archive,
+                frontmatter,
+                source.body_md,
+                sender_archive_label,
+                recipients_for_archive,
+                [],
+                sender_outbox_name=sender.name if sender.project_id == target_project.id else None,
+            )
+        except Exception:
+            with suppress(Exception):
+                await _delete_mention_receipt(message.id)
+            raise
+
+    statuses: dict[int, tuple[str, int | None]] = {
+        agent_id: ("already_delivered", receipt_id)
+        for agent_id, receipt_id in existing.items()
+    }
+    statuses.update(
+        {
+            agent.id: ("delivered", message.id)
+            for agent in new_recipients
+            if agent.id is not None
+        }
+    )
+    return statuses
+
+
+async def _deliver_channel_mentions(
+    ctx: Context,
+    channel_project: Project,
+    sender: Agent,
+    source: ChannelMessage,
+    names: Sequence[str],
+) -> list[ChannelMentionDeliveryDTO]:
+    """Best-effort durable receipt fanout, grouped by target project."""
+    resolutions = await _resolve_channel_mentions(channel_project, sender, names)
+    outcomes: list[ChannelMentionDeliveryDTO | None] = [None] * len(resolutions)
+    groups: dict[int, tuple[Project, list[tuple[int, _ChannelMentionResolution]]]] = {}
+
+    for index, resolution in enumerate(resolutions):
+        if resolution.reason is not None:
+            outcomes[index] = {
+                "name": resolution.name,
+                "target_project_key": resolution.project.human_key if resolution.project else None,
+                "status": "skipped",
+                "receipt_message_id": None,
+                "reason": resolution.reason,
+            }
+            continue
+        if resolution.agent is None or resolution.agent.id is None or resolution.project is None:
+            raise RuntimeError("Resolved mention is missing its target identity.")
+        if resolution.project.id is None:
+            raise RuntimeError("Resolved mention project is missing its id.")
+        group = groups.setdefault(resolution.project.id, (resolution.project, []))
+        group[1].append((index, resolution))
+
+    for project, members in groups.values():
+        agents = [resolution.agent for _index, resolution in members if resolution.agent is not None]
+        try:
+            statuses = await _write_channel_mention_receipt(project, sender, source, agents)
+        except Exception:
+            logger.exception(
+                "Failed to deliver channel mention receipts for channel_message=%s target_project=%s",
+                source.id,
+                project.human_key,
+            )
+            with suppress(Exception):
+                await ctx.info(
+                    f"Channel mention receipt delivery failed for target project '{project.human_key}'."
+                )
+            for index, resolution in members:
+                outcomes[index] = {
+                    "name": resolution.name,
+                    "target_project_key": project.human_key,
+                    "status": "skipped",
+                    "receipt_message_id": None,
+                    "reason": "target_failed",
+                }
+            continue
+
+        for index, resolution in members:
+            assert resolution.agent is not None and resolution.agent.id is not None
+            status, receipt_message_id = statuses[resolution.agent.id]
+            outcomes[index] = {
+                "name": resolution.name,
+                "target_project_key": project.human_key,
+                "status": status,
+                "receipt_message_id": receipt_message_id,
+                "reason": None,
+            }
+
+    return [outcome for outcome in outcomes if outcome is not None]
+
+
 async def _create_file_reservation(
     project: Project,
     agent: Agent,
@@ -7589,7 +7910,7 @@ def build_mcp_server() -> FastMCP:
 
     @mcp.tool(
         name="post_channel_message",
-        description="Post a message to a project channel (channel history only; no per-recipient fanout rows).",
+        description="Post channel history and durable inbox receipts for bare @mentions.",
     )
     @_instrument_tool(
         "post_channel_message",
@@ -7611,7 +7932,7 @@ def build_mcp_server() -> FastMCP:
         registration_token: Optional[str] = None,
         format: Optional[str] = None,
     ) -> dict[str, Any]:
-        """Post a message to a channel; writes only ChannelMessage rows."""
+        """Post channel history, then best-effort durable @mention receipts."""
         name = _validate_channel_name(channel_name)
         channel_project = await _get_project_by_identifier(channel_project_key)
         sender_project = await _get_project_by_identifier(sender_project_key)
@@ -7649,7 +7970,32 @@ def build_mcp_server() -> FastMCP:
             f"Posted channel message {message.id} to '{name}' in '{channel_project.human_key}' "
             f"by '{sender.name}'."
         )
-        payload: ChannelMessageDTO = _channel_message_to_dto(message, sender.name)
+        payload = cast(ChannelMessagePostDTO, dict(_channel_message_to_dto(message, sender.name)))
+        payload["mention_deliveries"] = []
+        mention_names: list[str] = []
+        try:
+            mention_names = extract_channel_mentions(body_md)
+            payload["mention_deliveries"] = await _deliver_channel_mentions(
+                ctx,
+                channel_project,
+                sender,
+                message,
+                mention_names,
+            )
+        except Exception:
+            logger.exception("Failed to resolve channel mentions for channel_message=%s", message.id)
+            with suppress(Exception):
+                await ctx.info(f"Channel mention resolution failed for channel message {message.id}.")
+            payload["mention_deliveries"] = [
+                {
+                    "name": mention_name,
+                    "target_project_key": None,
+                    "status": "skipped",
+                    "receipt_message_id": None,
+                    "reason": "target_failed",
+                }
+                for mention_name in mention_names
+            ]
         return dict(payload)
 
     @mcp.tool(

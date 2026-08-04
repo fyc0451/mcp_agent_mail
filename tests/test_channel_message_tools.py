@@ -3,8 +3,7 @@
 Covers the channel-message + read-cursor MCP tools:
 - same-project agents are default channel members; cross-project agents must
   subscribe before posting/reading
-- post writes only channel_messages (no message_recipients fanout), attachments
-  fixed empty, no @ parsing
+- post writes channel history; bodies without @mentions create no receipt rows
 - fetch is pure read (never advances the cursor), returns id > cursor in stable
   ascending order, bounded limit
 - mark_channel_read advances atomically via a single SQLite UPSERT
@@ -120,7 +119,10 @@ class TestPostChannelMessage:
     async def test_post_by_same_project_member(self, channel_client):
         client, owner, _ = channel_client
         result = await client.call_tool("post_channel_message", _post_args(owner["project"], "general", owner))
-        assert set(result.data) == {"id", "channel_id", "sender_id", "sender_name", "subject", "body_md", "importance", "created_ts"}
+        assert set(result.data) == {
+            "id", "channel_id", "sender_id", "sender_name", "subject", "body_md", "importance", "created_ts",
+            "mention_deliveries",
+        }
         assert result.data["subject"] == "hi"
         assert result.data["sender_name"] == "BlueLake"
 
