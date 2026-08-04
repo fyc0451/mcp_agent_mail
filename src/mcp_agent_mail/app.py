@@ -28,7 +28,7 @@ from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from functools import wraps
 from pathlib import Path
-from typing import Any, AsyncContextManager, Callable, Optional, Protocol, cast
+from typing import Any, AsyncContextManager, Callable, Optional, Protocol, TypedDict, cast
 from urllib.parse import parse_qsl
 import uuid
 
@@ -58,6 +58,8 @@ from .llm import complete_system_user
 from .models import (
     Agent,
     AgentLink,
+    Channel,
+    ChannelSubscription,
     FileReservation,
     Message,
     MessageRecipient,
@@ -112,6 +114,61 @@ class _ToolRegistryLike(Protocol):
 
 class _FastMCPToolManagerLike(Protocol):
     _tool_manager: _ToolRegistryLike
+
+
+class ChannelDTO(TypedDict):
+    """Public, field-whitelisted representation of a project channel."""
+
+    id: int
+    project_id: int
+    project_slug: str
+    project_key: str
+    name: str
+    created_ts: str
+
+
+class ChannelEnsureDTO(TypedDict):
+    channel: ChannelDTO
+    created: bool
+
+
+class ChannelListDTO(TypedDict):
+    project_slug: str
+    project_key: str
+    channels: list[ChannelDTO]
+    count: int
+
+
+class ChannelSubscriberDTO(TypedDict):
+    id: int
+    name: str
+    project_id: int
+    project_slug: str
+    project_key: str
+
+
+class ChannelSubscriptionDTO(TypedDict):
+    id: int
+    channel: ChannelDTO
+    subscriber: ChannelSubscriberDTO
+    created_ts: str
+
+
+class ChannelSubscriptionEnsureDTO(TypedDict):
+    subscription: ChannelSubscriptionDTO
+    created: bool
+
+
+class ChannelSubscriptionListDTO(TypedDict):
+    subscriber: ChannelSubscriberDTO
+    subscriptions: list[ChannelSubscriptionDTO]
+    count: int
+
+
+class ChannelUnsubscribeDTO(TypedDict):
+    channel: ChannelDTO
+    subscriber: ChannelSubscriberDTO
+    removed: bool
 
 # ty currently struggles to type SQLModel-mapped SQLAlchemy expressions.
 # Provide lightweight wrappers to keep type checking focused on our code.
@@ -1633,6 +1690,45 @@ def _validate_program_model(program: str, model: str) -> None:
         )
 
 
+_CHANNEL_NAME_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}")
+
+
+def _validate_channel_name(raw_value: str) -> str:
+    """Validate a canonical bare channel name used in server-side lookups."""
+    if not isinstance(raw_value, str):
+        raise ToolExecutionError(
+            "INVALID_CHANNEL_NAME",
+            f"channel_name must be a string, got {type(raw_value).__name__}.",
+            recoverable=True,
+            data={"parameter": "channel_name", "provided": repr(raw_value)},
+        )
+    if not raw_value or raw_value != raw_value.strip():
+        raise ToolExecutionError(
+            "INVALID_CHANNEL_NAME",
+            "channel_name must be non-empty and must not contain leading or trailing whitespace.",
+            recoverable=True,
+            data={"parameter": "channel_name", "provided": raw_value},
+        )
+    if raw_value.startswith("channel:"):
+        raise ToolExecutionError(
+            "INVALID_CHANNEL_NAME",
+            "channel_name must be the bare name without the 'channel:' recipient prefix.",
+            recoverable=True,
+            data={"parameter": "channel_name", "provided": raw_value},
+        )
+    if not _CHANNEL_NAME_RE.fullmatch(raw_value):
+        raise ToolExecutionError(
+            "INVALID_CHANNEL_NAME",
+            (
+                "channel_name must start with a lowercase letter or digit, contain only lowercase letters, "
+                "digits, '.', '_', or '-', and be at most 128 characters."
+            ),
+            recoverable=True,
+            data={"parameter": "channel_name", "provided": raw_value, "max_length": 128},
+        )
+    return raw_value
+
+
 def _validate_thread_id(raw_value: Optional[str]) -> Optional[str]:
     """Normalize and validate a thread_id used for DB indexing and thread digests."""
     if raw_value is None:
@@ -1837,6 +1933,51 @@ def _agent_to_dict(agent: Agent) -> dict[str, Any]:
     if getattr(agent, "retired_at", None) is not None:
         d["retired_at"] = _iso(agent.retired_at)
     return d
+
+
+def _channel_to_dto(channel: Channel, project: Project) -> ChannelDTO:
+    """Serialize only the public channel fields exposed by MCP tools."""
+    if channel.id is None or project.id is None:
+        raise ValueError("Channel and project must have ids before serialization.")
+    return {
+        "id": channel.id,
+        "project_id": project.id,
+        "project_slug": project.slug,
+        "project_key": project.human_key,
+        "name": channel.name,
+        "created_ts": _iso(channel.created_ts),
+    }
+
+
+def _channel_subscriber_to_dto(agent: Agent, project: Project) -> ChannelSubscriberDTO:
+    """Serialize the stable identity fields needed by channel subscription clients."""
+    if agent.id is None or project.id is None:
+        raise ValueError("Agent and project must have ids before serialization.")
+    return {
+        "id": agent.id,
+        "name": agent.name,
+        "project_id": project.id,
+        "project_slug": project.slug,
+        "project_key": project.human_key,
+    }
+
+
+def _channel_subscription_to_dto(
+    subscription: ChannelSubscription,
+    channel: Channel,
+    channel_project: Project,
+    agent: Agent,
+    agent_project: Project,
+) -> ChannelSubscriptionDTO:
+    """Serialize a subscription without exposing tokens or ORM internals."""
+    if subscription.id is None:
+        raise ValueError("Channel subscription must have an id before serialization.")
+    return {
+        "id": subscription.id,
+        "channel": _channel_to_dto(channel, channel_project),
+        "subscriber": _channel_subscriber_to_dto(agent, agent_project),
+        "created_ts": _iso(subscription.created_ts),
+    }
 
 
 def _message_to_dict(message: Message, include_body: bool = True) -> dict[str, Any]:
@@ -2603,6 +2744,30 @@ async def _get_project_by_id(project_id: int) -> Project:
         if not project:
             raise NoResultFound(f"Project id '{project_id}' not found.")
         return project
+
+
+async def _get_channel(project: Project, channel_name: str) -> Channel:
+    """Resolve a validated project-scoped channel or raise a structured error."""
+    if project.id is None:
+        raise ValueError("Project must have an id before querying channels.")
+    name = _validate_channel_name(channel_name)
+    await ensure_schema()
+    async with get_session() as session:
+        result = await session.execute(
+            select(Channel).where(
+                cast(Any, Channel.project_id) == project.id,
+                cast(Any, Channel.name) == name,
+            )
+        )
+        channel = result.scalars().first()
+    if channel is None:
+        raise ToolExecutionError(
+            "NOT_FOUND",
+            f"Channel '{name}' not found in project '{project.human_key}'. Use ensure_channel to create it first.",
+            recoverable=True,
+            data={"project_key": project.human_key, "channel_name": name},
+        )
+    return channel
 
 
 # --- Common mistake detection helpers --------------------------------------------------------
@@ -7048,6 +7213,291 @@ def build_mcp_server() -> FastMCP:
             "expired": True,
             "expired_at": _iso(now),
         }
+
+    @mcp.tool(
+        name="ensure_channel",
+        description="Create a project-scoped public channel if it does not already exist.",
+    )
+    @_instrument_tool(
+        "ensure_channel",
+        cluster=CLUSTER_MESSAGING,
+        capabilities={"messaging", "write"},
+        project_arg="project_key",
+    )
+    @retry_on_db_lock(max_retries=3, base_delay=0.05, max_delay=0.5)
+    async def ensure_channel_tool(
+        ctx: Context,
+        project_key: str,
+        channel_name: str,
+        registration_token: Optional[str] = None,
+        format: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Idempotently create a canonical, project-scoped channel."""
+        name = _validate_channel_name(channel_name)
+        project = await _get_project_by_identifier(project_key)
+        await _authenticate_project_admin(ctx, project, registration_token, action="ensure_channel")
+        if project.id is None:
+            raise ValueError("Project must have an id before creating a channel.")
+
+        created = False
+        async with get_session() as session:
+            result = await session.execute(
+                select(Channel).where(
+                    cast(Any, Channel.project_id) == project.id,
+                    cast(Any, Channel.name) == name,
+                )
+            )
+            channel = result.scalars().first()
+            if channel is None:
+                channel = Channel(project_id=project.id, name=name)
+                session.add(channel)
+                try:
+                    await session.commit()
+                    await session.refresh(channel)
+                    created = True
+                except IntegrityError:
+                    await session.rollback()
+                    result = await session.execute(
+                        select(Channel).where(
+                            cast(Any, Channel.project_id) == project.id,
+                            cast(Any, Channel.name) == name,
+                        )
+                    )
+                    channel = result.scalars().first()
+                    if channel is None:
+                        raise
+
+        await ctx.info(f"Ensured channel '{name}' for project '{project.human_key}'.")
+        payload: ChannelEnsureDTO = {"channel": _channel_to_dto(channel, project), "created": created}
+        return dict(payload)
+
+    @mcp.tool(
+        name="list_channels",
+        description="List public channels owned by one project in stable name order.",
+    )
+    @_instrument_tool(
+        "list_channels",
+        cluster=CLUSTER_MESSAGING,
+        capabilities={"messaging", "read"},
+        project_arg="project_key",
+    )
+    async def list_channels_tool(
+        ctx: Context,
+        project_key: str,
+        format: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Return the field-whitelisted channel directory for a project."""
+        project = await _get_project_by_identifier(project_key)
+        if project.id is None:
+            raise ValueError("Project must have an id before listing channels.")
+        async with get_session() as session:
+            result = await session.execute(
+                select(Channel)
+                .where(cast(Any, Channel.project_id) == project.id)
+                .order_by(cast(Any, Channel.name), cast(Any, Channel.created_ts))
+            )
+            channels = list(result.scalars().all())
+        payload = [_channel_to_dto(channel, project) for channel in channels]
+        await ctx.info(f"Listed {len(payload)} channel(s) for project '{project.human_key}'.")
+        response: ChannelListDTO = {
+            "project_slug": project.slug,
+            "project_key": project.human_key,
+            "channels": payload,
+            "count": len(payload),
+        }
+        return dict(response)
+
+    @mcp.tool(
+        name="subscribe_channel",
+        description="Idempotently subscribe an authenticated agent to a same-project or cross-project channel.",
+    )
+    @_instrument_tool(
+        "subscribe_channel",
+        cluster=CLUSTER_MESSAGING,
+        capabilities={"messaging", "write"},
+        project_arg="agent_project_key",
+        agent_arg="agent_name",
+    )
+    @retry_on_db_lock(max_retries=3, base_delay=0.05, max_delay=0.5)
+    async def subscribe_channel_tool(
+        ctx: Context,
+        channel_project_key: str,
+        channel_name: str,
+        agent_project_key: str,
+        agent_name: str,
+        registration_token: Optional[str] = None,
+        format: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Subscribe an agent without requiring channel and agent projects to match."""
+        name = _validate_channel_name(channel_name)
+        channel_project = await _get_project_by_identifier(channel_project_key)
+        agent_project = await _get_project_by_identifier(agent_project_key)
+        agent = await _authenticate_agent(
+            ctx,
+            agent_project,
+            agent_name,
+            registration_token,
+            token_param="registration_token",
+            action="subscribe_channel",
+        )
+        channel = await _get_channel(channel_project, name)
+        if channel.id is None or agent.id is None:
+            raise ValueError("Channel and agent must have ids before creating a subscription.")
+
+        created = False
+        async with get_session() as session:
+            result = await session.execute(
+                select(ChannelSubscription).where(
+                    cast(Any, ChannelSubscription.channel_id) == channel.id,
+                    cast(Any, ChannelSubscription.agent_id) == agent.id,
+                )
+            )
+            subscription = result.scalars().first()
+            if subscription is None:
+                subscription = ChannelSubscription(channel_id=channel.id, agent_id=agent.id)
+                session.add(subscription)
+                try:
+                    await session.commit()
+                    await session.refresh(subscription)
+                    created = True
+                except IntegrityError:
+                    await session.rollback()
+                    result = await session.execute(
+                        select(ChannelSubscription).where(
+                            cast(Any, ChannelSubscription.channel_id) == channel.id,
+                            cast(Any, ChannelSubscription.agent_id) == agent.id,
+                        )
+                    )
+                    subscription = result.scalars().first()
+                    if subscription is None:
+                        raise
+
+        await ctx.info(
+            f"Subscribed agent '{agent.name}' from '{agent_project.human_key}' to "
+            f"channel '{name}' in '{channel_project.human_key}'."
+        )
+        response: ChannelSubscriptionEnsureDTO = {
+            "subscription": _channel_subscription_to_dto(
+                subscription,
+                channel,
+                channel_project,
+                agent,
+                agent_project,
+            ),
+            "created": created,
+        }
+        return dict(response)
+
+    @mcp.tool(
+        name="list_channel_subscriptions",
+        description="List channels subscribed to by one authenticated agent, including cross-project channels.",
+    )
+    @_instrument_tool(
+        "list_channel_subscriptions",
+        cluster=CLUSTER_MESSAGING,
+        capabilities={"messaging", "read"},
+        project_arg="agent_project_key",
+        agent_arg="agent_name",
+    )
+    async def list_channel_subscriptions_tool(
+        ctx: Context,
+        agent_project_key: str,
+        agent_name: str,
+        registration_token: Optional[str] = None,
+        format: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Return the authenticated agent's subscriptions in stable project/name order."""
+        agent_project = await _get_project_by_identifier(agent_project_key)
+        agent = await _authenticate_agent(
+            ctx,
+            agent_project,
+            agent_name,
+            registration_token,
+            token_param="registration_token",
+            action="list_channel_subscriptions",
+        )
+        if agent.id is None:
+            raise ValueError("Agent must have an id before listing subscriptions.")
+
+        async with get_session() as session:
+            result = await session.execute(
+                select(ChannelSubscription, Channel, Project)
+                .join(Channel, cast(Any, Channel.id) == ChannelSubscription.channel_id)
+                .join(Project, cast(Any, Project.id) == Channel.project_id)
+                .where(cast(Any, ChannelSubscription.agent_id) == agent.id)
+                .order_by(cast(Any, Project.slug), cast(Any, Channel.name))
+            )
+            rows = result.all()
+        subscriptions = [
+            _channel_subscription_to_dto(subscription, channel, channel_project, agent, agent_project)
+            for subscription, channel, channel_project in rows
+        ]
+        await ctx.info(f"Listed {len(subscriptions)} channel subscription(s) for agent '{agent.name}'.")
+        response: ChannelSubscriptionListDTO = {
+            "subscriber": _channel_subscriber_to_dto(agent, agent_project),
+            "subscriptions": subscriptions,
+            "count": len(subscriptions),
+        }
+        return dict(response)
+
+    @mcp.tool(
+        name="unsubscribe_channel",
+        description="Idempotently remove an authenticated agent's channel subscription.",
+    )
+    @_instrument_tool(
+        "unsubscribe_channel",
+        cluster=CLUSTER_MESSAGING,
+        capabilities={"messaging", "write"},
+        project_arg="agent_project_key",
+        agent_arg="agent_name",
+    )
+    @retry_on_db_lock(max_retries=3, base_delay=0.05, max_delay=0.5)
+    async def unsubscribe_channel_tool(
+        ctx: Context,
+        channel_project_key: str,
+        channel_name: str,
+        agent_project_key: str,
+        agent_name: str,
+        registration_token: Optional[str] = None,
+        format: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Remove only the authenticated agent's subscription row; channel data is preserved."""
+        name = _validate_channel_name(channel_name)
+        channel_project = await _get_project_by_identifier(channel_project_key)
+        agent_project = await _get_project_by_identifier(agent_project_key)
+        agent = await _authenticate_agent(
+            ctx,
+            agent_project,
+            agent_name,
+            registration_token,
+            token_param="registration_token",
+            action="unsubscribe_channel",
+        )
+        channel = await _get_channel(channel_project, name)
+        if channel.id is None or agent.id is None:
+            raise ValueError("Channel and agent must have ids before removing a subscription.")
+
+        removed = False
+        async with get_session() as session:
+            result = await session.execute(
+                delete(ChannelSubscription).where(
+                    cast(Any, ChannelSubscription.channel_id) == channel.id,
+                    cast(Any, ChannelSubscription.agent_id) == agent.id,
+                )
+            )
+            removed = cast(Any, result).rowcount > 0
+            await session.commit()
+
+        await ctx.info(
+            f"Unsubscribed agent '{agent.name}' from channel '{name}' in '{channel_project.human_key}' "
+            f"(removed={removed})."
+        )
+        response: ChannelUnsubscribeDTO = {
+            "channel": _channel_to_dto(channel, channel_project),
+            "subscriber": _channel_subscriber_to_dto(agent, agent_project),
+            "removed": removed,
+        }
+        return dict(response)
 
     @mcp.tool(name="send_message")
     @_instrument_tool(
