@@ -242,6 +242,68 @@ class ChannelSubscription(SQLModel, table=True):
     created_ts: datetime = Field(default_factory=_utcnow_naive)
 
 
+class ChannelMessage(SQLModel, table=True):
+    """A message posted to a channel (channel history, "blackboard").
+
+    Independent from :class:`Message`: channel messages are not delivered to
+    per-recipient ``message_recipients`` rows. Subscribers pull what they have
+    not yet read via a per-agent read cursor (:class:`ChannelReadCursor`);
+    the monotonically increasing ``id`` is the ordering / cursor key.
+
+    The sender may be an agent from another project (cross-project subscriber
+    posting to a channel it subscribes to), so ``sender_id`` is a plain FK to
+    ``agents.id`` without a project coupling.
+    """
+
+    __tablename__ = "channel_messages"
+    __table_args__ = (
+        Index("idx_channel_messages_channel_created", "channel_id", "created_ts"),
+        Index("idx_channel_messages_channel_id", "channel_id", "id"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    channel_id: int = Field(foreign_key="channels.id")
+    sender_id: int = Field(foreign_key="agents.id")
+    subject: str = Field(max_length=512)
+    body_md: str
+    importance: str = Field(default="normal", max_length=16)
+    created_ts: datetime = Field(default_factory=_utcnow_naive)
+    attachments: list[dict[str, Any]] = Field(
+        default_factory=list,
+        sa_column=Column(JSON, nullable=False, server_default="[]"),
+    )
+
+
+class ChannelReadCursor(SQLModel, table=True):
+    """Per-agent read cursor for a channel (uniquely keyed by channel+agent).
+
+    ``last_read_message_id`` is NULL until the agent has read any channel
+    message (NULL means "no messages read yet", i.e. cursor at the start).
+    A NULL initial value avoids referencing a non-existent ``channel_messages``
+    row under FK enforcement (a cursor at 0 would be an orphan reference).
+
+    The FK only pins the column type/domain to ``channel_messages.id``;
+    asserting that a non-NULL ``last_read_message_id`` belongs to the SAME
+    channel as this cursor row is left to the advancing tool (a plain FK cannot
+    express cross-row consistency in SQLite), noted here for that tool.
+    """
+
+    __tablename__ = "channel_read_cursors"
+    __table_args__ = (
+        UniqueConstraint("channel_id", "agent_id", name="uq_channel_read_cursor"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    channel_id: int = Field(foreign_key="channels.id")
+    agent_id: int = Field(foreign_key="agents.id", index=True)
+    last_read_message_id: Optional[int] = Field(
+        default=None,
+        foreign_key="channel_messages.id",
+    )
+    created_ts: datetime = Field(default_factory=_utcnow_naive)
+    updated_ts: datetime = Field(default_factory=_utcnow_naive)
+
+
 class ProjectSiblingSuggestion(SQLModel, table=True):
     """LLM-ranked sibling project suggestion (undirected pair)."""
 
