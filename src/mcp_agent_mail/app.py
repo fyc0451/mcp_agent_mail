@@ -36,6 +36,7 @@ from fastmcp import Context, FastMCP
 from git import Repo
 from git.exc import InvalidGitRepositoryError, NoSuchPathError
 from sqlalchemy import and_ as _sa_and, asc as _sa_asc, bindparam, delete as _sa_delete, desc as _sa_desc, exists as _sa_exists, func, or_ as _sa_or, select as _sa_select, text, update as _sa_update
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError, NoResultFound, OperationalError, TimeoutError as SATimeoutError
 from sqlalchemy.orm import aliased
 
@@ -59,6 +60,8 @@ from .models import (
     Agent,
     AgentLink,
     Channel,
+    ChannelMessage,
+    ChannelReadCursor,
     ChannelSubscription,
     FileReservation,
     Message,
@@ -169,6 +172,33 @@ class ChannelUnsubscribeDTO(TypedDict):
     channel: ChannelDTO
     subscriber: ChannelSubscriberDTO
     removed: bool
+
+
+class ChannelMessageDTO(TypedDict):
+    """Public, field-whitelisted representation of a channel message."""
+
+    id: int
+    channel_id: int
+    sender_id: int
+    sender_name: str
+    subject: str
+    body_md: str
+    importance: str
+    created_ts: str
+
+
+class ChannelMessagesFetchDTO(TypedDict):
+    channel: ChannelDTO
+    messages: list[ChannelMessageDTO]
+    cursor: Optional[int]
+    limit: int
+    count: int
+
+
+class ChannelMarkReadDTO(TypedDict):
+    channel: ChannelDTO
+    cursor: int
+    updated: bool
 
 # ty currently struggles to type SQLModel-mapped SQLAlchemy expressions.
 # Provide lightweight wrappers to keep type checking focused on our code.
@@ -1980,6 +2010,22 @@ def _channel_subscription_to_dto(
     }
 
 
+def _channel_message_to_dto(message: ChannelMessage, sender_name: str) -> ChannelMessageDTO:
+    """Serialize only the public channel-message fields exposed by MCP tools."""
+    if message.id is None:
+        raise ValueError("Channel message must have an id before serialization.")
+    return {
+        "id": message.id,
+        "channel_id": message.channel_id,
+        "sender_id": message.sender_id,
+        "sender_name": sender_name,
+        "subject": message.subject,
+        "body_md": message.body_md,
+        "importance": message.importance,
+        "created_ts": _iso(message.created_ts),
+    }
+
+
 def _message_to_dict(message: Message, include_body: bool = True) -> dict[str, Any]:
     data = {
         "id": message.id,
@@ -2768,6 +2814,48 @@ async def _get_channel(project: Project, channel_name: str) -> Channel:
             data={"project_key": project.human_key, "channel_name": name},
         )
     return channel
+
+
+async def _channel_sender_allowed(
+    channel: Channel,
+    channel_project: Project,
+    sender_project: Project,
+    sender: Agent,
+    action: str,
+) -> None:
+    """Enforce channel membership: same-project agents are default members.
+
+    Cross-project agents must hold an explicit ChannelSubscription row.
+    Raises a structured error when the sender is not a member.
+    """
+    if channel.id is None or sender.id is None:
+        raise ValueError("Channel and sender must have ids before checking membership.")
+    if channel_project.id is not None and sender_project.id == channel_project.id:
+        return  # same-project agent = default member
+    async with get_session() as session:
+        result = await session.execute(
+            select(ChannelSubscription).where(
+                cast(Any, ChannelSubscription.channel_id) == channel.id,
+                cast(Any, ChannelSubscription.agent_id) == sender.id,
+            )
+        )
+        subscription = result.scalars().first()
+    if subscription is None:
+        raise ToolExecutionError(
+            "NOT_SUBSCRIBED",
+            (
+                f"Agent '{sender.name}' is not subscribed to channel '{channel.name}'. "
+                "Cross-project agents must subscribe (subscribe_channel) before posting or reading."
+            ),
+            recoverable=True,
+            data={
+                "channel_name": channel.name,
+                "channel_project_key": channel_project.human_key,
+                "agent_name": sender.name,
+                "agent_project_key": sender_project.human_key,
+                "action": action,
+            },
+        )
 
 
 # --- Common mistake detection helpers --------------------------------------------------------
@@ -7496,6 +7584,276 @@ def build_mcp_server() -> FastMCP:
             "channel": _channel_to_dto(channel, channel_project),
             "subscriber": _channel_subscriber_to_dto(agent, agent_project),
             "removed": removed,
+        }
+        return dict(response)
+
+    @mcp.tool(
+        name="post_channel_message",
+        description="Post a message to a project channel (channel history only; no per-recipient fanout rows).",
+    )
+    @_instrument_tool(
+        "post_channel_message",
+        cluster=CLUSTER_MESSAGING,
+        capabilities={"messaging", "write"},
+        project_arg="channel_project_key",
+        agent_arg="sender_name",
+    )
+    @retry_on_db_lock(max_retries=3, base_delay=0.05, max_delay=0.5)
+    async def post_channel_message_tool(
+        ctx: Context,
+        channel_project_key: str,
+        channel_name: str,
+        sender_project_key: str,
+        sender_name: str,
+        subject: str,
+        body_md: str,
+        importance: str = "normal",
+        registration_token: Optional[str] = None,
+        format: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Post a message to a channel; writes only ChannelMessage rows."""
+        name = _validate_channel_name(channel_name)
+        channel_project = await _get_project_by_identifier(channel_project_key)
+        sender_project = await _get_project_by_identifier(sender_project_key)
+        sender = await _authenticate_agent(
+            ctx,
+            sender_project,
+            sender_name,
+            registration_token,
+            token_param="registration_token",
+            action="post_channel_message",
+        )
+        channel = await _get_channel(channel_project, name)
+        await _channel_sender_allowed(channel, channel_project, sender_project, sender, "post_channel_message")
+        if channel.id is None or sender.id is None:
+            raise ValueError("Channel and sender must have ids before posting a message.")
+
+        message = ChannelMessage(
+            channel_id=channel.id,
+            sender_id=sender.id,
+            subject=subject,
+            body_md=body_md,
+            importance=importance,
+            attachments=[],
+        )
+        # Single transaction: message + sender activity commit together, so a
+        # lock retry re-running the tool can never duplicate the post.
+        async with get_session() as session:
+            sender.last_active_ts = _naive_utc()
+            session.add(sender)
+            session.add(message)
+            await session.commit()
+            await session.refresh(message)
+
+        await ctx.info(
+            f"Posted channel message {message.id} to '{name}' in '{channel_project.human_key}' "
+            f"by '{sender.name}'."
+        )
+        payload: ChannelMessageDTO = _channel_message_to_dto(message, sender.name)
+        return dict(payload)
+
+    @mcp.tool(
+        name="fetch_channel_messages",
+        description="Pull channel messages after the agent's read cursor (pure read; does not advance the cursor).",
+    )
+    @_instrument_tool(
+        "fetch_channel_messages",
+        cluster=CLUSTER_MESSAGING,
+        capabilities={"messaging", "read"},
+        project_arg="channel_project_key",
+        agent_arg="agent_name",
+    )
+    async def fetch_channel_messages_tool(
+        ctx: Context,
+        channel_project_key: str,
+        channel_name: str,
+        agent_project_key: str,
+        agent_name: str,
+        limit: int = 100,
+        registration_token: Optional[str] = None,
+        format: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Return unread channel messages (id > cursor) in stable ascending order."""
+        name = _validate_channel_name(channel_name)
+        limit = _validate_limit(limit, max_limit=500)
+        channel_project = await _get_project_by_identifier(channel_project_key)
+        agent_project = await _get_project_by_identifier(agent_project_key)
+        agent = await _authenticate_agent(
+            ctx,
+            agent_project,
+            agent_name,
+            registration_token,
+            token_param="registration_token",
+            action="fetch_channel_messages",
+        )
+        channel = await _get_channel(channel_project, name)
+        await _channel_sender_allowed(channel, channel_project, agent_project, agent, "fetch_channel_messages")
+        if channel.id is None or agent.id is None:
+            raise ValueError("Channel and agent must have ids before fetching messages.")
+
+        cursor: Optional[int] = None
+        async with get_session() as session:
+            result = await session.execute(
+                select(ChannelReadCursor).where(
+                    cast(Any, ChannelReadCursor.channel_id) == channel.id,
+                    cast(Any, ChannelReadCursor.agent_id) == agent.id,
+                )
+            )
+            cursor_row = result.scalars().first()
+            if cursor_row is not None:
+                cursor = cursor_row.last_read_message_id
+
+            sender_alias = aliased(Agent)
+            stmt = (
+                select(ChannelMessage, sender_alias.name)
+                .join(sender_alias, cast(Any, ChannelMessage.sender_id == sender_alias.id))
+                .where(cast(Any, ChannelMessage.channel_id) == channel.id)
+                .order_by(cast(Any, ChannelMessage.id))
+                .limit(limit)
+            )
+            if cursor is not None:
+                stmt = stmt.where(cast(Any, ChannelMessage.id) > cursor)
+            result = await session.execute(stmt)
+            rows = result.all()
+        messages = [_channel_message_to_dto(msg, sender_name) for msg, sender_name in rows]
+        response: ChannelMessagesFetchDTO = {
+            "channel": _channel_to_dto(channel, channel_project),
+            "messages": messages,
+            "cursor": cursor,
+            "limit": limit,
+            "count": len(messages),
+        }
+        await ctx.info(
+            f"Fetched {len(messages)} unread channel message(s) from '{name}' for '{agent.name}' "
+            f"(cursor={cursor})."
+        )
+        return dict(response)
+
+    @mcp.tool(
+        name="mark_channel_read",
+        description="Advance an agent's channel read cursor to a message (must belong to the same channel; monotonic, idempotent).",
+    )
+    @_instrument_tool(
+        "mark_channel_read",
+        cluster=CLUSTER_MESSAGING,
+        capabilities={"messaging", "write"},
+        project_arg="channel_project_key",
+        agent_arg="agent_name",
+    )
+    @retry_on_db_lock(max_retries=3, base_delay=0.05, max_delay=0.5)
+    async def mark_channel_read_tool(
+        ctx: Context,
+        channel_project_key: str,
+        channel_name: str,
+        agent_project_key: str,
+        agent_name: str,
+        message_id: int,
+        registration_token: Optional[str] = None,
+        format: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Advance the agent's cursor to ``message_id`` (monotonic, never rewinds)."""
+        name = _validate_channel_name(channel_name)
+        channel_project = await _get_project_by_identifier(channel_project_key)
+        agent_project = await _get_project_by_identifier(agent_project_key)
+        agent = await _authenticate_agent(
+            ctx,
+            agent_project,
+            agent_name,
+            registration_token,
+            token_param="registration_token",
+            action="mark_channel_read",
+        )
+        channel = await _get_channel(channel_project, name)
+        await _channel_sender_allowed(channel, channel_project, agent_project, agent, "mark_channel_read")
+        if channel.id is None or agent.id is None:
+            raise ValueError("Channel and agent must have ids before advancing the cursor.")
+
+        async with get_session() as session:
+            result = await session.execute(
+                select(ChannelMessage).where(cast(Any, ChannelMessage.id) == message_id)
+            )
+            target = result.scalars().first()
+            if target is None:
+                raise ToolExecutionError(
+                    "NOT_FOUND",
+                    f"Channel message {message_id} not found.",
+                    recoverable=True,
+                    data={"channel_name": name, "channel_project_key": channel_project.human_key, "message_id": message_id},
+                )
+            if target.channel_id != channel.id:
+                raise ToolExecutionError(
+                    "INVALID_ARGUMENT",
+                    (
+                        f"Channel message {message_id} belongs to channel id {target.channel_id}, "
+                        f"not '{name}' (channel id {channel.id}). Cross-channel advance is rejected."
+                    ),
+                    recoverable=True,
+                    data={
+                        "channel_name": name,
+                        "channel_project_key": channel_project.human_key,
+                        "message_id": message_id,
+                        "message_channel_id": target.channel_id,
+                    },
+                )
+
+            updated = False
+            now = _naive_utc()
+            # Single SQLite UPSERT implements the full atomic monotonic advance:
+            #   - no row yet          -> INSERT (creates the cursor)
+            #   - existing NULL row   -> DO UPDATE (advances from "start")
+            #   - existing smaller row-> DO UPDATE (advances)
+            #   - existing >= requested -> DO UPDATE ... WHERE does not match,
+            #     so the statement is a no-op and no row is returned
+            # The WHERE condition (stored IS NULL OR stored < requested) is
+            # decided by the DB in one statement, so concurrent marks always
+            # settle on the larger value (no select→Python max→update race).
+            # Note: scalar max(NULL, x) would return NULL in SQLite, so we do
+            # NOT use max(); we gate the update with the WHERE clause and set
+            # the requested value directly.
+            stmt = sqlite_insert(ChannelReadCursor).values(
+                channel_id=channel.id,
+                agent_id=agent.id,
+                last_read_message_id=message_id,
+                created_ts=now,
+                updated_ts=now,
+            )
+            stmt = stmt.on_conflict_do_update(
+                index_elements=[cast(Any, ChannelReadCursor.channel_id), cast(Any, ChannelReadCursor.agent_id)],
+                where=or_(
+                    cast(Any, ChannelReadCursor.last_read_message_id).is_(None),
+                    cast(Any, ChannelReadCursor.last_read_message_id) < message_id,
+                ),
+                set_={
+                    "last_read_message_id": message_id,
+                    "updated_ts": now,
+                },
+            ).returning(cast(Any, ChannelReadCursor.id))
+            result = await session.execute(stmt)
+            updated = result.scalars().first() is not None
+            # Re-read the effective cursor for a truthful response (no rewind)
+            # and update agent activity in the SAME transaction as the UPSERT,
+            # so a lock retry re-running the tool cannot observe a committed
+            # cursor that lost its activity bump.
+            result = await session.execute(
+                select(ChannelReadCursor).where(
+                    cast(Any, ChannelReadCursor.channel_id) == channel.id,
+                    cast(Any, ChannelReadCursor.agent_id) == agent.id,
+                )
+            )
+            effective = result.scalars().first()
+            effective_cursor = effective.last_read_message_id if effective is not None else message_id
+            agent.last_active_ts = now
+            session.add(agent)
+            await session.commit()
+
+        await ctx.info(
+            f"Advanced read cursor for '{agent.name}' on '{name}' to message {message_id} "
+            f"(updated={updated})."
+        )
+        response: ChannelMarkReadDTO = {
+            "channel": _channel_to_dto(channel, channel_project),
+            "cursor": effective_cursor,
+            "updated": updated,
         }
         return dict(response)
 
