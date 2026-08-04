@@ -276,6 +276,10 @@ class Settings:
     # access; this controls how long an inactive HTTP/stdio session is
     # remembered. Default 24h.
     session_binding_ttl_seconds: int
+    # Agent presence is event-driven today (there is no fixed mail poll loop),
+    # so use a short configurable display window. If a fixed poll is added,
+    # operators should recalibrate this to roughly twice that interval.
+    presence_online_ttl_seconds: int
     # Auto-retire agents whose `last_active_ts` is older than the
     # threshold. Long-running multi-agent projects accumulate stale
     # agents whose sessions ended without an explicit retire_agent call;
@@ -597,6 +601,7 @@ def _build_settings() -> Settings:
         window_identity_uuid=decouple_config("MCP_AGENT_MAIL_WINDOW_ID", default="").strip(),
         window_identity_ttl_days=_i("MCP_AGENT_MAIL_WINDOW_TTL_DAYS", default=30),
         session_binding_ttl_seconds=_i("MCP_AGENT_MAIL_SESSION_BINDING_TTL_SECONDS", default=86400),
+        presence_online_ttl_seconds=_i("PRESENCE_ONLINE_TTL_SECONDS", default=300),
         auto_retire_stale_agents_enabled=_b("AUTO_RETIRE_STALE_AGENTS_ENABLED", default=True),
         auto_retire_stale_agents_interval_seconds=_i("AUTO_RETIRE_STALE_AGENTS_INTERVAL_SECONDS", default=3600),
         auto_retire_stale_agents_threshold_seconds=_i("AUTO_RETIRE_STALE_AGENTS_THRESHOLD_SECONDS", default=86400),

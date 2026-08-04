@@ -1983,6 +1983,44 @@ def _agent_to_dict(agent: Agent) -> dict[str, Any]:
     return d
 
 
+def _agent_online(
+    agent: Agent,
+    *,
+    now: datetime | None = None,
+    ttl_seconds: int | None = None,
+) -> bool:
+    """Derive display-only presence from recent authenticated activity."""
+    if getattr(agent, "retired_at", None) is not None:
+        return False
+    ttl = (
+        int(get_settings().presence_online_ttl_seconds)
+        if ttl_seconds is None
+        else int(ttl_seconds)
+    )
+    if ttl <= 0:
+        return False
+    last_active = _ensure_utc(getattr(agent, "last_active_ts", None))
+    current = _ensure_utc(now or datetime.now(timezone.utc))
+    if last_active is None or current is None:
+        return False
+    return last_active >= current - timedelta(seconds=ttl)
+
+
+async def _touch_agent_activity(agent: Agent) -> None:
+    """Persist one passive heartbeat for an already authenticated agent."""
+    if agent.id is None:
+        return
+    now = _naive_utc()
+    async with get_session() as session:
+        await session.execute(
+            _sa_update(Agent)
+            .where(cast(Any, Agent.id) == agent.id)
+            .values(last_active_ts=now)
+        )
+        await session.commit()
+    agent.last_active_ts = now
+
+
 def _channel_to_dto(channel: Channel, project: Project) -> ChannelDTO:
     """Serialize only the public channel fields exposed by MCP tools."""
     if channel.id is None or project.id is None:
@@ -5747,9 +5785,25 @@ def build_mcp_server() -> FastMCP:
         action: str,
     ) -> Agent:
         agent = await _get_agent(project, agent_name)
+
+        async def _authenticated(
+            activity_agent: Agent,
+            *,
+            result_agent: Agent | None = None,
+        ) -> Agent:
+            try:
+                await _touch_agent_activity(activity_agent)
+            except Exception:
+                logger.warning(
+                    "Failed to refresh activity for authenticated agent id=%s",
+                    activity_agent.id,
+                    exc_info=True,
+                )
+            return activity_agent if result_agent is None else result_agent
+
         if _session_is_bound_to_agent(ctx, project, agent):
             _bind_session_agent(ctx, project, agent)
-            return agent
+            return await _authenticated(agent)
 
         stored_token = (agent.registration_token or "").strip()
         if not stored_token:
@@ -5766,7 +5820,7 @@ def build_mcp_server() -> FastMCP:
                         f"'{agent.name}' via adjacent agent '{peer.name}' in project "
                         f"'{project.human_key}'."
                     )
-                    return agent
+                    return await _authenticated(peer, result_agent=agent)
             raise ToolExecutionError(
                 "AUTHENTICATION_REQUIRED",
                 (
@@ -5788,7 +5842,7 @@ def build_mcp_server() -> FastMCP:
                 _wi = await _get_window_identity(project, _wi_uuid)
                 if _wi and _wi.display_name == agent.name:
                     _bind_session_agent(ctx, project, agent)
-                    return agent
+                    return await _authenticated(agent)
             raise ToolExecutionError(
                 "AUTHENTICATION_REQUIRED",
                 (
@@ -5807,7 +5861,7 @@ def build_mcp_server() -> FastMCP:
             )
 
         _bind_session_agent(ctx, project, agent)
-        return agent
+        return await _authenticated(agent)
 
     async def _resolve_authenticated_agent(
         ctx: Context,
@@ -14658,6 +14712,7 @@ def build_mcp_server() -> FastMCP:
                   "task_description": "API development",
                   "inception_ts": "2025-10-25T...",
                   "last_active_ts": "2025-10-25T...",
+                  "online": true,
                   "unread_count": 3
                 },
                 ...
@@ -14709,6 +14764,10 @@ def build_mcp_server() -> FastMCP:
             for agent in agents:
                 agent_dict = _agent_to_dict(agent)
                 agent_dict["unread_count"] = unread_counts_map.get(agent.id, 0)
+                agent_dict["online"] = _agent_online(
+                    agent,
+                    ttl_seconds=settings.presence_online_ttl_seconds,
+                )
                 if getattr(agent, "retired_at", None) is not None:
                     retired_agent_data.append(agent_dict)
                 else:
