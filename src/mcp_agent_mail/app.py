@@ -64,6 +64,7 @@ from .models import (
     ChannelReadCursor,
     ChannelSubscription,
     FileReservation,
+    HubAuditEvent,
     MentionDelivery,
     Message,
     MessageRecipient,
@@ -217,6 +218,36 @@ class ChannelMarkReadDTO(TypedDict):
     channel: ChannelDTO
     cursor: int
     updated: bool
+
+
+class HubAuditEventDTO(TypedDict):
+    """Strict, content-free representation of one Hub audit event."""
+
+    id: int
+    project_id: int
+    actor_agent_id: Optional[int]
+    event_type: str
+    source_type: str
+    source_id: int
+    outcome: str
+    reason: Optional[str]
+    target_project_id: Optional[int]
+    target_agent_id: Optional[int]
+    related_message_id: Optional[int]
+    created_ts: str
+
+
+class HubAuditEventListDTO(TypedDict):
+    project_id: int
+    events: list[HubAuditEventDTO]
+    cursor: Optional[int]
+    limit: int
+    count: int
+
+
+_HUB_AUDIT_EVENT_TYPES = frozenset({"channel_message_posted", "channel_mention_delivery"})
+_HUB_AUDIT_OUTCOMES = frozenset({"succeeded", "delivered", "already_delivered", "skipped"})
+_HUB_AUDIT_REASONS = frozenset({"unknown", "ambiguous", "block_all", "target_failed"})
 
 # ty currently struggles to type SQLModel-mapped SQLAlchemy expressions.
 # Provide lightweight wrappers to keep type checking focused on our code.
@@ -2079,6 +2110,80 @@ def _channel_message_to_dto(message: ChannelMessage, sender_name: str) -> Channe
         "body_md": message.body_md,
         "importance": message.importance,
         "created_ts": _iso(message.created_ts),
+    }
+
+
+def _new_hub_audit_event(
+    *,
+    project_id: int,
+    actor_agent_id: int | None,
+    event_type: str,
+    source_id: int,
+    outcome: str,
+    reason: str | None = None,
+    target_project_id: int | None = None,
+    target_agent_id: int | None = None,
+    related_message_id: int | None = None,
+) -> HubAuditEvent:
+    """Build an audit row from controlled values; arbitrary metadata is forbidden."""
+    if event_type not in _HUB_AUDIT_EVENT_TYPES:
+        raise ValueError(f"Unsupported Hub audit event_type: {event_type}")
+    if outcome not in _HUB_AUDIT_OUTCOMES:
+        raise ValueError(f"Unsupported Hub audit outcome: {outcome}")
+    if reason is not None and reason not in _HUB_AUDIT_REASONS:
+        raise ValueError(f"Unsupported Hub audit reason: {reason}")
+    return HubAuditEvent(
+        project_id=project_id,
+        actor_agent_id=actor_agent_id,
+        event_type=event_type,
+        source_type="channel_message",
+        source_id=source_id,
+        outcome=outcome,
+        reason=reason,
+        target_project_id=target_project_id,
+        target_agent_id=target_agent_id,
+        related_message_id=related_message_id,
+    )
+
+
+async def _commit_hub_audit_events(events: Sequence[HubAuditEvent]) -> None:
+    """Commit audit rows in their own transaction."""
+    async with get_session() as session:
+        session.add_all(list(events))
+        await session.commit()
+
+
+async def _record_hub_audit_events(events: Sequence[HubAuditEvent]) -> None:
+    """Best-effort audit sink; observability failure never changes business results."""
+    if not events:
+        return
+    try:
+        await _commit_hub_audit_events(events)
+    except Exception:
+        logger.warning(
+            "Failed to persist Hub audit event(s) types=%s",
+            sorted({event.event_type for event in events}),
+            exc_info=True,
+        )
+
+
+def _hub_audit_event_to_dto(event: HubAuditEvent) -> HubAuditEventDTO:
+    """Serialize only IDs and controlled enum fields; never message content or tokens."""
+    if event.id is None:
+        raise ValueError("Hub audit event must have an id before serialization.")
+    return {
+        "id": event.id,
+        "project_id": event.project_id,
+        "actor_agent_id": event.actor_agent_id,
+        "event_type": event.event_type,
+        "source_type": event.source_type,
+        "source_id": event.source_id,
+        "outcome": event.outcome,
+        "reason": event.reason,
+        "target_project_id": event.target_project_id,
+        "target_agent_id": event.target_agent_id,
+        "related_message_id": event.related_message_id,
+        "created_ts": _iso(event.created_ts),
     }
 
 
@@ -4386,6 +4491,8 @@ async def _deliver_channel_mentions(
     names: Sequence[str],
 ) -> list[ChannelMentionDeliveryDTO]:
     """Best-effort durable receipt fanout, grouped by target project."""
+    if channel_project.id is None or sender.id is None or source.id is None:
+        raise ValueError("Channel project, sender, and source message must have ids.")
     resolutions = await _resolve_channel_mentions(channel_project, sender, names)
     outcomes: list[ChannelMentionDeliveryDTO | None] = [None] * len(resolutions)
     groups: dict[int, tuple[Project, list[tuple[int, _ChannelMentionResolution]]]] = {}
@@ -4442,7 +4549,34 @@ async def _deliver_channel_mentions(
                 "reason": None,
             }
 
-    return [outcome for outcome in outcomes if outcome is not None]
+    resolved_outcomes = [outcome for outcome in outcomes if outcome is not None]
+    if len(resolved_outcomes) != len(resolutions):
+        raise RuntimeError("Channel mention delivery produced an incomplete outcome set.")
+
+    try:
+        audit_events = [
+            _new_hub_audit_event(
+                project_id=channel_project.id,
+                actor_agent_id=sender.id,
+                event_type="channel_mention_delivery",
+                source_id=source.id,
+                outcome=outcome["status"],
+                reason=outcome["reason"],
+                target_project_id=resolution.project.id if resolution.project else None,
+                target_agent_id=resolution.agent.id if resolution.agent else None,
+                related_message_id=outcome["receipt_message_id"],
+            )
+            for resolution, outcome in zip(resolutions, resolved_outcomes, strict=True)
+        ]
+    except Exception:
+        logger.warning(
+            "Failed to build Hub mention audit event(s) for channel_message=%s",
+            source.id,
+            exc_info=True,
+        )
+    else:
+        await _record_hub_audit_events(audit_events)
+    return resolved_outcomes
 
 
 async def _create_file_reservation(
@@ -8019,6 +8153,24 @@ def build_mcp_server() -> FastMCP:
             session.add(message)
             await session.commit()
             await session.refresh(message)
+        if channel_project.id is None or message.id is None:
+            raise ValueError("Channel project and message must have ids after posting.")
+        try:
+            post_audit_event = _new_hub_audit_event(
+                project_id=channel_project.id,
+                actor_agent_id=sender.id,
+                event_type="channel_message_posted",
+                source_id=message.id,
+                outcome="succeeded",
+            )
+        except Exception:
+            logger.warning(
+                "Failed to build Hub post audit event for channel_message=%s",
+                message.id,
+                exc_info=True,
+            )
+        else:
+            await _record_hub_audit_events([post_audit_event])
 
         await ctx.info(
             f"Posted channel message {message.id} to '{name}' in '{channel_project.human_key}' "
@@ -8050,7 +8202,87 @@ def build_mcp_server() -> FastMCP:
                 }
                 for mention_name in mention_names
             ]
+            try:
+                failure_audit_events = [
+                    _new_hub_audit_event(
+                        project_id=channel_project.id,
+                        actor_agent_id=sender.id,
+                        event_type="channel_mention_delivery",
+                        source_id=message.id,
+                        outcome="skipped",
+                        reason="target_failed",
+                    )
+                    for _mention_name in mention_names
+                ]
+            except Exception:
+                logger.warning(
+                    "Failed to build fallback Hub mention audit event(s) for channel_message=%s",
+                    message.id,
+                    exc_info=True,
+                )
+            else:
+                await _record_hub_audit_events(failure_audit_events)
         return dict(payload)
+
+    @mcp.tool(
+        name="list_hub_audit_events",
+        description="List the authenticated project's content-free Hub audit stream after an event id.",
+    )
+    @_instrument_tool(
+        "list_hub_audit_events",
+        cluster=CLUSTER_MESSAGING,
+        capabilities={"messaging", "read"},
+        project_arg="project_key",
+    )
+    async def list_hub_audit_events_tool(
+        ctx: Context,
+        project_key: str,
+        after_id: Optional[int] = None,
+        event_type: Optional[str] = None,
+        limit: int = 100,
+        registration_token: Optional[str] = None,
+        format: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Return a stable, ascending audit cursor without content or arbitrary metadata."""
+        limit = _validate_limit(limit, max_limit=500)
+        if after_id is not None and after_id < 0:
+            raise ValueError("after_id must be non-negative.")
+        if event_type is not None and event_type not in _HUB_AUDIT_EVENT_TYPES:
+            raise ValueError(
+                f"event_type must be one of: {', '.join(sorted(_HUB_AUDIT_EVENT_TYPES))}."
+            )
+        project = await _get_project_by_identifier(project_key)
+        await _authenticate_project_admin(
+            ctx,
+            project,
+            registration_token,
+            action="list_hub_audit_events",
+        )
+        if project.id is None:
+            raise ValueError("Project must have an id before listing Hub audit events.")
+
+        stmt = (
+            select(HubAuditEvent)
+            .where(cast(Any, HubAuditEvent.project_id) == project.id)
+            .order_by(cast(Any, HubAuditEvent.id))
+            .limit(limit)
+        )
+        if after_id is not None:
+            stmt = stmt.where(cast(Any, HubAuditEvent.id) > after_id)
+        if event_type is not None:
+            stmt = stmt.where(cast(Any, HubAuditEvent.event_type) == event_type)
+        async with get_session() as session:
+            result = await session.execute(stmt)
+            events = list(result.scalars().all())
+
+        response: HubAuditEventListDTO = {
+            "project_id": project.id,
+            "events": [_hub_audit_event_to_dto(event) for event in events],
+            "cursor": events[-1].id if events else after_id,
+            "limit": limit,
+            "count": len(events),
+        }
+        return dict(response)
 
     @mcp.tool(
         name="fetch_channel_messages",

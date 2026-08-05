@@ -331,6 +331,40 @@ class MentionDelivery(SQLModel, table=True):
     created_ts: datetime = Field(default_factory=_utcnow_naive)
 
 
+class HubAuditEvent(SQLModel, table=True):
+    """Append-only, field-whitelisted audit event for Hub channel actions.
+
+    Audit rows intentionally store only trusted identifiers and controlled
+    outcome/reason values. Message text, registration tokens, exception text,
+    and arbitrary client metadata do not belong in this table.
+
+    Reference ids are durable tombstones: current queries never inner-join
+    agents/messages, so explicit hard deletion may leave an id that no longer
+    resolves while preserving the historical event. If SQLite FK enforcement
+    is enabled later, these nullable references must use ON DELETE SET NULL.
+    """
+
+    __tablename__ = "hub_audit_events"
+    __table_args__ = (
+        Index("idx_hub_audit_events_project_id", "project_id", "id"),
+        Index("idx_hub_audit_events_actor_id", "actor_agent_id", "id"),
+        Index("idx_hub_audit_events_source", "source_type", "source_id"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    project_id: int = Field(foreign_key="projects.id")
+    actor_agent_id: Optional[int] = Field(default=None, foreign_key="agents.id")
+    event_type: str = Field(max_length=64)
+    source_type: str = Field(max_length=32)
+    source_id: int
+    outcome: str = Field(max_length=32)
+    reason: Optional[str] = Field(default=None, max_length=32)
+    target_project_id: Optional[int] = Field(default=None, foreign_key="projects.id")
+    target_agent_id: Optional[int] = Field(default=None, foreign_key="agents.id")
+    related_message_id: Optional[int] = Field(default=None, foreign_key="messages.id")
+    created_ts: datetime = Field(default_factory=_utcnow_naive)
+
+
 class ProjectSiblingSuggestion(SQLModel, table=True):
     """LLM-ranked sibling project suggestion (undirected pair)."""
 
