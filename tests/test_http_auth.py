@@ -20,11 +20,14 @@ import json
 from typing import Any
 
 import pytest
+from authlib.jose import jwt
 from httpx import ASGITransport, AsyncClient
 
 from mcp_agent_mail import config as _config
 from mcp_agent_mail.app import build_mcp_server
+from mcp_agent_mail.db import get_session
 from mcp_agent_mail.http import build_http_app
+from mcp_agent_mail.models import Agent
 
 
 def _rpc(method: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -39,6 +42,29 @@ def _make_fake_jwt(claims: dict[str, Any], alg: str = "HS256") -> str:
     payload_b64 = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
     sig_b64 = base64.urlsafe_b64encode(b"fake_signature").decode().rstrip("=")
     return f"{header_b64}.{payload_b64}.{sig_b64}"
+
+
+def _configure_hub_jwt(monkeypatch):
+    monkeypatch.setenv("HTTP_JWT_ENABLED", "true")
+    monkeypatch.setenv("HTTP_JWT_ALGORITHMS", "HS256")
+    monkeypatch.setenv("HTTP_JWT_SECRET", "hub-test-secret")
+    monkeypatch.setenv("HTTP_RBAC_ENABLED", "true")
+    monkeypatch.setenv("HTTP_RBAC_WRITER_ROLES", "writer")
+    monkeypatch.setenv("HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED", "false")
+    _config.clear_settings_cache()
+    return _config.get_settings()
+
+
+def _hub_headers(settings, subject: str | None, **claims: Any) -> dict[str, str]:
+    payload = {settings.http.jwt_role_claim: "writer", **claims}
+    if subject is not None:
+        payload["sub"] = subject
+    token = jwt.encode(
+        {"alg": "HS256"},
+        payload,
+        settings.http.jwt_secret,
+    ).decode("utf-8")
+    return {"Authorization": f"Bearer {token}"}
 
 
 # =============================================================================
@@ -690,3 +716,294 @@ class TestRateLimitingIntegration:
             assert r.status_code == 429
             data = r.json()
             assert data.get("detail") == "Rate limit exceeded"
+
+
+# =============================================================================
+# Test: M3a authenticated Human / project membership API
+# =============================================================================
+
+
+class TestHubHumanIdentityApi:
+    """Hub mutations require a JWT Human principal and project-scoped rights."""
+
+    @pytest.mark.asyncio
+    async def test_human_mapping_requires_jwt_subject(self, isolated_env, monkeypatch):
+        monkeypatch.setenv("HTTP_BEARER_TOKEN", "legacy-token")
+        settings = _configure_hub_jwt(monkeypatch)
+        app = build_http_app(settings, build_mcp_server())
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            missing_sub = await client.put(
+                "/hub/api/humans/me",
+                headers=_hub_headers(settings, None),
+                json={"display_name": "No Subject"},
+            )
+            assert missing_sub.status_code == 401
+
+            # A static bearer may call legacy MCP endpoints, but it must never
+            # be promoted into a Human principal.
+            static_bearer = await client.put(
+                "/hub/api/humans/me",
+                headers={"Authorization": "Bearer legacy-token"},
+                json={"display_name": "Legacy Client"},
+            )
+            assert static_bearer.status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_jwt_subject_maps_to_stable_human(self, isolated_env, monkeypatch):
+        settings = _configure_hub_jwt(monkeypatch)
+        app = build_http_app(settings, build_mcp_server())
+        headers = _hub_headers(settings, "oidc|alice")
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            invalid = await client.put(
+                "/hub/api/humans/me",
+                headers=headers,
+                json={"display_name": ""},
+            )
+            assert invalid.status_code == 400
+
+            created, concurrent = await asyncio.gather(
+                client.put(
+                    "/hub/api/humans/me",
+                    headers=headers,
+                    json={"display_name": "Alice"},
+                ),
+                client.put(
+                    "/hub/api/humans/me",
+                    headers=headers,
+                    json={"display_name": "Alice"},
+                ),
+            )
+            assert created.status_code == concurrent.status_code == 200
+            human_id = created.json()["id"]
+            assert concurrent.json()["id"] == human_id
+
+            updated = await client.put(
+                "/hub/api/humans/me",
+                headers=headers,
+                json={"display_name": "Alice Zhang"},
+            )
+            assert updated.status_code == 200
+            assert updated.json() == {
+                "id": human_id,
+                "display_name": "Alice Zhang",
+            }
+
+            fetched = await client.get("/hub/api/humans/me", headers=headers)
+            assert fetched.status_code == 200
+            assert fetched.json() == updated.json()
+
+    @pytest.mark.asyncio
+    async def test_project_join_approval_and_agent_authorization(
+        self, isolated_env, monkeypatch
+    ):
+        settings = _configure_hub_jwt(monkeypatch)
+        app = build_http_app(settings, build_mcp_server())
+        alice_headers = _hub_headers(settings, "oidc|alice")
+        bob_headers = _hub_headers(settings, "oidc|bob")
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            alice = await client.put(
+                "/hub/api/humans/me",
+                headers=alice_headers,
+                json={"display_name": "Alice"},
+            )
+            bob = await client.put(
+                "/hub/api/humans/me",
+                headers=bob_headers,
+                json={"display_name": "Bob"},
+            )
+            assert alice.status_code == bob.status_code == 200
+
+            created = await client.post(
+                "/hub/api/projects",
+                headers=alice_headers,
+                json={"human_key": "/teams/m3a", "mention_handle": "alice"},
+            )
+            assert created.status_code == 201
+            project = created.json()
+            slug = project["slug"]
+            assert project["membership"]["role"] == "admin"
+            assert project["membership"]["status"] == "active"
+
+            discover = await client.get("/hub/api/projects", headers=bob_headers)
+            assert discover.status_code == 200
+            discovered_project = discover.json()["projects"][0]
+            assert discovered_project["slug"] == slug
+            assert discovered_project["membership"] is None
+            assert "human_key" not in discovered_project
+
+            duplicate = await client.post(
+                "/hub/api/projects",
+                headers=bob_headers,
+                json={"human_key": "/teams/m3a", "mention_handle": "bob"},
+            )
+            assert duplicate.status_code == 409
+
+            join = await client.post(
+                f"/hub/api/projects/{slug}/join-requests",
+                headers=bob_headers,
+                json={"mention_handle": "bob"},
+            )
+            assert join.status_code == 201
+            assert join.json()["status"] == "invited"
+
+            repeated_join = await client.post(
+                f"/hub/api/projects/{slug}/join-requests",
+                headers=bob_headers,
+                json={"mention_handle": "bob"},
+            )
+            assert repeated_join.status_code == 200
+            assert repeated_join.json()["id"] == join.json()["id"]
+
+            pending_cannot_read_agents = await client.get(
+                f"/hub/api/projects/{slug}/agents",
+                headers=bob_headers,
+            )
+            assert pending_cannot_read_agents.status_code == 403
+
+            cannot_self_promote = await client.patch(
+                f"/hub/api/projects/{slug}/membership",
+                headers=bob_headers,
+                json={"role": "admin"},
+            )
+            assert cannot_self_promote.status_code == 400
+
+            members = await client.get(
+                f"/hub/api/projects/{slug}/members",
+                headers=alice_headers,
+            )
+            assert members.status_code == 200
+            bob_membership = next(
+                item for item in members.json()["members"]
+                if item["human_id"] == bob.json()["id"]
+            )
+            assert bob_membership["status"] == "invited"
+
+            admin_cannot_set_others_default = await client.patch(
+                f"/hub/api/projects/{slug}/members/{bob.json()['id']}",
+                headers=alice_headers,
+                json={"default_agent_id": None},
+            )
+            assert admin_cannot_set_others_default.status_code == 400
+
+            approved = await client.patch(
+                f"/hub/api/projects/{slug}/members/{bob.json()['id']}",
+                headers=alice_headers,
+                json={"status": "active"},
+            )
+            assert approved.status_code == 200
+            assert approved.json()["status"] == "active"
+
+            async with get_session() as session:
+                agent = Agent(
+                    project_id=project["id"],
+                    name="GreenLake",
+                    program="test",
+                    model="test",
+                )
+                session.add(agent)
+                await session.commit()
+                await session.refresh(agent)
+                assert agent.id is not None
+                agent_id = agent.id
+
+            # Pre-M3a unowned agents remain visible, but an ordinary member
+            # cannot claim one by assigning owner_id to themselves.
+            agents = await client.get(
+                f"/hub/api/projects/{slug}/agents",
+                headers=bob_headers,
+            )
+            assert agents.status_code == 200
+            assert agents.json()["agents"][0]["owner_id"] is None
+
+            legacy_bypass = await client.post(
+                "/mail/api/retire-agent",
+                headers=bob_headers,
+                json={"agent_id": agent_id},
+            )
+            assert legacy_bypass.status_code == 403
+
+            claim = await client.patch(
+                f"/hub/api/projects/{slug}/agents/{agent_id}",
+                headers=bob_headers,
+                json={"owner_id": bob.json()["id"]},
+            )
+            assert claim.status_code == 403
+
+            assigned = await client.patch(
+                f"/hub/api/projects/{slug}/agents/{agent_id}",
+                headers=alice_headers,
+                json={"owner_id": bob.json()["id"]},
+            )
+            assert assigned.status_code == 200
+            assert assigned.json()["owner_id"] == bob.json()["id"]
+
+            retired = await client.patch(
+                f"/hub/api/projects/{slug}/agents/{agent_id}",
+                headers=bob_headers,
+                json={"retired": True},
+            )
+            assert retired.status_code == 200
+            assert retired.json()["retired"] is True
+
+            retired_default = await client.patch(
+                f"/hub/api/projects/{slug}/membership",
+                headers=bob_headers,
+                json={"default_agent_id": agent_id},
+            )
+            assert retired_default.status_code == 400
+
+            restored = await client.patch(
+                f"/hub/api/projects/{slug}/agents/{agent_id}",
+                headers=bob_headers,
+                json={"retired": False},
+            )
+            assert restored.status_code == 200
+
+            defaulted = await client.patch(
+                f"/hub/api/projects/{slug}/membership",
+                headers=bob_headers,
+                json={"default_agent_id": agent_id},
+            )
+            assert defaulted.status_code == 200
+            assert defaulted.json()["default_agent_id"] == agent_id
+
+            retire_default = await client.patch(
+                f"/hub/api/projects/{slug}/agents/{agent_id}",
+                headers=bob_headers,
+                json={"retired": True},
+            )
+            assert retire_default.status_code == 409
+
+            member_archive = await client.post(
+                "/mail/api/archive-project",
+                headers=bob_headers,
+                json={"project_id": project["id"]},
+            )
+            assert member_archive.status_code == 403
+
+            admin_archive = await client.post(
+                "/mail/api/archive-project",
+                headers=alice_headers,
+                json={"project_id": project["id"]},
+            )
+            assert admin_archive.status_code == 200
+
+            member_unarchive = await client.post(
+                "/mail/api/unarchive-project",
+                headers=bob_headers,
+                json={"project_id": project["id"]},
+            )
+            assert member_unarchive.status_code == 403
+
+            admin_unarchive = await client.post(
+                "/mail/api/unarchive-project",
+                headers=alice_headers,
+                json={"project_id": project["id"]},
+            )
+            assert admin_unarchive.status_code == 200

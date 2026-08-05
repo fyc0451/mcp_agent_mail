@@ -4188,7 +4188,12 @@ async def _validate_default_agent(
     """default agent must belong to the same project and be owned by this human."""
     if default_agent_id is None:
         return
-    agent = await session.get(Agent, default_agent_id)
+    result = await session.execute(
+        select(Agent)
+        .where(cast(Any, Agent.id) == default_agent_id)
+        .with_for_update()
+    )
+    agent = result.scalars().first()
     if agent is None:
         raise ValueError(f"default agent 不存在: {default_agent_id}")
     if agent.project_id != project.id:
@@ -4199,6 +4204,8 @@ async def _validate_default_agent(
         raise ValueError(
             f"default agent 必须属于该 human: agent.owner_id={agent.owner_id}, human={human_id}"
         )
+    if agent.retired_at is not None:
+        raise ValueError(f"default agent 必须是 active agent: {default_agent_id}")
 
 
 async def _ensure_human(
@@ -4228,7 +4235,12 @@ async def _set_agent_owner(
     Refuses to change/clear the owner of an agent that is referenced as a
     project membership default_agent_id — that would leave a dangling default.
     """
-    agent = await session.get(Agent, agent_id)
+    result = await session.execute(
+        select(Agent)
+        .where(cast(Any, Agent.id) == agent_id)
+        .with_for_update()
+    )
+    agent = result.scalars().first()
     if agent is None:
         raise NoResultFound(f"Agent id '{agent_id}' no longer exists.")
     if human_id is not None:

@@ -23,16 +23,24 @@ from fastapi.exception_handlers import http_exception_handler
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import text
-from sqlalchemy.exc import NoResultFound
+from sqlalchemy import select, text
+from sqlalchemy.exc import IntegrityError, NoResultFound
+from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.types import Receive, Scope, Send
 
 from .app import (
+    _agent_referenced_as_default,
+    _compute_project_slug,
+    _ensure_human,
     _expire_stale_file_reservations,
     _format_cross_project_agent_address,
+    _human_by_subject,
+    _normalize_project_human_key,
     _sender_display_name,
+    _set_agent_owner,
     _tool_metrics_snapshot,
+    _upsert_project_human_membership,
     build_mcp_server,
     get_project_sibling_data,
     refresh_project_sibling_suggestions,
@@ -41,6 +49,7 @@ from .app import (
 )
 from .config import Settings, get_settings
 from .db import ensure_schema, get_session
+from .models import Agent, Human, Project, ProjectHumanMembership
 from .storage import (
     ProjectArchive,
     archive_write_lock,
@@ -455,6 +464,7 @@ _LOGGING_CONFIGURED = False
 # Pre-compiled regex patterns for HTTP validators
 _SLUG_VALIDATOR_RE = re.compile(r"^[a-z0-9_-]+$", re.IGNORECASE)
 _AGENT_NAME_VALIDATOR_RE = re.compile(r"^[A-Za-z0-9]+$")
+_MENTION_HANDLE_VALIDATOR_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _TIMESTAMP_VALIDATOR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}")
 
 _LIKE_ESCAPE_CHAR = "!"
@@ -1615,6 +1625,536 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         """
         return JSONResponse({"status": "ok", "timestamp": datetime.now(timezone.utc).isoformat()})
 
+    # M3a shared-Hub identity API. These routes only mutate Hub metadata. They
+    # never invoke a local shell, terminal multiplexer, worktree, or task runner.
+    async def _hub_json_body(request: Request) -> dict[str, Any]:
+        try:
+            payload = await request.json()
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail="Request body must be a JSON object") from exc
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="Request body must be a JSON object")
+        return cast(dict[str, Any], payload)
+
+    def _hub_subject(request: Request) -> str:
+        claims = getattr(request.state, "jwt_claims", None)
+        subject = claims.get("sub") if isinstance(claims, dict) else None
+        if not isinstance(subject, str) or not subject.strip() or len(subject.strip()) > 255:
+            raise HTTPException(status_code=401, detail="A valid JWT subject is required")
+        return subject.strip()
+
+    async def _hub_human(request: Request, *, session: AsyncSession) -> Human:
+        human = await _human_by_subject(_hub_subject(request), session=session)
+        if human is None:
+            raise HTTPException(status_code=404, detail="Human identity is not registered")
+        return human
+
+    async def _hub_project(slug: str, *, session: AsyncSession) -> Project:
+        if not _SLUG_VALIDATOR_RE.fullmatch(slug):
+            raise HTTPException(status_code=400, detail="Invalid project slug")
+        result = await session.execute(
+            select(Project).where(cast(Any, Project.slug) == slug)
+        )
+        project = result.scalars().first()
+        if project is None:
+            raise HTTPException(status_code=404, detail="Project not found")
+        return project
+
+    async def _hub_membership(
+        project_id: int,
+        human_id: int,
+        *,
+        session: AsyncSession,
+    ) -> ProjectHumanMembership | None:
+        result = await session.execute(
+            select(ProjectHumanMembership).where(
+                cast(Any, ProjectHumanMembership.project_id) == project_id,
+                cast(Any, ProjectHumanMembership.human_id) == human_id,
+            )
+        )
+        return result.scalars().first()
+
+    async def _hub_active_membership(
+        project: Project,
+        human: Human,
+        *,
+        session: AsyncSession,
+        admin: bool = False,
+    ) -> ProjectHumanMembership:
+        if project.id is None or human.id is None:
+            raise HTTPException(status_code=403, detail="Active project membership is required")
+        membership = await _hub_membership(project.id, human.id, session=session)
+        if membership is None or membership.status != "active":
+            raise HTTPException(status_code=403, detail="Active project membership is required")
+        if admin and membership.role != "admin":
+            raise HTTPException(status_code=403, detail="Project admin membership is required")
+        return membership
+
+    async def _hub_agent_manager(
+        request: Request,
+        agent: Agent,
+        *,
+        session: AsyncSession,
+    ) -> tuple[Human, ProjectHumanMembership]:
+        human = await _hub_human(request, session=session)
+        project = await session.get(Project, agent.project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail="Project not found")
+        membership = await _hub_active_membership(project, human, session=session)
+        if membership.role != "admin" and agent.owner_id != human.id:
+            raise HTTPException(status_code=403, detail="Agent owner or project admin is required")
+        return human, membership
+
+    async def _hub_agent_for_update(agent_id: int, *, session: AsyncSession) -> Agent | None:
+        result = await session.execute(
+            select(Agent)
+            .where(cast(Any, Agent.id) == agent_id)
+            .with_for_update()
+        )
+        return result.scalars().first()
+
+    def _hub_human_payload(human: Human) -> dict[str, Any]:
+        return {"id": human.id, "display_name": human.display_name}
+
+    def _hub_membership_payload(membership: ProjectHumanMembership) -> dict[str, Any]:
+        return {
+            "id": membership.id,
+            "project_id": membership.project_id,
+            "human_id": membership.human_id,
+            "mention_handle": membership.mention_handle,
+            "role": membership.role,
+            "status": membership.status,
+            "default_agent_id": membership.default_agent_id,
+        }
+
+    def _hub_agent_payload(agent: Agent) -> dict[str, Any]:
+        return {
+            "id": agent.id,
+            "name": agent.name,
+            "program": agent.program,
+            "model": agent.model,
+            "owner_id": agent.owner_id,
+            "retired": agent.retired_at is not None,
+        }
+
+    def _hub_mention_handle(value: Any) -> str:
+        handle = value.strip() if isinstance(value, str) else ""
+        if not _MENTION_HANDLE_VALIDATOR_RE.fullmatch(handle):
+            raise HTTPException(
+                status_code=400,
+                detail="mention_handle must be 1-128 letters, numbers, '.', '_' or '-'",
+            )
+        return handle
+
+    @fastapi_app.put("/hub/api/humans/me", response_class=JSONResponse)
+    async def hub_upsert_human(request: Request) -> JSONResponse:
+        await ensure_schema()
+        body = await _hub_json_body(request)
+        display_name = body.get("display_name")
+        if not isinstance(display_name, str) or not display_name.strip():
+            raise HTTPException(status_code=400, detail="display_name is required")
+        if len(display_name.strip()) > 255:
+            raise HTTPException(status_code=400, detail="display_name is too long")
+        subject = _hub_subject(request)
+        async with get_session() as session:
+            try:
+                human = await _ensure_human(
+                    subject,
+                    display_name.strip(),
+                    session=session,
+                )
+                human.display_name = display_name.strip()
+                session.add(human)
+                await session.commit()
+            except IntegrityError as exc:
+                # Two tabs may bootstrap the same JWT subject concurrently.
+                # The unique subject row is authoritative; reuse it rather
+                # than leaking a database error to the second request.
+                await session.rollback()
+                human = await _human_by_subject(subject, session=session)
+                if human is None:
+                    raise HTTPException(status_code=409, detail="Human identity conflict") from exc
+                human.display_name = display_name.strip()
+                session.add(human)
+                await session.commit()
+            await session.refresh(human)
+            return JSONResponse(_hub_human_payload(human))
+
+    @fastapi_app.get("/hub/api/humans/me", response_class=JSONResponse)
+    async def hub_get_human(request: Request) -> JSONResponse:
+        await ensure_schema()
+        async with get_session() as session:
+            human = await _hub_human(request, session=session)
+            return JSONResponse(_hub_human_payload(human))
+
+    @fastapi_app.get("/hub/api/projects", response_class=JSONResponse)
+    async def hub_list_projects(request: Request) -> JSONResponse:
+        """List discoverable Hub projects without exposing local human_key paths."""
+        await ensure_schema()
+        async with get_session() as session:
+            human = await _hub_human(request, session=session)
+            if human.id is None:
+                raise HTTPException(status_code=404, detail="Human identity is not registered")
+            rows = await session.execute(
+                text(
+                    """
+                    SELECT p.id, p.slug, mine.role, mine.status, mine.mention_handle,
+                           COUNT(active_members.id) AS active_member_count
+                    FROM projects p
+                    LEFT JOIN project_human_memberships mine
+                      ON mine.project_id = p.id AND mine.human_id = :human_id
+                    LEFT JOIN project_human_memberships active_members
+                      ON active_members.project_id = p.id AND active_members.status = 'active'
+                    WHERE p.archived_at IS NULL
+                    GROUP BY p.id, p.slug, mine.role, mine.status, mine.mention_handle
+                    ORDER BY p.created_at DESC
+                    """
+                ),
+                {"human_id": human.id},
+            )
+            projects = [
+                {
+                    "id": row.id,
+                    "slug": row.slug,
+                    "active_member_count": row.active_member_count,
+                    "membership": (
+                        {
+                            "role": row.role,
+                            "status": row.status,
+                            "mention_handle": row.mention_handle,
+                        }
+                        if row.status is not None
+                        else None
+                    ),
+                }
+                for row in rows
+            ]
+            return JSONResponse({"projects": projects})
+
+    @fastapi_app.post("/hub/api/projects", response_class=JSONResponse, status_code=201)
+    async def hub_create_project(request: Request) -> JSONResponse:
+        await ensure_schema()
+        body = await _hub_json_body(request)
+        raw_human_key = body.get("human_key")
+        if not isinstance(raw_human_key, str) or not raw_human_key.strip():
+            raise HTTPException(status_code=400, detail="human_key is required")
+        human_key = _normalize_project_human_key(raw_human_key.strip())
+        if len(human_key) > 255:
+            raise HTTPException(status_code=400, detail="human_key is too long")
+        mention_handle = _hub_mention_handle(body.get("mention_handle"))
+        slug = _compute_project_slug(human_key)
+
+        async with get_session() as session:
+            human = await _hub_human(request, session=session)
+            project = Project(slug=slug, human_key=human_key)
+            session.add(project)
+            try:
+                await session.flush()
+                membership = await _upsert_project_human_membership(
+                    project=project,
+                    subject=human.subject,
+                    display_name=human.display_name,
+                    mention_handle=mention_handle,
+                    role="admin",
+                    status="active",
+                    session=session,
+                )
+                await session.commit()
+            except IntegrityError as exc:
+                await session.rollback()
+                raise HTTPException(status_code=409, detail="Project already exists") from exc
+            await session.refresh(project)
+            await session.refresh(membership)
+            return JSONResponse(
+                {
+                    "id": project.id,
+                    "slug": project.slug,
+                    "human_key": project.human_key,
+                    "membership": _hub_membership_payload(membership),
+                },
+                status_code=201,
+            )
+
+    @fastapi_app.post(
+        "/hub/api/projects/{project_slug}/join-requests",
+        response_class=JSONResponse,
+        status_code=201,
+    )
+    async def hub_request_project_join(project_slug: str, request: Request) -> JSONResponse:
+        await ensure_schema()
+        body = await _hub_json_body(request)
+        mention_handle = _hub_mention_handle(body.get("mention_handle"))
+        async with get_session() as session:
+            human = await _hub_human(request, session=session)
+            project = await _hub_project(project_slug, session=session)
+            if project.id is None or human.id is None:
+                raise HTTPException(status_code=404, detail="Project or Human not found")
+            project_id = project.id
+            human_id = human.id
+            existing = await _hub_membership(project_id, human_id, session=session)
+            if existing is not None and existing.status == "active":
+                raise HTTPException(status_code=409, detail="Human is already an active member")
+            try:
+                membership = await _upsert_project_human_membership(
+                    project=project,
+                    subject=human.subject,
+                    display_name=human.display_name,
+                    mention_handle=mention_handle,
+                    role="member",
+                    status="invited",
+                    session=session,
+                )
+                await session.commit()
+            except ValueError as exc:
+                await session.rollback()
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            except IntegrityError as exc:
+                # Idempotent concurrent self-join: if this Human's row won in
+                # another transaction, return it. A handle collision belonging
+                # to someone else remains a conflict.
+                await session.rollback()
+                membership = await _hub_membership(project_id, human_id, session=session)
+                if membership is None:
+                    raise HTTPException(status_code=409, detail="Membership conflict") from exc
+            await session.refresh(membership)
+            return JSONResponse(
+                _hub_membership_payload(membership),
+                status_code=200 if existing is not None else 201,
+            )
+
+    @fastapi_app.get(
+        "/hub/api/projects/{project_slug}/membership",
+        response_class=JSONResponse,
+    )
+    async def hub_get_membership(project_slug: str, request: Request) -> JSONResponse:
+        await ensure_schema()
+        async with get_session() as session:
+            human = await _hub_human(request, session=session)
+            project = await _hub_project(project_slug, session=session)
+            if project.id is None or human.id is None:
+                raise HTTPException(status_code=404, detail="Membership not found")
+            membership = await _hub_membership(project.id, human.id, session=session)
+            if membership is None:
+                raise HTTPException(status_code=404, detail="Membership not found")
+            return JSONResponse(_hub_membership_payload(membership))
+
+    @fastapi_app.patch(
+        "/hub/api/projects/{project_slug}/membership",
+        response_class=JSONResponse,
+    )
+    async def hub_update_membership(project_slug: str, request: Request) -> JSONResponse:
+        await ensure_schema()
+        body = await _hub_json_body(request)
+        allowed = {"mention_handle", "default_agent_id"}
+        if not body or not set(body).issubset(allowed):
+            raise HTTPException(
+                status_code=400,
+                detail="Only mention_handle and default_agent_id may be changed",
+            )
+        async with get_session() as session:
+            human = await _hub_human(request, session=session)
+            project = await _hub_project(project_slug, session=session)
+            membership = await _hub_active_membership(project, human, session=session)
+            mention_handle = (
+                _hub_mention_handle(body["mention_handle"])
+                if "mention_handle" in body
+                else membership.mention_handle
+            )
+            default_agent_id = body.get(
+                "default_agent_id", membership.default_agent_id
+            )
+            if default_agent_id is not None and (
+                isinstance(default_agent_id, bool) or not isinstance(default_agent_id, int)
+            ):
+                raise HTTPException(status_code=400, detail="default_agent_id must be an integer or null")
+            try:
+                membership = await _upsert_project_human_membership(
+                    project=project,
+                    subject=human.subject,
+                    display_name=human.display_name,
+                    mention_handle=mention_handle,
+                    role=membership.role,
+                    status=membership.status,
+                    default_agent_id=default_agent_id,
+                    session=session,
+                )
+                await session.commit()
+            except ValueError as exc:
+                await session.rollback()
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            await session.refresh(membership)
+            return JSONResponse(_hub_membership_payload(membership))
+
+    @fastapi_app.get(
+        "/hub/api/projects/{project_slug}/members",
+        response_class=JSONResponse,
+    )
+    async def hub_list_members(project_slug: str, request: Request) -> JSONResponse:
+        await ensure_schema()
+        async with get_session() as session:
+            human = await _hub_human(request, session=session)
+            project = await _hub_project(project_slug, session=session)
+            await _hub_active_membership(project, human, session=session, admin=True)
+            rows = await session.execute(
+                select(ProjectHumanMembership, Human)
+                .join(Human, cast(Any, Human.id) == ProjectHumanMembership.human_id)
+                .where(cast(Any, ProjectHumanMembership.project_id) == project.id)
+                .order_by(cast(Any, ProjectHumanMembership.created_at))
+            )
+            members = []
+            for membership, member_human in rows.all():
+                payload = _hub_membership_payload(membership)
+                payload["display_name"] = member_human.display_name
+                members.append(payload)
+            return JSONResponse({"members": members})
+
+    @fastapi_app.patch(
+        "/hub/api/projects/{project_slug}/members/{human_id}",
+        response_class=JSONResponse,
+    )
+    async def hub_manage_member(
+        project_slug: str,
+        human_id: int,
+        request: Request,
+    ) -> JSONResponse:
+        await ensure_schema()
+        body = await _hub_json_body(request)
+        allowed = {"mention_handle", "role", "status"}
+        if not body or not set(body).issubset(allowed):
+            raise HTTPException(
+                status_code=400,
+                detail="Only mention_handle, role and status may be changed",
+            )
+        async with get_session() as session:
+            actor = await _hub_human(request, session=session)
+            project = await _hub_project(project_slug, session=session)
+            await _hub_active_membership(project, actor, session=session, admin=True)
+            if actor.id == human_id:
+                raise HTTPException(status_code=400, detail="Use the self membership endpoint")
+            if project.id is None:
+                raise HTTPException(status_code=404, detail="Project not found")
+            membership = await _hub_membership(project.id, human_id, session=session)
+            target = await session.get(Human, human_id)
+            if membership is None or target is None:
+                raise HTTPException(status_code=404, detail="Membership not found")
+            mention_handle = (
+                _hub_mention_handle(body["mention_handle"])
+                if "mention_handle" in body
+                else membership.mention_handle
+            )
+            role = body.get("role", membership.role)
+            member_status = body.get("status", membership.status)
+            default_agent_id = (
+                None if member_status == "removed" else membership.default_agent_id
+            )
+            try:
+                membership = await _upsert_project_human_membership(
+                    project=project,
+                    subject=target.subject,
+                    display_name=target.display_name,
+                    mention_handle=mention_handle,
+                    role=role,
+                    status=member_status,
+                    default_agent_id=default_agent_id,
+                    session=session,
+                )
+                await session.commit()
+            except ValueError as exc:
+                await session.rollback()
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            await session.refresh(membership)
+            return JSONResponse(_hub_membership_payload(membership))
+
+    @fastapi_app.get(
+        "/hub/api/projects/{project_slug}/agents",
+        response_class=JSONResponse,
+    )
+    async def hub_list_agents(project_slug: str, request: Request) -> JSONResponse:
+        await ensure_schema()
+        async with get_session() as session:
+            human = await _hub_human(request, session=session)
+            project = await _hub_project(project_slug, session=session)
+            await _hub_active_membership(project, human, session=session)
+            rows = await session.execute(
+                select(Agent)
+                .where(cast(Any, Agent.project_id) == project.id)
+                .order_by(Agent.name)
+            )
+            return JSONResponse(
+                {"agents": [_hub_agent_payload(agent) for agent in rows.scalars().all()]}
+            )
+
+    @fastapi_app.patch(
+        "/hub/api/projects/{project_slug}/agents/{agent_id}",
+        response_class=JSONResponse,
+    )
+    async def hub_manage_agent(
+        project_slug: str,
+        agent_id: int,
+        request: Request,
+    ) -> JSONResponse:
+        await ensure_schema()
+        body = await _hub_json_body(request)
+        allowed = {"owner_id", "retired"}
+        if not body or not set(body).issubset(allowed):
+            raise HTTPException(status_code=400, detail="Only owner_id and retired may be changed")
+        async with get_session() as session:
+            human = await _hub_human(request, session=session)
+            project = await _hub_project(project_slug, session=session)
+            membership = await _hub_active_membership(project, human, session=session)
+            agent = await _hub_agent_for_update(agent_id, session=session)
+            if agent is None or agent.project_id != project.id:
+                raise HTTPException(status_code=404, detail="Agent not found")
+
+            if "owner_id" in body:
+                if membership.role != "admin":
+                    raise HTTPException(status_code=403, detail="Project admin membership is required")
+                owner_id = body["owner_id"]
+                if owner_id is not None and (
+                    isinstance(owner_id, bool) or not isinstance(owner_id, int)
+                ):
+                    raise HTTPException(status_code=400, detail="owner_id must be an integer or null")
+                if owner_id is not None:
+                    owner_membership = await _hub_membership(
+                        agent.project_id,
+                        owner_id,
+                        session=session,
+                    )
+                    if owner_membership is None or owner_membership.status != "active":
+                        raise HTTPException(
+                            status_code=400,
+                            detail="Agent owner must be an active project member",
+                        )
+                try:
+                    agent = await _set_agent_owner(agent_id, owner_id, session=session)
+                except (NoResultFound, ValueError) as exc:
+                    raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+            if "retired" in body:
+                retired = body["retired"]
+                if not isinstance(retired, bool):
+                    raise HTTPException(status_code=400, detail="retired must be a boolean")
+                if membership.role != "admin" and agent.owner_id != human.id:
+                    raise HTTPException(
+                        status_code=403,
+                        detail="Agent owner or project admin is required",
+                    )
+                if retired and agent.retired_at is None:
+                    referenced = await _agent_referenced_as_default(agent_id, session=session)
+                    if referenced:
+                        raise HTTPException(
+                            status_code=409,
+                            detail="Clear membership default_agent_id before retiring this agent",
+                        )
+                agent.retired_at = (
+                    datetime.now(timezone.utc).replace(tzinfo=None) if retired else None
+                )
+                session.add(agent)
+
+            await session.commit()
+            await session.refresh(agent)
+            return JSONResponse(_hub_agent_payload(agent))
+
     def _oauth_metadata_disabled_response() -> JSONResponse:
         return JSONResponse({"mcp_oauth": False}, status_code=404)
 
@@ -2266,10 +2806,17 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     raise HTTPException(status_code=400, detail="agent_id is required")
 
                 async with get_session() as session:
-                    from .models import Agent
-                    agent = await session.get(Agent, agent_id)
+                    agent = await _hub_agent_for_update(agent_id, session=session)
                     if not agent:
                         raise HTTPException(status_code=404, detail="Agent not found")
+                    if settings.http.jwt_enabled:
+                        await _hub_agent_manager(request, agent, session=session)
+                    referenced = await _agent_referenced_as_default(agent_id, session=session)
+                    if referenced:
+                        raise HTTPException(
+                            status_code=409,
+                            detail="Clear membership default_agent_id before retiring this agent",
+                        )
                     agent.retired_at = datetime.now(timezone.utc).replace(tzinfo=None)
                     session.add(agent)
                     await session.commit()
@@ -2291,10 +2838,11 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     raise HTTPException(status_code=400, detail="agent_id is required")
 
                 async with get_session() as session:
-                    from .models import Agent
-                    agent = await session.get(Agent, agent_id)
+                    agent = await _hub_agent_for_update(agent_id, session=session)
                     if not agent:
                         raise HTTPException(status_code=404, detail="Agent not found")
+                    if settings.http.jwt_enabled:
+                        await _hub_agent_manager(request, agent, session=session)
                     agent.retired_at = None
                     session.add(agent)
                     await session.commit()
@@ -2318,10 +2866,17 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     raise HTTPException(status_code=400, detail="project_id is required")
 
                 async with get_session() as session:
-                    from .models import Project
                     project = await session.get(Project, project_id)
                     if not project:
                         raise HTTPException(status_code=404, detail="Project not found")
+                    if settings.http.jwt_enabled:
+                        human = await _hub_human(request, session=session)
+                        await _hub_active_membership(
+                            project,
+                            human,
+                            session=session,
+                            admin=True,
+                        )
                     project.archived_at = datetime.now(timezone.utc).replace(tzinfo=None)
                     session.add(project)
                     await session.commit()
@@ -2343,10 +2898,17 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     raise HTTPException(status_code=400, detail="project_id is required")
 
                 async with get_session() as session:
-                    from .models import Project
                     project = await session.get(Project, project_id)
                     if not project:
                         raise HTTPException(status_code=404, detail="Project not found")
+                    if settings.http.jwt_enabled:
+                        human = await _hub_human(request, session=session)
+                        await _hub_active_membership(
+                            project,
+                            human,
+                            session=session,
+                            admin=True,
+                        )
                     project.archived_at = None
                     session.add(project)
                     await session.commit()
