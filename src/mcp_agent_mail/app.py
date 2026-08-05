@@ -38,6 +38,7 @@ from git.exc import InvalidGitRepositoryError, NoSuchPathError
 from sqlalchemy import and_ as _sa_and, asc as _sa_asc, bindparam, delete as _sa_delete, desc as _sa_desc, exists as _sa_exists, func, or_ as _sa_or, select as _sa_select, text, update as _sa_update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError, NoResultFound, OperationalError, TimeoutError as SATimeoutError
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
 from . import rich_logger
@@ -65,11 +66,13 @@ from .models import (
     ChannelSubscription,
     FileReservation,
     HubAuditEvent,
+    Human,
     MentionDelivery,
     Message,
     MessageRecipient,
     MessageSummary,
     Project,
+    ProjectHumanMembership,
     ProjectSiblingSuggestion,
     Product,
     ProductProjectLink,
@@ -3851,6 +3854,21 @@ async def _get_or_create_agent(
                 await session.refresh(agent)
                 break
 
+            # M3a reverse invariant: a new agent name must not collide with an
+            # active human membership mention_handle (case-insensitive). An
+            # existing agent re-registering keeps its own name (handled above);
+            # a fresh explicit name colliding is an error; an auto-generated
+            # name colliding is regenerated, bounded by the 5-attempt retry.
+            if await _membership_handle_taken(
+                project, desired_name, session=session, active_only=True
+            ):
+                if explicit_name_used:
+                    raise ValueError(
+                        f"agent 名与项目 human membership mention_handle 冲突: {desired_name}"
+                    )
+                desired_name = await _generate_unique_agent_name(project, settings, None)
+                continue
+
             candidate = Agent(
                 project_id=project.id,
                 name=desired_name,
@@ -4073,6 +4091,226 @@ async def _ensure_agent_registration_token(
             await session.commit()
             await session.refresh(db_agent)
         return db_agent, str(token)
+
+
+# ── M3a: human identity + project membership ──────────────────
+#
+# Service layer enforces the cross-row invariants a plain unique constraint
+# cannot express in SQLite:
+#   * (project, human) unique, (project, mention_handle) unique — via constraints
+#   * default agent must belong to the same project AND be owned by this human
+#   * mention_handle must not collide with an active agent name in the project
+
+
+async def _human_by_subject(subject: str, *, session: AsyncSession) -> Human | None:
+    """Return the global human for an opaque subject (case-sensitive)."""
+    if not subject or not subject.strip():
+        return None
+    result = await session.execute(
+        select(Human).where(cast(Any, Human.subject == subject.strip()))
+    )
+    return result.scalars().first()
+
+
+async def _active_agent_names(project: Project, *, session: AsyncSession) -> set[str]:
+    """Return the set of active agent names in a project (case-insensitive)."""
+    if project.id is None:
+        return set()
+    result = await session.execute(
+        select(Agent.name).where(
+            cast(Any, Agent.project_id == project.id),
+            cast(Any, Agent.retired_at).is_(None),
+        )
+    )
+    return {str(name) for name in result.scalars().all()}
+
+
+async def _membership_collides_with_agent(
+    project: Project, mention_handle: str, *, session: AsyncSession
+) -> bool:
+    """True if a mention_handle collides with an active agent name in the project."""
+    active = await _active_agent_names(project, session=session)
+    return mention_handle.lower() in {name.lower() for name in active}
+
+
+async def _membership_handle_taken(
+    project: Project, mention_handle: str, *, session: AsyncSession,
+    exclude_human_id: int | None = None,
+    active_only: bool = False,
+) -> bool:
+    """True if a mention_handle (case-insensitive) is already used by another
+    membership in the project.
+
+    Membership upserts check every status because the database uniqueness rule
+    covers every row. Agent registration passes ``active_only=True`` because
+    only active human handles reserve the shared mention namespace.
+    """
+    if project.id is None:
+        return False
+    statement = select(
+        ProjectHumanMembership.mention_handle,
+        ProjectHumanMembership.human_id,
+    ).where(
+        cast(Any, ProjectHumanMembership.project_id) == project.id,
+    )
+    if active_only:
+        statement = statement.where(
+            cast(Any, ProjectHumanMembership.status) == "active"
+        )
+    rows = await session.execute(statement)
+    needle = mention_handle.lower()
+    return any(
+        str(handle).lower() == needle
+        and (exclude_human_id is None or human_id != exclude_human_id)
+        for handle, human_id in rows.all()
+    )
+
+
+async def _agent_referenced_as_default(
+    agent_id: int, *, session: AsyncSession
+) -> list[ProjectHumanMembership]:
+    """Return memberships whose default_agent_id references this agent.
+
+    Detaching or re-owning such an agent would leave a dangling reference, so
+    callers must refuse the change instead.
+    """
+    rows = await session.execute(
+        select(ProjectHumanMembership).where(
+            cast(Any, ProjectHumanMembership.default_agent_id) == agent_id
+        )
+    )
+    return list(rows.scalars().all())
+
+
+async def _validate_default_agent(
+    project: Project, human_id: int, default_agent_id: int | None, *, session: AsyncSession
+) -> None:
+    """default agent must belong to the same project and be owned by this human."""
+    if default_agent_id is None:
+        return
+    agent = await session.get(Agent, default_agent_id)
+    if agent is None:
+        raise ValueError(f"default agent 不存在: {default_agent_id}")
+    if agent.project_id != project.id:
+        raise ValueError(
+            f"default agent 必须属于同一项目: agent={agent.project_id}, project={project.id}"
+        )
+    if agent.owner_id != human_id:
+        raise ValueError(
+            f"default agent 必须属于该 human: agent.owner_id={agent.owner_id}, human={human_id}"
+        )
+
+
+async def _ensure_human(
+    subject: str, display_name: str, *, session: AsyncSession
+) -> Human:
+    """Create or fetch a global human; display_name may repeat across humans."""
+    subject = (subject or "").strip()
+    if not subject:
+        raise ValueError("human subject 不能为空")
+    display_name = (display_name or "").strip()
+    if not display_name:
+        raise ValueError("human display_name 不能为空")
+    human = await _human_by_subject(subject, session=session)
+    if human is not None:
+        return human
+    human = Human(subject=subject, display_name=display_name[:255])
+    session.add(human)
+    await session.flush()
+    return human
+
+
+async def _set_agent_owner(
+    agent_id: int, human_id: int | None, *, session: AsyncSession
+) -> Agent:
+    """Attach / detach an agent's owner (nullable).
+
+    Refuses to change/clear the owner of an agent that is referenced as a
+    project membership default_agent_id — that would leave a dangling default.
+    """
+    agent = await session.get(Agent, agent_id)
+    if agent is None:
+        raise NoResultFound(f"Agent id '{agent_id}' no longer exists.")
+    if human_id is not None:
+        human = await session.get(Human, human_id)
+        if human is None:
+            raise ValueError(f"human 不存在: {human_id}")
+    # Prevent dangling default_agent_id: if some membership points at this agent
+    # as its default, the owner must not change (or be cleared).
+    referenced = await _agent_referenced_as_default(agent_id, session=session)
+    if referenced and agent.owner_id != human_id:
+        raise ValueError("默认 agent 引用(default_agent_id)存在, 不能修改 owner")
+    agent.owner_id = human_id
+    session.add(agent)
+    await session.flush()
+    return agent
+
+
+async def _upsert_project_human_membership(
+    *,
+    project: Project,
+    subject: str,
+    display_name: str,
+    mention_handle: str,
+    role: str = "member",
+    status: str = "active",
+    default_agent_id: int | None = None,
+    session: AsyncSession,
+) -> ProjectHumanMembership:
+    """Create or update a human's membership in a project (service foundation).
+
+    Enforces the M3a invariants the plain constraints cannot express:
+      * mention_handle collides with an active agent name → rejected
+      * mention_handle case-insensitively unique within the project
+      * default agent must belong to the same project and be owned by the human
+    """
+    mention_handle = (mention_handle or "").strip()
+    if not mention_handle:
+        raise ValueError("mention_handle 不能为空")
+    if role not in ("member", "admin"):
+        raise ValueError(f"role 必须是 member|admin: {role!r}")
+    if status not in ("active", "invited", "removed"):
+        raise ValueError(f"status 必须是 active|invited|removed: {status!r}")
+    if project.id is None:
+        raise ValueError("项目未持久化")
+    if await _membership_collides_with_agent(project, mention_handle, session=session):
+        raise ValueError(f"mention_handle 与项目 active agent 名冲突: {mention_handle}")
+    human = await _ensure_human(subject, display_name, session=session)
+    if human.id is None:
+        raise ValueError("human 创建失败")
+    if await _membership_handle_taken(
+        project, mention_handle, session=session, exclude_human_id=human.id
+    ):
+        raise ValueError(
+            f"mention_handle 已在项目内被使用(大小写不敏感): {mention_handle}"
+        )
+    await _validate_default_agent(project, human.id, default_agent_id, session=session)
+    existing = await session.execute(
+        select(ProjectHumanMembership).where(
+            cast(Any, ProjectHumanMembership.project_id) == project.id,
+            cast(Any, ProjectHumanMembership.human_id) == human.id,
+        )
+    )
+    membership = existing.scalars().first()
+    if membership is None:
+        membership = ProjectHumanMembership(
+            project_id=project.id,
+            human_id=human.id,
+            mention_handle=mention_handle,
+            role=role,
+            status=status,
+            default_agent_id=default_agent_id,
+        )
+        session.add(membership)
+    else:
+        membership.mention_handle = mention_handle
+        membership.role = role
+        membership.status = status
+        membership.default_agent_id = default_agent_id
+        membership.updated_at = _naive_utc()
+        session.add(membership)
+    await session.flush()
+    return membership
 
 
 def _message_visible_to_agent_clause(agent_id: int) -> Any:

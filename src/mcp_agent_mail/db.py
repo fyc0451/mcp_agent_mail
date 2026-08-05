@@ -936,6 +936,8 @@ def _setup_fts(connection: Any) -> None:
         # round-trip through the DB (previously reply_to lived only in the
         # response payload and was lost on read).
         "ALTER TABLE messages ADD COLUMN reply_to INTEGER DEFAULT NULL",
+        # M3a: owning human for an agent (nullable; pre-M3a agents stay unowned).
+        "ALTER TABLE agents ADD COLUMN owner_id INTEGER DEFAULT NULL",
     ]:
         with suppress(Exception):  # Column already exists — safe to ignore
             connection.exec_driver_sql(migration_sql)
@@ -946,6 +948,10 @@ def _setup_fts(connection: Any) -> None:
         "CREATE INDEX IF NOT EXISTS ix_agents_registration_token ON agents (registration_token)",
         "CREATE INDEX IF NOT EXISTS idx_messages_project_topic ON messages (project_id, topic)",
         "CREATE INDEX IF NOT EXISTS ix_messages_reply_to ON messages (reply_to)",
+        "CREATE INDEX IF NOT EXISTS ix_agents_owner_id ON agents (owner_id)",
+        # M3a: case-insensitive unique mention_handle within a project.
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_phm_project_handle_ci "
+        "ON project_human_memberships (project_id, lower(mention_handle))",
     ]:
         connection.exec_driver_sql(index_sql)
 

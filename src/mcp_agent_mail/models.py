@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from sqlalchemy import Column, Index, UniqueConstraint
+from sqlalchemy import Column, Index, UniqueConstraint, text
 from sqlalchemy.types import JSON
 from sqlmodel import Field, SQLModel
 
@@ -71,6 +71,10 @@ class Agent(SQLModel, table=True):
     contact_policy: str = Field(default="auto", max_length=16)  # open | auto | contacts_only | block_all
     registration_token: Optional[str] = Field(default=None, max_length=64, index=True)
     retired_at: Optional[datetime] = Field(default=None)
+    # M3a identity: owning human (nullable so pre-M3a agents stay unowned).
+    # The owner's project need not match this agent's project_id — a human is a
+    # global identity, while default_agent_id lives on ProjectHumanMembership.
+    owner_id: Optional[int] = Field(default=None, foreign_key="humans.id", index=True)
 
 
 class MessageRecipient(SQLModel, table=True):
@@ -381,3 +385,64 @@ class ProjectSiblingSuggestion(SQLModel, table=True):
     evaluated_ts: datetime = Field(default_factory=_utcnow_naive)
     confirmed_ts: Optional[datetime] = Field(default=None)
     dismissed_ts: Optional[datetime] = Field(default=None)
+
+
+class Human(SQLModel, table=True):
+    """M3a global human identity.
+
+    ``subject`` is the stable opaque auth identity; ``id`` is its local integer
+    primary key. ``display_name`` may repeat across humans (it is only for
+    display; @-mention disambiguation is handled by membership handles).
+    """
+
+    __tablename__ = "humans"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    subject: str = Field(index=True, unique=True, max_length=255)
+    display_name: str = Field(max_length=255)
+    created_at: datetime = Field(default_factory=_utcnow_naive)
+
+
+class ProjectHumanMembership(SQLModel, table=True):
+    """M3a membership of a global human within a project (per-project role).
+
+    ``mention_handle`` is unique per project and must not collide with an
+    active agent name in the same project. ``default_agent_id`` is the human's
+    default delivery target within THIS project (may be NULL) and must belong to
+    the same project and to this human.
+
+    Note: a plain unique constraint cannot express the cross-row default-agent
+    invariant (same project + owned by this human); the service layer enforces it.
+    """
+
+    __tablename__ = "project_human_memberships"
+    __table_args__ = (
+        UniqueConstraint("project_id", "human_id", name="uq_phm_project_human"),
+        UniqueConstraint("project_id", "mention_handle", name="uq_phm_project_mention_handle"),
+        # human_id/project_id/default_agent_id 索引由 Field(index=True) 生成,
+        # 不在此重复声明。
+        # Database-level case-insensitive uniqueness for mention_handle within a
+        # project: the plain unique constraint is case-sensitive, and human
+        # handles must be unique ignoring case (lead audit point 2).
+        # NOTE: must reference the COLUMN expression lower(mention_handle),
+        # not func.lower('mention_handle') which would compile to the string
+        # constant lower('mention_handle') and reject every second membership.
+        Index(
+            "uq_phm_project_handle_ci",
+            "project_id",
+            text("lower(mention_handle)"),
+            unique=True,
+        ),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    project_id: int = Field(foreign_key="projects.id", index=True)
+    human_id: int = Field(foreign_key="humans.id", index=True)
+    mention_handle: str = Field(max_length=128)
+    role: str = Field(default="member", max_length=32)  # member | admin
+    status: str = Field(default="active", max_length=16)  # active | invited | removed
+    default_agent_id: Optional[int] = Field(
+        default=None, foreign_key="agents.id", index=True
+    )
+    created_at: datetime = Field(default_factory=_utcnow_naive)
+    updated_at: datetime = Field(default_factory=_utcnow_naive)
