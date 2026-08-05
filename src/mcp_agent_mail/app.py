@@ -67,6 +67,7 @@ from .models import (
     FileReservation,
     HubAuditEvent,
     Human,
+    HumanInboxItem,
     MentionDelivery,
     Message,
     MessageRecipient,
@@ -249,7 +250,7 @@ class HubAuditEventListDTO(TypedDict):
 
 
 _HUB_AUDIT_EVENT_TYPES = frozenset({"channel_message_posted", "channel_mention_delivery"})
-_HUB_AUDIT_OUTCOMES = frozenset({"succeeded", "delivered", "already_delivered", "skipped"})
+_HUB_AUDIT_OUTCOMES = frozenset({"succeeded", "delivered", "already_delivered", "skipped", "delivered_human_inbox"})
 _HUB_AUDIT_REASONS = frozenset({"unknown", "ambiguous", "block_all", "target_failed"})
 
 # ty currently struggles to type SQLModel-mapped SQLAlchemy expressions.
@@ -4505,6 +4506,10 @@ class _ChannelMentionResolution:
     agent: Agent | None = None
     project: Project | None = None
     reason: str | None = None
+    # Set when the mention targets a project human membership without a usable
+    # default agent: the receipt goes to the durable human inbox instead of an
+    # agent mailbox.
+    human_id: int | None = None
 
 
 async def _resolve_channel_mentions(
@@ -4561,6 +4566,43 @@ async def _resolve_channel_mentions(
             cross_seen[key].add(agent.id)
             cross_by_name[key].append((project, agent))
 
+        # M3a: candidates that match neither a local agent nor a cross-project
+        # link may address a project human membership's mention_handle
+        # (active only, case-insensitive, project-local). A membership with a
+        # usable default agent routes to that agent; without one the receipt
+        # lands in the durable human inbox.
+        human_candidates = [
+            key
+            for key in lookup_keys
+            if key != sender.name.lower()
+            and key not in local_by_name
+            and key not in cross_by_name
+        ]
+        human_by_key: dict[str, ProjectHumanMembership] = {}
+        default_agents: dict[int, Agent] = {}
+        if human_candidates:
+            membership_rows = await session.execute(
+                select(ProjectHumanMembership).where(
+                    cast(Any, ProjectHumanMembership.project_id) == channel_project.id,
+                    cast(Any, ProjectHumanMembership.status) == "active",
+                    func.lower(ProjectHumanMembership.mention_handle).in_(human_candidates),
+                )
+            )
+            for membership in membership_rows.scalars().all():
+                human_by_key[membership.mention_handle.lower()] = membership
+            default_ids = {
+                membership.default_agent_id
+                for membership in human_by_key.values()
+                if membership.default_agent_id is not None
+            }
+            if default_ids:
+                agent_rows = await session.execute(
+                    select(Agent).where(cast(Any, Agent.id).in_(default_ids))
+                )
+                default_agents = {
+                    agent.id: agent for agent in agent_rows.scalars().all() if agent.id is not None
+                }
+
     resolutions: list[_ChannelMentionResolution] = []
     sender_key = sender.name.lower()
     for name in ordered_names:
@@ -4579,7 +4621,41 @@ async def _resolve_channel_mentions(
             agent = local_by_name.get(key)
             project = channel_project if agent is not None else None
         if agent is None or project is None:
-            resolutions.append(_ChannelMentionResolution(name=name, reason="unknown"))
+            membership = human_by_key.get(key)
+            if membership is not None and membership.human_id is not None:
+                default_agent = (
+                    default_agents.get(membership.default_agent_id)
+                    if membership.default_agent_id is not None
+                    else None
+                )
+                if default_agent is not None and (
+                    default_agent.project_id != channel_project.id
+                    or default_agent.owner_id != membership.human_id
+                    or default_agent.retired_at is not None
+                ):
+                    # Re-check the ownership invariant at the delivery boundary.
+                    # Normal APIs enforce it when assigning a default, but old or
+                    # directly corrupted rows must never route a Human mention to
+                    # another project or another Human's Agent.
+                    default_agent = None
+                if default_agent is not None and default_agent.contact_policy == "block_all":
+                    resolutions.append(
+                        _ChannelMentionResolution(
+                            name=name, agent=default_agent, project=channel_project, reason="block_all"
+                        )
+                    )
+                elif default_agent is not None:
+                    resolutions.append(
+                        _ChannelMentionResolution(name=name, agent=default_agent, project=channel_project)
+                    )
+                else:
+                    resolutions.append(
+                        _ChannelMentionResolution(
+                            name=name, project=channel_project, human_id=membership.human_id
+                        )
+                    )
+            else:
+                resolutions.append(_ChannelMentionResolution(name=name, reason="unknown"))
         elif agent.contact_policy == "block_all":
             resolutions.append(_ChannelMentionResolution(name=name, agent=agent, project=project, reason="block_all"))
         else:
@@ -4733,6 +4809,90 @@ async def _write_channel_mention_receipt(
     return statuses
 
 
+async def _write_human_inbox_receipt(
+    target_project: Project,
+    sender: Agent,
+    source: ChannelMessage,
+    human_ids: Sequence[int],
+) -> dict[int, tuple[str, int | None]]:
+    """Durable human-inbox fanout for @human mentions without a default agent.
+
+    Creates ONE receipt Message (no agent recipients) plus one HumanInboxItem
+    per human. Idempotent per (source channel message, human); existing items
+    are reported as already_delivered. Pure DB writes: no git archive, no
+    local execution (Herdr/shell/worktree/task) — the hub stays a dumb bus.
+    """
+    if target_project.id is None or sender.id is None or source.id is None:
+        raise ValueError("Target project, sender, and source message must have ids.")
+
+    wanted = list(dict.fromkeys(human_ids))
+    if not wanted:
+        return {}
+    existing: dict[int, int] = {}
+    new_human_ids: list[int] = []
+    message: Message | None = None
+    for attempt in range(3):
+        async with get_session() as session:
+            existing_rows = await session.execute(
+                select(HumanInboxItem).where(
+                    cast(Any, HumanInboxItem.source_channel_message_id == source.id),
+                    cast(Any, HumanInboxItem.human_id).in_(wanted),
+                )
+            )
+            existing = {
+                row.human_id: row.message_id for row in existing_rows.scalars().all()
+            }
+            new_human_ids = [human_id for human_id in wanted if human_id not in existing]
+            if not new_human_ids:
+                return {
+                    human_id: ("already_delivered", receipt_id)
+                    for human_id, receipt_id in existing.items()
+                }
+            message = Message(
+                project_id=target_project.id,
+                sender_id=sender.id,
+                subject=source.subject,
+                body_md=source.body_md,
+                importance=source.importance,
+                ack_required=False,
+                attachments=list(source.attachments),
+            )
+            session.add(message)
+            await session.flush()
+            assert message.id is not None
+            for human_id in new_human_ids:
+                session.add(
+                    HumanInboxItem(
+                        project_id=target_project.id,
+                        human_id=human_id,
+                        message_id=message.id,
+                        source_channel_message_id=source.id,
+                        kind="mention",
+                    )
+                )
+            try:
+                await session.commit()
+                await session.refresh(message)
+                break
+            except IntegrityError:
+                await session.rollback()
+                message = None
+                # A concurrent uq_hii_source_human winner is resolved by the
+                # next query. Other integrity failures safely exhaust the
+                # bounded retries and become target_failed upstream.
+                if attempt == 2:
+                    raise
+    if message is None or message.id is None:
+        raise RuntimeError("Human inbox receipt was not created.")
+
+    statuses: dict[int, tuple[str, int | None]] = {
+        human_id: ("already_delivered", receipt_id)
+        for human_id, receipt_id in existing.items()
+    }
+    statuses.update(dict.fromkeys(new_human_ids, ("delivered", message.id)))
+    return statuses
+
+
 async def _deliver_channel_mentions(
     ctx: Context,
     channel_project: Project,
@@ -4746,6 +4906,7 @@ async def _deliver_channel_mentions(
     resolutions = await _resolve_channel_mentions(channel_project, sender, names)
     outcomes: list[ChannelMentionDeliveryDTO | None] = [None] * len(resolutions)
     groups: dict[int, tuple[Project, list[tuple[int, _ChannelMentionResolution]]]] = {}
+    human_members: list[tuple[int, _ChannelMentionResolution]] = []
 
     for index, resolution in enumerate(resolutions):
         if resolution.reason is not None:
@@ -4756,6 +4917,10 @@ async def _deliver_channel_mentions(
                 "receipt_message_id": None,
                 "reason": resolution.reason,
             }
+            continue
+        if resolution.agent is None and resolution.human_id is not None:
+            # @human without a usable default agent → durable human inbox.
+            human_members.append((index, resolution))
             continue
         if resolution.agent is None or resolution.agent.id is None or resolution.project is None:
             raise RuntimeError("Resolved mention is missing its target identity.")
@@ -4798,6 +4963,48 @@ async def _deliver_channel_mentions(
                 "receipt_message_id": receipt_message_id,
                 "reason": None,
             }
+
+    if human_members:
+        human_ids = [
+            resolution.human_id
+            for _index, resolution in human_members
+            if resolution.human_id is not None
+        ]
+        try:
+            human_statuses = await _write_human_inbox_receipt(
+                channel_project, sender, source, human_ids
+            )
+        except Exception:
+            logger.exception(
+                "Failed to deliver human inbox receipts for channel_message=%s target_project=%s",
+                source.id,
+                channel_project.human_key,
+            )
+            with suppress(Exception):
+                await ctx.info(
+                    f"Human inbox receipt delivery failed for target project '{channel_project.human_key}'."
+                )
+            for index, resolution in human_members:
+                outcomes[index] = {
+                    "name": resolution.name,
+                    "target_project_key": channel_project.human_key,
+                    "status": "skipped",
+                    "receipt_message_id": None,
+                    "reason": "target_failed",
+                }
+        else:
+            for index, resolution in human_members:
+                assert resolution.human_id is not None
+                status, receipt_message_id = human_statuses[resolution.human_id]
+                outcomes[index] = {
+                    "name": resolution.name,
+                    "target_project_key": channel_project.human_key,
+                    "status": (
+                        "delivered_human_inbox" if status == "delivered" else status
+                    ),
+                    "receipt_message_id": receipt_message_id,
+                    "reason": None,
+                }
 
     resolved_outcomes = [outcome for outcome in outcomes if outcome is not None]
     if len(resolved_outcomes) != len(resolutions):

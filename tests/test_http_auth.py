@@ -1007,3 +1007,83 @@ class TestHubHumanIdentityApi:
                 json={"project_id": project["id"]},
             )
             assert admin_unarchive.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_member_roster_readable_by_active_members_only(
+        self, isolated_env, monkeypatch
+    ):
+        """Directory semantics (lead ruling): ordinary active members read a
+        minimal roster of ACTIVE members only (human_id, display_name,
+        mention_handle, role/status) — no invited/removed rows, no opaque
+        subject, no other members' default_agent_id. Admins keep the full
+        view for approval and member management."""
+        settings = _configure_hub_jwt(monkeypatch)
+        app = build_http_app(settings, build_mcp_server())
+        alice_headers = _hub_headers(settings, "oidc|alice")
+        bob_headers = _hub_headers(settings, "oidc|bob")
+        carol_headers = _hub_headers(settings, "oidc|carol")
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            for headers, name in ((alice_headers, "Alice"), (bob_headers, "Bob"), (carol_headers, "Carol")):
+                r = await client.put("/hub/api/humans/me", headers=headers, json={"display_name": name})
+                assert r.status_code == 200
+
+            created = await client.post(
+                "/hub/api/projects",
+                headers=alice_headers,
+                json={"human_key": "/teams/roster", "mention_handle": "alice"},
+            )
+            assert created.status_code == 201
+            slug = created.json()["slug"]
+
+            join = await client.post(
+                f"/hub/api/projects/{slug}/join-requests",
+                headers=bob_headers,
+                json={"mention_handle": "bob"},
+            )
+            assert join.status_code == 201
+
+            # invited member may not read the roster
+            invited = await client.get(f"/hub/api/projects/{slug}/members", headers=bob_headers)
+            assert invited.status_code == 403
+            # non-member may not read the roster
+            outsider = await client.get(f"/hub/api/projects/{slug}/members", headers=carol_headers)
+            assert outsider.status_code == 403
+
+            bob_id = join.json()["human_id"]
+            approve = await client.patch(
+                f"/hub/api/projects/{slug}/members/{bob_id}",
+                headers=alice_headers,
+                json={"status": "active"},
+            )
+            assert approve.status_code == 200
+
+            # carol requests too but stays invited: invisible to ordinary members
+            carol_join = await client.post(
+                f"/hub/api/projects/{slug}/join-requests",
+                headers=carol_headers,
+                json={"mention_handle": "carol"},
+            )
+            assert carol_join.status_code == 201
+
+            # ordinary active member: minimal roster, ACTIVE rows only
+            roster = await client.get(f"/hub/api/projects/{slug}/members", headers=bob_headers)
+            assert roster.status_code == 200
+            members = roster.json()["members"]
+            assert {m["mention_handle"] for m in members} == {"alice", "bob"}
+            for m in members:
+                assert set(m) == {
+                    "human_id", "display_name", "mention_handle", "role", "status",
+                }
+                assert m["status"] == "active"
+
+            # admin: full view including invited rows and default_agent_id
+            admin_roster = await client.get(f"/hub/api/projects/{slug}/members", headers=alice_headers)
+            assert admin_roster.status_code == 200
+            admin_members = admin_roster.json()["members"]
+            assert {m["mention_handle"] for m in admin_members} == {"alice", "bob", "carol"}
+            for m in admin_members:
+                assert "default_agent_id" in m
+                assert "id" in m and "project_id" in m
+            assert next(m for m in admin_members if m["mention_handle"] == "carol")["status"] == "invited"

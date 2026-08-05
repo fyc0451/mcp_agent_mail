@@ -23,7 +23,7 @@ from fastapi.exception_handlers import http_exception_handler
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import select, text
+from sqlalchemy import select, text, update
 from sqlalchemy.exc import IntegrityError, NoResultFound
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
@@ -49,7 +49,7 @@ from .app import (
 )
 from .config import Settings, get_settings
 from .db import ensure_schema, get_session
-from .models import Agent, Human, Project, ProjectHumanMembership
+from .models import Agent, Human, HumanInboxItem, Message, Project, ProjectHumanMembership
 from .storage import (
     ProjectArchive,
     archive_write_lock,
@@ -1994,16 +1994,33 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         async with get_session() as session:
             human = await _hub_human(request, session=session)
             project = await _hub_project(project_slug, session=session)
-            await _hub_active_membership(project, human, session=session, admin=True)
+            caller = await _hub_active_membership(project, human, session=session)
+            is_admin = caller.role == "admin"
+            # Ordinary members get a minimal roster of ACTIVE members only —
+            # the @mention UI needs human_id/display_name/mention_handle, but
+            # invited/removed rows, opaque subjects and other members'
+            # default_agent_id stay hidden. Admins keep the full view for
+            # approval and member management.
+            conditions = [cast(Any, ProjectHumanMembership.project_id) == project.id]
+            if not is_admin:
+                conditions.append(cast(Any, ProjectHumanMembership.status) == "active")
             rows = await session.execute(
                 select(ProjectHumanMembership, Human)
                 .join(Human, cast(Any, Human.id) == ProjectHumanMembership.human_id)
-                .where(cast(Any, ProjectHumanMembership.project_id) == project.id)
+                .where(*conditions)
                 .order_by(cast(Any, ProjectHumanMembership.created_at))
             )
             members = []
             for membership, member_human in rows.all():
-                payload = _hub_membership_payload(membership)
+                if is_admin:
+                    payload = _hub_membership_payload(membership)
+                else:
+                    payload = {
+                        "human_id": membership.human_id,
+                        "mention_handle": membership.mention_handle,
+                        "role": membership.role,
+                        "status": membership.status,
+                    }
                 payload["display_name"] = member_human.display_name
                 members.append(payload)
             return JSONResponse({"members": members})
@@ -2154,6 +2171,79 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             await session.commit()
             await session.refresh(agent)
             return JSONResponse(_hub_agent_payload(agent))
+
+    # M3a human inbox (人工收件箱): read-only + mark-read over durable items
+    # created by @human channel mentions without a usable default agent. Pure
+    # DB access — Hub data never triggers local execution.
+    @fastapi_app.get("/hub/api/inbox", response_class=JSONResponse)
+    async def hub_list_inbox(
+        request: Request,
+        unread_only: bool = False,
+        limit: int = 50,
+    ) -> JSONResponse:
+        await ensure_schema()
+        if not 1 <= limit <= 200:
+            raise HTTPException(status_code=400, detail="limit must be 1-200")
+        async with get_session() as session:
+            human = await _hub_human(request, session=session)
+            conditions = [cast(Any, HumanInboxItem.human_id) == human.id]
+            if unread_only:
+                conditions.append(cast(Any, HumanInboxItem.read_ts).is_(None))
+            rows = await session.execute(
+                select(HumanInboxItem, Message, Agent, Project)
+                .join(Message, cast(Any, Message.id) == HumanInboxItem.message_id)
+                .join(Agent, cast(Any, Agent.id) == Message.sender_id)
+                .join(Project, cast(Any, Project.id) == HumanInboxItem.project_id)
+                .where(*conditions)
+                .order_by(cast(Any, HumanInboxItem.created_ts).desc())
+                .limit(limit)
+            )
+            items = [
+                {
+                    "id": item.id,
+                    "project_slug": project.slug,
+                    "message_id": message.id,
+                    "subject": message.subject,
+                    "body_md": message.body_md,
+                    "importance": message.importance,
+                    "kind": item.kind,
+                    "sender_name": sender.name,
+                    "read_ts": str(item.read_ts) if item.read_ts else None,
+                    "created_ts": str(item.created_ts),
+                }
+                for item, message, sender, project in rows.all()
+            ]
+            return JSONResponse({"items": items})
+
+    @fastapi_app.post("/hub/api/inbox/mark-read", response_class=JSONResponse)
+    async def hub_mark_inbox_read(request: Request) -> JSONResponse:
+        await ensure_schema()
+        body = await _hub_json_body(request)
+        raw_ids = body.get("ids")
+        if raw_ids is None:
+            ids: list[int] | None = None
+        elif (
+            isinstance(raw_ids, list)
+            and all(isinstance(value, int) and not isinstance(value, bool) for value in raw_ids)
+        ):
+            ids = raw_ids
+        else:
+            raise HTTPException(status_code=400, detail="ids must be an array of integers")
+        async with get_session() as session:
+            human = await _hub_human(request, session=session)
+            conditions = [
+                cast(Any, HumanInboxItem.human_id) == human.id,
+                cast(Any, HumanInboxItem.read_ts).is_(None),
+            ]
+            if ids is not None:
+                conditions.append(cast(Any, HumanInboxItem.id).in_(ids))
+            result = await session.execute(
+                update(HumanInboxItem)
+                .where(*conditions)
+                .values(read_ts=datetime.now(timezone.utc).replace(tzinfo=None))
+            )
+            await session.commit()
+            return JSONResponse({"updated": cast(Any, result).rowcount or 0})
 
     def _oauth_metadata_disabled_response() -> JSONResponse:
         return JSONResponse({"mcp_oauth": False}, status_code=404)

@@ -446,3 +446,34 @@ class ProjectHumanMembership(SQLModel, table=True):
     )
     created_at: datetime = Field(default_factory=_utcnow_naive)
     updated_at: datetime = Field(default_factory=_utcnow_naive)
+
+
+class HumanInboxItem(SQLModel, table=True):
+    """M3a durable human inbox entry (人工收件箱).
+
+    Created when an @<mention_handle> channel mention targets a human whose
+    membership has no usable default agent. ``message_id`` points at the
+    receipt Message row (no agent recipients); humans read via /hub/api/inbox
+    with their JWT principal. Delivery is idempotent per source channel
+    message and human.
+    """
+
+    __tablename__ = "human_inbox_items"
+    __table_args__ = (
+        UniqueConstraint("message_id", "human_id", name="uq_hii_message_human"),
+        UniqueConstraint(
+            "source_channel_message_id", "human_id", name="uq_hii_source_human"
+        ),
+        Index("ix_hii_human_unread", "human_id", "read_ts"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    project_id: int = Field(foreign_key="projects.id", index=True)
+    human_id: int = Field(foreign_key="humans.id", index=True)
+    message_id: int = Field(foreign_key="messages.id", index=True)
+    source_channel_message_id: Optional[int] = Field(
+        default=None, foreign_key="channel_messages.id", index=True
+    )
+    kind: str = Field(default="mention", max_length=16)
+    read_ts: Optional[datetime] = Field(default=None)
+    created_ts: datetime = Field(default_factory=_utcnow_naive)
