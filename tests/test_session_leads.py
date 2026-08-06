@@ -490,6 +490,124 @@ async def test_chat_history_shows_human_via_lead(hub):
         assert own["sender_name"] == "Bob"
         assert own["sender_human_id"] == bob_id
         assert own["sender_kind"] == "session_lead"
-        assert own["sender_agent"] == lead_name
-        # 受管 lead 不得呈现为独立团队成员: sender_name 不能是 lead 名
+        # sender_agent 是客户端 lead_label,内部 Agent 名(hash)永不透出
+        assert own["sender_agent"] == "Mac 终端"
         assert own["sender_name"] != lead_name
+        assert lead_name not in str(own)
+
+
+@pytest.mark.anyio
+async def test_single_active_lead_per_human_project(hub):
+    """#1064 收口 1: 同一 TeamProject+Human 任意时刻仅一个 active binding;
+    并发两个不同 client_session_id 也必须收敛为一个 active。"""
+    import asyncio
+
+    settings, app = hub
+    root = _headers(settings, "oidc|root", admin=True)
+    bob = _headers(settings, "oidc|bob")
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        await _setup_team(client, root)
+        bob_id = await _register_human(client, bob, "Bob")
+        await _join_active(client, root, bob, bob_id, "bob")
+
+        # 顺序: 新 id upsert 后旧 id 转 unbound
+        first = await _upsert_lead(client, bob, "session-old")
+        assert first.status_code == 201
+        second = await _upsert_lead(client, bob, "session-new")
+        assert second.status_code == 201
+        async with get_session() as session:
+            rows = (
+                await session.execute(
+                    select(SessionLeadBinding).where(
+                        SessionLeadBinding.human_id == bob_id
+                    )
+                )
+            ).scalars().all()
+            active = [row for row in rows if row.status == "active"]
+            assert len(rows) == 2
+            assert len(active) == 1
+            assert active[0].client_session_id == "session-new"
+        membership = await client.get("/hub/api/projects/core/membership", headers=bob)
+        assert membership.json()["default_agent_id"] == second.json()["agent"]["id"]
+
+        # 并发: 两个不同 id 同时 PUT,最终恰好一个 active 且 default 指向它
+        first, other = await asyncio.gather(
+            _upsert_lead(client, bob, "race-a"),
+            _upsert_lead(client, bob, "race-b"),
+        )
+        assert first.status_code in (200, 201) and other.status_code in (200, 201)
+        async with get_session() as session:
+            rows = (
+                await session.execute(
+                    select(SessionLeadBinding).where(
+                        SessionLeadBinding.human_id == bob_id,
+                        SessionLeadBinding.status == "active",
+                    )
+                )
+            ).scalars().all()
+            assert len(rows) == 1
+            winner_id = rows[0].agent_id
+        membership = await client.get("/hub/api/projects/core/membership", headers=bob)
+        assert membership.json()["default_agent_id"] == winner_id
+
+
+@pytest.mark.anyio
+async def test_inbox_shows_human_and_lead_label_not_internal_name(hub):
+    """#1064 收口 3: Human Inbox 对 lead sender 显示 display_name+lead_label,
+    内部 hash 名不透出。"""
+    settings, app = hub
+    root = _headers(settings, "oidc|root", admin=True)
+    alice = _headers(settings, "oidc|alice")
+    bob = _headers(settings, "oidc|bob")
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        await _setup_team(client, root)
+        alice_id = await _register_human(client, alice, "Alice")
+        bob_id = await _register_human(client, bob, "Bob")
+        await _join_active(client, root, alice, alice_id, "alice")
+        await _join_active(client, root, bob, bob_id, "bob")
+        await _upsert_lead(client, alice, "wsl-1")
+        bob_lead = await _upsert_lead(client, bob, "mac-1")
+        lead_name = bob_lead.json()["agent"]["name"]
+
+        support = await client.post(
+            "/hub/api/projects/core/support-requests",
+            headers=alice,
+            json={"subject": "inbox 显示", "body_md": "x", "mention_handles": ["bob"]},
+        )
+        assert support.status_code == 201
+
+        inbox = await client.get("/hub/api/inbox", headers=bob)
+        assert inbox.status_code == 200
+        items = inbox.json()["items"]
+        assert items
+        own = next(item for item in items if item["subject"] == "inbox 显示")
+        assert own["sender_name"] == "Alice"
+        assert own["sender_kind"] == "session_lead"
+        assert own["sender_agent"] is not None
+        assert lead_name not in str(own)
+
+
+@pytest.mark.anyio
+async def test_lead_label_in_binding_payload(hub):
+    settings, app = hub
+    root = _headers(settings, "oidc|root", admin=True)
+    bob = _headers(settings, "oidc|bob")
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        await _setup_team(client, root)
+        bob_id = await _register_human(client, bob, "Bob")
+        await _join_active(client, root, bob, bob_id, "bob")
+        created = await _upsert_lead(client, bob, "mac-1", label="codex-main")
+        assert created.status_code == 201
+        assert created.json()["binding"]["lead_label"] == "codex-main"
+
+        # label 校验: 空/超长/控制字符均 400
+        for bad_label in ("", "x" * 129, "bad\nlabel"):
+            resp = await client.put(
+                "/hub/api/projects/core/session-lead",
+                headers=bob,
+                json={"client_session_id": "s2", "lead_label": bad_label},
+            )
+            assert resp.status_code == 400, repr(bad_label)

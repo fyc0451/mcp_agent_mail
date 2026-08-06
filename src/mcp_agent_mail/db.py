@@ -938,6 +938,8 @@ def _setup_fts(connection: Any) -> None:
         "ALTER TABLE messages ADD COLUMN reply_to INTEGER DEFAULT NULL",
         # M3a: owning human for an agent (nullable; pre-M3a agents stay unowned).
         "ALTER TABLE agents ADD COLUMN owner_id INTEGER DEFAULT NULL",
+        # M3 session-team: display label for managed session leads.
+        "ALTER TABLE session_lead_bindings ADD COLUMN lead_label VARCHAR(128) DEFAULT ''",
     ]:
         with suppress(Exception):  # Column already exists — safe to ignore
             connection.exec_driver_sql(migration_sql)

@@ -530,9 +530,11 @@ class SessionLeadBinding(SQLModel, table=True):
 
     The Hub creates and owns the lifecycle of a routing-project-local lead
     Agent so a human can be addressed and receive team messages without any
-    client-side Agent Mail token. The row is the management record only:
-    unbinding flips ``status`` to ``unbound`` (routing stops) while the Agent
-    row, messages and this history are all preserved.
+    client-side Agent Mail token. Sessions sharing one lead_label also share
+    the same Agent row (per human+project at most one is ever active). The
+    row is the management record only: unbinding flips ``status`` to
+    ``unbound`` (routing stops) while the Agent row, messages and this
+    history are all preserved.
     """
 
     __tablename__ = "session_lead_bindings"
@@ -540,7 +542,6 @@ class SessionLeadBinding(SQLModel, table=True):
         UniqueConstraint(
             "team_project_id", "human_id", "client_session_id", name="uq_slb_team_human_session"
         ),
-        UniqueConstraint("agent_id", name="uq_slb_agent"),
         Index("ix_slb_agent_status", "agent_id", "status"),
     )
 
@@ -549,6 +550,9 @@ class SessionLeadBinding(SQLModel, table=True):
     human_id: int = Field(foreign_key="humans.id", index=True)
     client_session_id: str = Field(max_length=128)
     agent_id: int = Field(foreign_key="agents.id", index=True)
+    # Display label chosen by the client (e.g. "codex-main"); chat history and
+    # the Human Inbox show this instead of the internal Agent name.
+    lead_label: str = Field(default="", max_length=128)
     status: str = Field(default="active", max_length=16)  # active | unbound
     created_at: datetime = Field(default_factory=_utcnow_naive)
     updated_at: datetime = Field(default_factory=_utcnow_naive)

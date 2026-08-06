@@ -2453,6 +2453,14 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 .order_by(cast(Any, ChannelMessage.id).desc())
                 .limit(200)
             )
+            lead_rows = await session.execute(
+                select(SessionLeadBinding).where(
+                    cast(Any, SessionLeadBinding.team_project_id) == team_project.id
+                )
+            )
+            lead_labels = {
+                binding.agent_id: binding.lead_label for binding in lead_rows.scalars().all()
+            }
             items = []
             for message, sender, sender_human in rows.all():
                 body_md = message.body_md
@@ -2469,8 +2477,9 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 is_relay = sender.program == _HUB_HUMAN_RELAY_PROGRAM
                 is_session_lead = sender.program == _SESSION_LEAD_PROGRAM
                 # M3: 受管 lead 是 Human 的代理,不是独立团队成员——sender 归
-                # Human(display_name/human_id),lead 名只经 sender_agent 透出,
-                # 前端据此显示 "付彦超 · via codex-main" 并识别自己的消息。
+                # Human(display_name/human_id),内部 Agent 名永不透出;sender_agent
+                # 只带客户端 lead_label,前端据此显示 "付彦超 · via codex-main"
+                # 并识别自己的消息。
                 items.append({
                     "id": message.id,
                     "subject": message.subject,
@@ -2485,7 +2494,12 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                         if is_relay
                         else ("session_lead" if is_session_lead else "agent")
                     ),
-                    "sender_agent": None if is_relay else sender.name,
+                    "sender_agent": (
+                        None
+                        if is_relay
+                        else (lead_labels.get(sender.id) or None
+                              if is_session_lead else sender.name)
+                    ),
                 })
             items.reverse()
             return JSONResponse(
@@ -2650,6 +2664,10 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 .order_by(cast(Any, HumanInboxItem.created_ts).desc())
                 .limit(limit)
             )
+            lead_rows = await session.execute(select(SessionLeadBinding))
+            lead_labels = {
+                binding.agent_id: binding.lead_label for binding in lead_rows.scalars().all()
+            }
             items = [
                 {
                     "id": item.id,
@@ -2659,13 +2677,24 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     "body_md": message.body_md,
                     "importance": message.importance,
                     "kind": item.kind,
+                    # relay/受管 lead 的 sender 归 Human;内部 Agent 名(hash)永不透出,
+                    # lead 只经 sender_agent 透出客户端 lead_label。
                     "sender_name": (
                         sender_human.display_name
-                        if sender.program == _HUB_HUMAN_RELAY_PROGRAM and sender_human is not None
+                        if sender_human is not None
+                        and sender.program in (_HUB_HUMAN_RELAY_PROGRAM, _SESSION_LEAD_PROGRAM)
                         else sender.name
                     ),
                     "sender_kind": (
-                        "human" if sender.program == _HUB_HUMAN_RELAY_PROGRAM else "agent"
+                        "human"
+                        if sender.program == _HUB_HUMAN_RELAY_PROGRAM
+                        else ("session_lead" if sender.program == _SESSION_LEAD_PROGRAM else "agent")
+                    ),
+                    "sender_agent": (
+                        None
+                        if sender.program == _HUB_HUMAN_RELAY_PROGRAM
+                        else (lead_labels.get(sender.id) or None
+                              if sender.program == _SESSION_LEAD_PROGRAM else sender.name)
                     ),
                     "read_ts": str(item.read_ts) if item.read_ts else None,
                     "created_ts": str(item.created_ts),
@@ -2901,6 +2930,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
     # and never echoed to responses, exceptions, or logs; unknown selectors and
     # bad tokens get the same opaque refusal.
     _claim_locks: dict[int, asyncio.Lock] = {}
+    _session_lead_locks: dict[tuple[int, int], asyncio.Lock] = {}
     # Exposed for race-controlled tests (pre-acquire an agent's lock).
     fastapi_app.state.hub_claim_locks = _claim_locks
 
@@ -3095,6 +3125,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             "human_id": binding.human_id,
             "client_session_id": binding.client_session_id,
             "agent_id": binding.agent_id,
+            "lead_label": binding.lead_label,
             "status": binding.status,
             "created_at": str(binding.created_at),
             "updated_at": str(binding.updated_at),
@@ -3127,10 +3158,14 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             )
         raw_label = body.get("lead_label")
         lead_label = raw_label.strip() if isinstance(raw_label, str) else ""
-        if not lead_label or len(lead_label) > 128:
+        if (
+            not lead_label
+            or len(lead_label) > 128
+            or any(ord(char) < 32 for char in lead_label)
+        ):
             raise HTTPException(
                 status_code=400,
-                detail="lead_label is required and must be at most 128 characters",
+                detail="lead_label is required, must be at most 128 characters and contain no control characters",
             )
         async with get_session() as session:
             team_project = await _hub_team_project(project_slug, session=session)
@@ -3141,85 +3176,110 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             if project is None or project.archived_at is not None:
                 raise HTTPException(status_code=404, detail="Project not found")
             membership = await _hub_active_membership(project, human, session=session)
-
-            existing_row = await session.execute(
-                select(SessionLeadBinding).where(
-                    cast(Any, SessionLeadBinding.team_project_id) == team_project.id,
-                    cast(Any, SessionLeadBinding.human_id) == human.id,
-                    cast(Any, SessionLeadBinding.client_session_id) == client_session_id,
-                )
+            # 同一 human+project 任意时刻仅一个 active lead(#1064):
+            # 关键段按 (team_project, human) 串行,先保证单 active 再 upsert。
+            lead_lock = _session_lead_locks.setdefault(
+                (team_project.id, human.id), asyncio.Lock()
             )
-            binding = existing_row.scalars().first()
-            created = False
-            if binding is not None:
-                agent = await session.get(Agent, binding.agent_id)
-                if agent is None:
-                    raise HTTPException(status_code=409, detail="Managed lead agent is unavailable")
-                if agent.retired_at is not None:
-                    # The Hub owns the managed lifecycle: reuse reactivates.
-                    agent.retired_at = None
-                    session.add(agent)
-                if binding.status != "active":
-                    binding.status = "active"
-                    binding.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
-                    session.add(binding)
-            else:
-                lead_name = _hub_session_lead_name(human.id, lead_label)
-                if await _membership_handle_taken(project, lead_name, session=session):
-                    raise HTTPException(
-                        status_code=409,
-                        detail="Managed lead name collides with an active member mention_handle",
-                    )
-                agent_insert = sqlite_insert(Agent).values(
-                    project_id=project.id,
-                    name=lead_name,
-                    program="team-session-lead",
-                    model="hub",
-                    task_description="Hub-managed session lead agent",
-                    owner_id=human.id,
-                    contact_policy="open",
-                )
+            async with lead_lock:
                 await session.execute(
-                    agent_insert.on_conflict_do_nothing(index_elements=["project_id", "name"])
-                )
-                agent_row = await session.execute(
-                    select(Agent).where(
-                        cast(Any, Agent.project_id) == project.id,
-                        cast(Any, Agent.name) == lead_name,
+                    update(SessionLeadBinding)
+                    .where(
+                        cast(Any, SessionLeadBinding.team_project_id) == team_project.id,
+                        cast(Any, SessionLeadBinding.human_id) == human.id,
+                        cast(Any, SessionLeadBinding.status) == "active",
+                        cast(Any, SessionLeadBinding.client_session_id) != client_session_id,
+                    )
+                    .values(
+                        status="unbound",
+                        updated_at=datetime.now(timezone.utc).replace(tzinfo=None),
                     )
                 )
-                agent = agent_row.scalars().first()
-                if agent is None or agent.owner_id != human.id:
-                    raise HTTPException(status_code=409, detail="Managed lead agent is unavailable")
-                binding_insert = sqlite_insert(SessionLeadBinding).values(
-                    team_project_id=team_project.id,
-                    human_id=human.id,
-                    client_session_id=client_session_id,
-                    agent_id=agent.id,
-                    status="active",
-                )
-                await session.execute(
-                    binding_insert.on_conflict_do_nothing(
-                        index_elements=["team_project_id", "human_id", "client_session_id"]
-                    )
-                )
-                binding_row = await session.execute(
+
+                existing_row = await session.execute(
                     select(SessionLeadBinding).where(
                         cast(Any, SessionLeadBinding.team_project_id) == team_project.id,
                         cast(Any, SessionLeadBinding.human_id) == human.id,
                         cast(Any, SessionLeadBinding.client_session_id) == client_session_id,
                     )
                 )
-                binding = binding_row.scalars().first()
-                if binding is None:
-                    raise HTTPException(status_code=409, detail="Session lead binding conflict")
-                created = True
+                binding = existing_row.scalars().first()
+                created = False
+                if binding is not None:
+                    agent = await session.get(Agent, binding.agent_id)
+                    if agent is None:
+                        raise HTTPException(status_code=409, detail="Managed lead agent is unavailable")
+                    if agent.retired_at is not None:
+                        # The Hub owns the managed lifecycle: reuse reactivates.
+                        agent.retired_at = None
+                        session.add(agent)
+                    if binding.status != "active":
+                        binding.status = "active"
+                        binding.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                        session.add(binding)
+                    if binding.lead_label != lead_label:
+                        # Label follows the latest PUT (display name, not a key).
+                        binding.lead_label = lead_label
+                        binding.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                        session.add(binding)
+                else:
+                    lead_name = _hub_session_lead_name(human.id, lead_label)
+                    if await _membership_handle_taken(project, lead_name, session=session):
+                        raise HTTPException(
+                            status_code=409,
+                            detail="Managed lead name collides with an active member mention_handle",
+                        )
+                    agent_insert = sqlite_insert(Agent).values(
+                        project_id=project.id,
+                        name=lead_name,
+                        program="team-session-lead",
+                        model="hub",
+                        task_description="Hub-managed session lead agent",
+                        owner_id=human.id,
+                        contact_policy="open",
+                    )
+                    await session.execute(
+                        agent_insert.on_conflict_do_nothing(index_elements=["project_id", "name"])
+                    )
+                    agent_row = await session.execute(
+                        select(Agent).where(
+                            cast(Any, Agent.project_id) == project.id,
+                            cast(Any, Agent.name) == lead_name,
+                        )
+                    )
+                    agent = agent_row.scalars().first()
+                    if agent is None or agent.owner_id != human.id:
+                        raise HTTPException(status_code=409, detail="Managed lead agent is unavailable")
+                    binding_insert = sqlite_insert(SessionLeadBinding).values(
+                        team_project_id=team_project.id,
+                        human_id=human.id,
+                        client_session_id=client_session_id,
+                        agent_id=agent.id,
+                        lead_label=lead_label,
+                        status="active",
+                    )
+                    await session.execute(
+                        binding_insert.on_conflict_do_nothing(
+                            index_elements=["team_project_id", "human_id", "client_session_id"]
+                        )
+                    )
+                    binding_row = await session.execute(
+                        select(SessionLeadBinding).where(
+                            cast(Any, SessionLeadBinding.team_project_id) == team_project.id,
+                            cast(Any, SessionLeadBinding.human_id) == human.id,
+                            cast(Any, SessionLeadBinding.client_session_id) == client_session_id,
+                        )
+                    )
+                    binding = binding_row.scalars().first()
+                    if binding is None:
+                        raise HTTPException(status_code=409, detail="Session lead binding conflict")
+                    created = True
 
-            # Atomically make the lead the caller's default (same transaction).
-            await _validate_default_agent(project, human.id, agent.id, session=session)
-            membership.default_agent_id = agent.id
-            session.add(membership)
-            await session.commit()
+                # Atomically make the lead the caller's default (same transaction).
+                await _validate_default_agent(project, human.id, agent.id, session=session)
+                membership.default_agent_id = agent.id
+                session.add(membership)
+                await session.commit()
             await session.refresh(binding)
             await session.refresh(agent)
             return JSONResponse(
