@@ -1,4 +1,6 @@
+import concurrent.futures
 import json
+import sqlite3
 import stat
 
 from authlib.jose import JsonWebKey, JsonWebToken
@@ -31,7 +33,12 @@ def test_bootstrap_login_and_jwks_verification(tmp_path):
     payload = response.json()
     assert payload["token_type"] == "Bearer"
     assert payload["expires_in"] == 600
-    assert payload["profile"] == {"username": "fyc", "display_name": "付彦超"}
+    assert payload["profile"] == {
+        "username": "fyc",
+        "display_name": "付彦超",
+        "roles": ["writer", "admin"],
+        "status": "active",
+    }
 
     jwks = client.get("/.well-known/jwks.json").json()
     public_key = JsonWebKey.import_key_set(jwks).find_by_kid(app.state.store.kid)
@@ -77,3 +84,193 @@ def test_discovery_exposes_public_metadata_only(tmp_path):
     assert discovery.json()["jwks_uri"] == "http://127.0.0.1:8766/.well-known/jwks.json"
     combined = discovery.text + client.get("/.well-known/jwks.json").text + client.get("/health").text
     assert json.loads(credentials.read_text())["password"] not in combined
+
+
+def test_invitation_registration_approval_and_disable(tmp_path):
+    app, client, credentials = _bootstrapped_client(tmp_path)
+    admin_secret = json.loads(credentials.read_text())
+    admin_login = client.post("/token", json=admin_secret)
+    admin_token = admin_login.json()["access_token"]
+    admin_headers = {"Authorization": f"Bearer {admin_token}"}
+
+    invitation = client.post(
+        "/admin/invitations",
+        headers=admin_headers,
+        json={"expires_in": 3600},
+    )
+    assert invitation.status_code == 201
+    invite_code = invitation.json()["invite_code"]
+    assert invite_code not in client.get("/admin/users", headers=admin_headers).text
+    with app.state.store._connect() as connection:
+        stored_invitation = connection.execute(
+            "SELECT code_hash FROM invitations"
+        ).fetchone()
+    assert stored_invitation["code_hash"] != invite_code
+
+    registration = {
+        "username": "alice",
+        "display_name": "Alice",
+        "password": "alice-password-123",
+        "invite_code": invite_code,
+    }
+    registered = client.post("/register", json=registration)
+    assert registered.status_code == 201
+    assert registered.json()["account"] == {
+        "username": "alice",
+        "display_name": "Alice",
+        "status": "pending",
+    }
+    assert client.post("/register", json={**registration, "username": "bob"}).status_code == 400
+    assert client.post(
+        "/token",
+        json={"username": "alice", "password": registration["password"]},
+    ).status_code == 401
+
+    users = client.get("/admin/users", headers=admin_headers)
+    assert users.status_code == 200
+    alice = next(user for user in users.json()["users"] if user["username"] == "alice")
+    assert alice["status"] == "pending"
+    assert alice["roles"] == ["writer"]
+
+    approved = client.patch(
+        "/admin/users/alice",
+        headers=admin_headers,
+        json={"status": "active"},
+    )
+    assert approved.status_code == 200
+    login = client.post(
+        "/token",
+        json={"username": "alice", "password": registration["password"]},
+    )
+    assert login.status_code == 200
+    assert login.json()["profile"]["roles"] == ["writer"]
+    alice_token = login.json()["access_token"]
+    assert client.get(
+        "/me", headers={"Authorization": f"Bearer {alice_token}"}
+    ).status_code == 200
+    assert client.post(
+        "/admin/invitations",
+        headers={"Authorization": f"Bearer {alice_token}"},
+        json={"expires_in": 3600},
+    ).status_code == 403
+
+    disabled = client.patch(
+        "/admin/users/alice",
+        headers=admin_headers,
+        json={"status": "disabled"},
+    )
+    assert disabled.status_code == 200
+    assert client.get(
+        "/me", headers={"Authorization": f"Bearer {alice_token}"}
+    ).status_code == 401
+    assert client.post(
+        "/token",
+        json={"username": "alice", "password": registration["password"]},
+    ).status_code == 401
+
+
+def test_invitation_admin_guards_and_invalid_code(tmp_path):
+    _, client, credentials = _bootstrapped_client(tmp_path)
+    admin_token = client.post(
+        "/token", json=json.loads(credentials.read_text())
+    ).json()["access_token"]
+    admin_headers = {"Authorization": f"Bearer {admin_token}"}
+
+    assert client.post(
+        "/register",
+        json={
+            "username": "alice",
+            "display_name": "Alice",
+            "password": "alice-password-123",
+            "invite_code": "not-an-invitation",
+        },
+    ).status_code == 400
+    assert client.get("/admin/users").status_code == 401
+    assert client.post(
+        "/admin/invitations",
+        headers=admin_headers,
+        json={"expires_in": 60},
+    ).status_code == 422
+    assert client.patch(
+        "/admin/users/fyc",
+        headers=admin_headers,
+        json={"status": "disabled"},
+    ).status_code == 400
+
+
+def test_existing_user_database_is_migrated_without_recreating_accounts(tmp_path):
+    data_dir = tmp_path / "state"
+    data_dir.mkdir()
+    db_path = data_dir / "users.sqlite3"
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute(
+            """
+            CREATE TABLE users (
+                subject TEXT PRIMARY KEY,
+                username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                display_name TEXT NOT NULL,
+                password_hash TEXT NOT NULL,
+                roles_json TEXT NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO users(subject, username, display_name, password_hash, roles_json, active)
+            VALUES ('human:fyc', 'fyc', '付彦超', 'existing-hash', '["writer", "admin"]', 1)
+            """
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    app = create_app(
+        HumanAuthConfig(
+            data_dir=data_dir,
+            issuer="http://127.0.0.1:8766",
+            audience="mcp-agent-mail-human",
+        )
+    )
+    users = app.state.store.list_users()
+    assert users == [
+        {
+            "username": "fyc",
+            "display_name": "付彦超",
+            "roles": ["writer", "admin"],
+            "status": "active",
+            "created_at": users[0]["created_at"],
+        }
+    ]
+    assert users[0]["created_at"] > 0
+
+
+def test_concurrent_registration_consumes_invitation_once(tmp_path):
+    app, client, credentials = _bootstrapped_client(tmp_path)
+    admin_token = client.post(
+        "/token", json=json.loads(credentials.read_text())
+    ).json()["access_token"]
+    invitation = client.post(
+        "/admin/invitations",
+        headers={"Authorization": f"Bearer {admin_token}"},
+        json={"expires_in": 3600},
+    ).json()["invite_code"]
+
+    def register(username: str):
+        with TestClient(app) as concurrent_client:
+            return concurrent_client.post(
+                "/register",
+                json={
+                    "username": username,
+                    "display_name": username.title(),
+                    "password": f"{username}-password-123",
+                    "invite_code": invitation,
+                },
+            )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        first, second = executor.map(register, ("alice", "bob"))
+    assert sorted((first.status_code, second.status_code)) == [201, 400]
+    pending = [user for user in app.state.store.list_users() if user["status"] == "pending"]
+    assert len(pending) == 1

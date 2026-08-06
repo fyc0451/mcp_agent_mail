@@ -803,7 +803,7 @@ class TestHubHumanIdentityApi:
     ):
         settings = _configure_hub_jwt(monkeypatch)
         app = build_http_app(settings, build_mcp_server())
-        headers = _hub_headers(settings, "oidc|alice")
+        headers = _hub_headers(settings, "oidc|alice", role=["writer", "admin"])
 
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
@@ -843,7 +843,7 @@ class TestHubHumanIdentityApi:
     ):
         settings = _configure_hub_jwt(monkeypatch)
         app = build_http_app(settings, build_mcp_server())
-        alice_headers = _hub_headers(settings, "oidc|alice")
+        alice_headers = _hub_headers(settings, "oidc|alice", role=["writer", "admin"])
         bob_headers = _hub_headers(settings, "oidc|bob")
 
         transport = ASGITransport(app=app)
@@ -896,10 +896,17 @@ class TestHubHumanIdentityApi:
             assert discovered_project["membership"] is None
             assert "human_key" not in discovered_project
 
-            duplicate = await client.post(
+            non_admin_create = await client.post(
                 "/hub/api/projects",
                 headers=bob_headers,
-                json={"name": "Duplicate", "slug": "m3a", "mention_handle": "bob"},
+                json={"name": "Bob Team", "slug": "bob-team", "mention_handle": "bob"},
+            )
+            assert non_admin_create.status_code == 403
+
+            duplicate = await client.post(
+                "/hub/api/projects",
+                headers=alice_headers,
+                json={"name": "Duplicate", "slug": "m3a", "mention_handle": "alice"},
             )
             assert duplicate.status_code == 409
 
@@ -1078,7 +1085,7 @@ class TestHubHumanIdentityApi:
         view for approval and member management."""
         settings = _configure_hub_jwt(monkeypatch)
         app = build_http_app(settings, build_mcp_server())
-        alice_headers = _hub_headers(settings, "oidc|alice")
+        alice_headers = _hub_headers(settings, "oidc|alice", role=["writer", "admin"])
         bob_headers = _hub_headers(settings, "oidc|bob")
         carol_headers = _hub_headers(settings, "oidc|carol")
 

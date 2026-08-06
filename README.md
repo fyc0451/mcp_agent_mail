@@ -2145,6 +2145,20 @@ private signing key into chat, logs, or source control. For remote deployments,
 keep the issuer on loopback and expose the login flow only through an
 authenticated HTTPS reverse proxy.
 
+The beta issuer also provides an invitation-only account lifecycle:
+
+- an active system administrator creates a one-time, expiring code with
+  `POST /admin/invitations`;
+- a new person submits `POST /register` and remains `pending`;
+- an administrator lists accounts with `GET /admin/users` and approves or
+  disables one with `PATCH /admin/users/{username}`;
+- only `active` accounts can log in or use `/me`.
+
+Invitation codes are stored only as SHA-256 hashes and are consumed in the
+same SQLite transaction as registration. Registration does not add the Human
+to any Team group; project membership still requires a separate join request
+and project-admin approval.
+
 ### Logical Team project groups
 
 The Human API treats `TeamProject` as the only user-visible project/group.

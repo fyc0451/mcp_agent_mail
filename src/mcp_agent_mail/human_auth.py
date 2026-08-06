@@ -23,6 +23,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from authlib.jose import JsonWebKey, JsonWebToken
+from authlib.jose.errors import JoseError
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
@@ -45,6 +46,21 @@ class HumanAuthConfig:
 class LoginRequest(BaseModel):
     username: str = Field(min_length=1, max_length=64)
     password: str = Field(min_length=1, max_length=256)
+
+
+class RegistrationRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=64)
+    display_name: str = Field(min_length=1, max_length=128)
+    password: str = Field(min_length=1, max_length=256)
+    invite_code: str = Field(min_length=1, max_length=256)
+
+
+class InvitationRequest(BaseModel):
+    expires_in: int = Field(default=24 * 60 * 60, ge=300, le=7 * 24 * 60 * 60)
+
+
+class UserStatusRequest(BaseModel):
+    status: str = Field(min_length=1, max_length=16)
 
 
 def _b64(data: bytes) -> str:
@@ -116,10 +132,18 @@ class HumanAuthStore:
         # A real hash keeps unknown-user failures on the same expensive path.
         self._dummy_hash = _password_hash(secrets.token_urlsafe(24))
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextlib.contextmanager
+    def _connect(self):
         connection = sqlite3.connect(self.db_path, timeout=5)
         connection.row_factory = sqlite3.Row
-        return connection
+        try:
+            yield connection
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
     def _ensure_schema(self) -> None:
         with self._connect() as connection:
@@ -132,6 +156,37 @@ class HumanAuthStore:
                     password_hash TEXT NOT NULL,
                     roles_json TEXT NOT NULL,
                     active INTEGER NOT NULL DEFAULT 1
+                )
+                """
+            )
+            columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(users)").fetchall()
+            }
+            if "status" not in columns:
+                connection.execute(
+                    "ALTER TABLE users ADD COLUMN status TEXT NOT NULL DEFAULT 'active'"
+                )
+                connection.execute(
+                    "UPDATE users SET status = 'disabled' WHERE active = 0"
+                )
+            if "created_at" not in columns:
+                connection.execute(
+                    "ALTER TABLE users ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0"
+                )
+                connection.execute(
+                    "UPDATE users SET created_at = ? WHERE created_at = 0",
+                    (int(time.time()),),
+                )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS invitations (
+                    code_hash TEXT PRIMARY KEY,
+                    created_by TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    expires_at INTEGER NOT NULL,
+                    used_by TEXT,
+                    used_at INTEGER
                 )
                 """
             )
@@ -169,8 +224,9 @@ class HumanAuthStore:
             password = secrets.token_urlsafe(24)
             connection.execute(
                 """
-                INSERT INTO users(subject, username, display_name, password_hash, roles_json)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO users(
+                    subject, username, display_name, password_hash, roles_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 (
                     f"human:{username}",
@@ -178,6 +234,7 @@ class HumanAuthStore:
                     display_name,
                     _password_hash(password),
                     json.dumps(["writer", "admin"]),
+                    int(time.time()),
                 ),
             )
             _write_private_file(
@@ -191,8 +248,8 @@ class HumanAuthStore:
         with self._connect() as connection:
             row = connection.execute(
                 """
-                SELECT subject, username, display_name, password_hash, roles_json
-                FROM users WHERE username = ? AND active = 1
+                SELECT subject, username, display_name, password_hash, roles_json, status
+                FROM users WHERE username = ? AND active = 1 AND status = 'active'
                 """,
                 (username,),
             ).fetchone()
@@ -200,6 +257,146 @@ class HumanAuthStore:
         if not _password_matches(password, stored_hash):
             return None
         return row
+
+    @staticmethod
+    def profile(user: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "username": user["username"],
+            "display_name": user["display_name"],
+            "roles": json.loads(user["roles_json"]),
+            "status": user["status"],
+        }
+
+    def active_user(self, subject: str) -> sqlite3.Row | None:
+        with self._connect() as connection:
+            return connection.execute(
+                """
+                SELECT subject, username, display_name, roles_json, status
+                FROM users WHERE subject = ? AND active = 1 AND status = 'active'
+                """,
+                (subject,),
+            ).fetchone()
+
+    def create_invitation(self, *, created_by: str, expires_in: int) -> dict[str, Any]:
+        now = int(time.time())
+        code = secrets.token_urlsafe(24)
+        code_hash = hashlib.sha256(code.encode("utf-8")).hexdigest()
+        expires_at = now + expires_in
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO invitations(code_hash, created_by, created_at, expires_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (code_hash, created_by, now, expires_at),
+            )
+        return {"invite_code": code, "expires_at": expires_at}
+
+    def register(
+        self,
+        *,
+        username: str,
+        display_name: str,
+        password: str,
+        invite_code: str,
+    ) -> dict[str, Any]:
+        username = username.strip().lower()
+        display_name = display_name.strip()
+        if not _USERNAME_RE.fullmatch(username):
+            raise ValueError("Invalid username")
+        if not display_name or len(display_name) > 128:
+            raise ValueError("Invalid display name")
+        code_hash = hashlib.sha256(invite_code.strip().encode("utf-8")).hexdigest()
+        now = int(time.time())
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            invitation = connection.execute(
+                """
+                SELECT code_hash FROM invitations
+                WHERE code_hash = ? AND used_at IS NULL AND expires_at >= ?
+                """,
+                (code_hash, now),
+            ).fetchone()
+            if invitation is None:
+                raise ValueError("Invalid or expired invitation")
+            existing = connection.execute(
+                "SELECT 1 FROM users WHERE username = ?", (username,)
+            ).fetchone()
+            if existing is not None:
+                raise FileExistsError("Username is already registered")
+            subject = f"human:{username}"
+            connection.execute(
+                """
+                INSERT INTO users(
+                    subject, username, display_name, password_hash, roles_json,
+                    active, status, created_at
+                ) VALUES (?, ?, ?, ?, ?, 0, 'pending', ?)
+                """,
+                (
+                    subject,
+                    username,
+                    display_name,
+                    _password_hash(password),
+                    json.dumps(["writer"]),
+                    now,
+                ),
+            )
+            connection.execute(
+                "UPDATE invitations SET used_by = ?, used_at = ? WHERE code_hash = ?",
+                (subject, now, code_hash),
+            )
+        return {"username": username, "display_name": display_name, "status": "pending"}
+
+    def list_users(self) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT username, display_name, roles_json, status, created_at
+                FROM users ORDER BY created_at, username
+                """
+            ).fetchall()
+        return [
+            {
+                "username": row["username"],
+                "display_name": row["display_name"],
+                "roles": json.loads(row["roles_json"]),
+                "status": row["status"],
+                "created_at": row["created_at"],
+            }
+            for row in rows
+        ]
+
+    def set_user_status(
+        self, *, actor_subject: str, username: str, status: str
+    ) -> dict[str, Any]:
+        if status not in {"active", "disabled"}:
+            raise ValueError("Status must be active or disabled")
+        username = username.strip().lower()
+        with self._connect() as connection:
+            target = connection.execute(
+                """
+                SELECT subject, username, display_name, roles_json, status, created_at
+                FROM users WHERE username = ?
+                """,
+                (username,),
+            ).fetchone()
+            if target is None:
+                raise LookupError("User not found")
+            if target["subject"] == actor_subject:
+                raise ValueError("Administrators cannot change their own status")
+            if "admin" in json.loads(target["roles_json"]):
+                raise ValueError("Administrator accounts cannot be disabled here")
+            connection.execute(
+                "UPDATE users SET status = ?, active = ? WHERE subject = ?",
+                (status, 1 if status == "active" else 0, target["subject"]),
+            )
+        return {
+            "username": target["username"],
+            "display_name": target["display_name"],
+            "roles": json.loads(target["roles_json"]),
+            "status": status,
+            "created_at": target["created_at"],
+        }
 
     def issue_token(self, user: sqlite3.Row) -> tuple[str, int]:
         now = int(time.time())
@@ -265,6 +462,31 @@ def create_app(config: HumanAuthConfig) -> FastAPI:
     async def jwks() -> dict[str, Any]:
         return store.jwks
 
+    def authenticated_user(request: Request, *, admin: bool = False) -> sqlite3.Row:
+        authorization = request.headers.get("authorization", "")
+        if not authorization.startswith("Bearer "):
+            raise HTTPException(status_code=401, detail="Authentication required")
+        try:
+            claims = JsonWebToken(["RS256"]).decode(
+                authorization[7:].strip(), store._key
+            )
+            claims.validate()
+        except (JoseError, ValueError, TypeError):
+            raise HTTPException(status_code=401, detail="Authentication required") from None
+        audience = claims.get("aud")
+        if (
+            claims.get("iss") != config.issuer
+            or audience != config.audience
+            or not isinstance(claims.get("sub"), str)
+        ):
+            raise HTTPException(status_code=401, detail="Authentication required")
+        user = store.active_user(claims["sub"])
+        if user is None:
+            raise HTTPException(status_code=401, detail="Authentication required")
+        if admin and "admin" not in json.loads(user["roles_json"]):
+            raise HTTPException(status_code=403, detail="Administrator role required")
+        return user
+
     @app.post("/token")
     async def token(request: Request, body: LoginRequest) -> dict[str, Any]:
         username = body.username.strip().lower()
@@ -283,11 +505,58 @@ def create_app(config: HumanAuthConfig) -> FastAPI:
             "access_token": access_token,
             "token_type": "Bearer",
             "expires_in": expires_in,
-            "profile": {
-                "username": user["username"],
-                "display_name": user["display_name"],
-            },
+            "profile": store.profile(user),
         }
+
+    @app.get("/me")
+    async def me(request: Request) -> dict[str, Any]:
+        return {"profile": store.profile(authenticated_user(request))}
+
+    @app.post("/register", status_code=201)
+    async def register(body: RegistrationRequest) -> dict[str, Any]:
+        try:
+            account = store.register(
+                username=body.username,
+                display_name=body.display_name,
+                password=body.password,
+                invite_code=body.invite_code,
+            )
+        except FileExistsError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"account": account}
+
+    @app.post("/admin/invitations", status_code=201)
+    async def create_invitation(
+        request: Request, body: InvitationRequest
+    ) -> dict[str, Any]:
+        admin_user = authenticated_user(request, admin=True)
+        return store.create_invitation(
+            created_by=admin_user["subject"], expires_in=body.expires_in
+        )
+
+    @app.get("/admin/users")
+    async def list_users(request: Request) -> dict[str, Any]:
+        authenticated_user(request, admin=True)
+        return {"users": store.list_users()}
+
+    @app.patch("/admin/users/{username}")
+    async def update_user(
+        username: str, request: Request, body: UserStatusRequest
+    ) -> dict[str, Any]:
+        admin_user = authenticated_user(request, admin=True)
+        try:
+            user = store.set_user_status(
+                actor_subject=admin_user["subject"],
+                username=username,
+                status=body.status,
+            )
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"user": user}
 
     return app
 

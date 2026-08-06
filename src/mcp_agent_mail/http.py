@@ -1658,6 +1658,18 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             raise HTTPException(status_code=401, detail="A valid JWT subject is required")
         return subject.strip()
 
+    def _hub_require_global_admin(request: Request) -> None:
+        claims = getattr(request.state, "jwt_claims", None)
+        roles_raw = claims.get(settings.http.jwt_role_claim, []) if isinstance(claims, dict) else []
+        if isinstance(roles_raw, str):
+            roles = {roles_raw}
+        elif isinstance(roles_raw, (list, tuple)):
+            roles = {str(role) for role in roles_raw}
+        else:
+            roles = set()
+        if "admin" not in roles:
+            raise HTTPException(status_code=403, detail="Global administrator role is required")
+
     async def _hub_human(request: Request, *, session: AsyncSession) -> Human:
         human = await _human_by_subject(_hub_subject(request), session=session)
         if human is None:
@@ -1865,6 +1877,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
     @fastapi_app.post("/hub/api/projects", response_class=JSONResponse, status_code=201)
     async def hub_create_project(request: Request) -> JSONResponse:
         await ensure_schema()
+        _hub_require_global_admin(request)
         body = await _hub_json_body(request)
         name = body.get("name")
         if not isinstance(name, str) or not name.strip() or len(name.strip()) > 255:
