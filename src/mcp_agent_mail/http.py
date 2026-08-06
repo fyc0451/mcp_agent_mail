@@ -2214,10 +2214,24 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             agent = await _hub_agent_for_update(agent_id, session=session)
             if agent is None or not await _agent_in_project_scope(project, agent, session=session):
                 raise HTTPException(status_code=404, detail="Agent not found")
+            # M3b-1 review: an externally bound Agent row is GLOBAL state shared
+            # with its home project and other groups. A group admin may bind it,
+            # but must not gain lifecycle control over it:
+            #   * owner_id change → global admin only
+            #   * retired change  → global admin or the agent's CURRENT owner
+            # Local routing-project agents keep the existing group admin/owner rules.
+            is_local_agent = agent.project_id == project.id
+            is_global_admin = _hub_is_global_admin(request)
 
             if "owner_id" in body:
-                if membership.role != "admin":
-                    raise HTTPException(status_code=403, detail="Project admin membership is required")
+                if is_local_agent:
+                    if membership.role != "admin":
+                        raise HTTPException(status_code=403, detail="Project admin membership is required")
+                elif not is_global_admin:
+                    raise HTTPException(
+                        status_code=403,
+                        detail="Global administrator role is required to change a bound external agent owner",
+                    )
                 owner_id = body["owner_id"]
                 if owner_id is not None and (
                     isinstance(owner_id, bool) or not isinstance(owner_id, int)
@@ -2243,10 +2257,16 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 retired = body["retired"]
                 if not isinstance(retired, bool):
                     raise HTTPException(status_code=400, detail="retired must be a boolean")
-                if membership.role != "admin" and agent.owner_id != human.id:
+                if is_local_agent:
+                    if membership.role != "admin" and agent.owner_id != human.id:
+                        raise HTTPException(
+                            status_code=403,
+                            detail="Agent owner or project admin is required",
+                        )
+                elif not is_global_admin and agent.owner_id != human.id:
                     raise HTTPException(
                         status_code=403,
-                        detail="Agent owner or project admin is required",
+                        detail="Global admin or the current agent owner is required for a bound external agent",
                     )
                 if retired and agent.retired_at is None:
                     referenced = await _agent_referenced_as_default(agent_id, session=session)

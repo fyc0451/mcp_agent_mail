@@ -373,10 +373,16 @@ async def test_bound_agent_as_default_and_support_request(hub):
         )
         assert premature.status_code == 400
 
-        # admin 把绑定 agent 的 owner 分给 bob (owner 必须是本群 active 成员)
-        assigned = await client.patch(
+        # 外部绑定 agent 的 owner 只能由全局 admin 分配 (#965 复审结论)
+        hijack = await client.patch(
             f"/hub/api/projects/core/agents/{external_id}",
             headers=alice,
+            json={"owner_id": bob_id},
+        )
+        assert hijack.status_code == 403
+        assigned = await client.patch(
+            f"/hub/api/projects/core/agents/{external_id}",
+            headers=root,
             json={"owner_id": bob_id},
         )
         assert assigned.status_code == 200, assigned.text
@@ -492,3 +498,104 @@ async def test_human_default_unbound_falls_back_to_inbox(hub):
         second = await _post_channel("TeamBot", project, "@bob 第二次")
         outcomes = await _deliver(project, second["id"])
         assert _outcome(outcomes, "bob")["status"] == "delivered_human_inbox"
+
+
+@pytest.mark.anyio
+async def test_external_agent_lifecycle_requires_global_admin_or_owner(hub):
+    """#965: a group admin may bind an external agent but must not gain
+    lifecycle control over the global row — owner_id is global-admin-only,
+    retired is global-admin or current-owner only. Local agents keep the
+    existing group admin/owner rules."""
+    settings, app = hub
+    alice = _headers(settings, "oidc|alice")
+    bob = _headers(settings, "oidc|bob")
+    root = _headers(settings, "oidc|root", admin=True)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        alice_id = await _setup_team(client, root, alice)
+        bob_id = await _register_human(client, bob, "Bob")
+        join = await client.post(
+            "/hub/api/projects/core/join-requests", headers=bob, json={"mention_handle": "bob"}
+        )
+        assert join.status_code == 201
+        await client.patch(
+            f"/hub/api/projects/core/members/{bob_id}", headers=alice, json={"status": "active"}
+        )
+
+        external_id = await _mk_agent("/workspaces/w1", "BlueLake")
+        await _bind(client, alice, "core", external_id)
+
+        # 群组 admin(非全局)对外部绑定 agent 的 owner/retired 均 403
+        owner_change = await client.patch(
+            f"/hub/api/projects/core/agents/{external_id}",
+            headers=alice,
+            json={"owner_id": alice_id},
+        )
+        assert owner_change.status_code == 403
+        retire = await client.patch(
+            f"/hub/api/projects/core/agents/{external_id}",
+            headers=alice,
+            json={"retired": True},
+        )
+        assert retire.status_code == 403
+
+        # 非 owner 普通成员也不可以
+        bob_retire = await client.patch(
+            f"/hub/api/projects/core/agents/{external_id}",
+            headers=bob,
+            json={"retired": True},
+        )
+        assert bob_retire.status_code == 403
+
+        # 全局 admin 分配 owner 给 bob
+        assigned = await client.patch(
+            f"/hub/api/projects/core/agents/{external_id}",
+            headers=root,
+            json={"owner_id": bob_id},
+        )
+        assert assigned.status_code == 200
+
+        # 当前 owner(bob, 普通成员)可退休自己的 agent; 其他成员仍不行
+        owner_retire = await client.patch(
+            f"/hub/api/projects/core/agents/{external_id}",
+            headers=bob,
+            json={"retired": True},
+        )
+        assert owner_retire.status_code == 200
+        owner_unretire = await client.patch(
+            f"/hub/api/projects/core/agents/{external_id}",
+            headers=bob,
+            json={"retired": False},
+        )
+        assert owner_unretire.status_code == 200
+
+        # 全局 admin 可退休/恢复外部 agent
+        root_retire = await client.patch(
+            f"/hub/api/projects/core/agents/{external_id}",
+            headers=root,
+            json={"retired": True},
+        )
+        assert root_retire.status_code == 200
+        root_unretire = await client.patch(
+            f"/hub/api/projects/core/agents/{external_id}",
+            headers=root,
+            json={"retired": False},
+        )
+        assert root_unretire.status_code == 200
+
+        # routing 本地 agent: 群组 admin 的既有规则不变(可分配 owner/退休)
+        project = await _routing_project("core")
+        local_id = await _seed_team_agent(client, alice, "core", "LocalBot")
+        local_owner = await client.patch(
+            f"/hub/api/projects/core/agents/{local_id}",
+            headers=alice,
+            json={"owner_id": alice_id},
+        )
+        assert local_owner.status_code == 200
+        local_retire = await client.patch(
+            f"/hub/api/projects/core/agents/{local_id}",
+            headers=alice,
+            json={"retired": True},
+        )
+        assert local_retire.status_code == 200
+        assert project.id
