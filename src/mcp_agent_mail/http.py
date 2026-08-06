@@ -2727,6 +2727,124 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 bindings.append(payload)
             return JSONResponse({"bindings": bindings})
 
+    # M3e: self-service claim of an unowned Agent by a team member who controls
+    # it (proven by the agent's registration_token). Sets owner + creates or
+    # revives the binding atomically. The token is compared in constant time
+    # and never echoed to responses, exceptions, or logs.
+    @fastapi_app.post(
+        "/hub/api/projects/{project_slug}/agent-claims",
+        response_class=JSONResponse,
+    )
+    async def hub_claim_agent(project_slug: str, request: Request) -> JSONResponse:
+        await ensure_schema()
+        body = await _hub_json_body(request)
+        agent_id = body.get("agent_id")
+        if isinstance(agent_id, bool) or not isinstance(agent_id, int):
+            raise HTTPException(status_code=400, detail="agent_id must be an integer")
+        presented = body.get("registration_token")
+        if not isinstance(presented, str) or not presented.strip() or len(presented) > 255:
+            raise HTTPException(status_code=400, detail="registration_token is required")
+        presented_token = presented.strip()
+
+        async with get_session() as session:
+            team_project = await _hub_team_project(project_slug, session=session)
+            human = await _hub_human(request, session=session)
+            project = await session.get(Project, team_project.routing_project_id)
+            if project is None or project.archived_at is not None:
+                raise HTTPException(status_code=404, detail="Project not found")
+            # Any active member may claim an agent they control; no admin power
+            # is granted or required here.
+            await _hub_active_membership(project, human, session=session)
+
+            agent = await session.get(Agent, agent_id)
+            if agent is None:
+                raise HTTPException(status_code=404, detail="Agent not found")
+            if agent.retired_at is not None:
+                raise HTTPException(status_code=409, detail="Cannot claim a retired agent")
+            # Team routing agents are managed, not claimable.
+            routing_row = await session.execute(
+                select(TeamProject).where(
+                    cast(Any, TeamProject.routing_project_id) == agent.project_id,
+                    cast(Any, TeamProject.archived_at).is_(None),
+                )
+            )
+            if routing_row.scalars().first() is not None:
+                raise HTTPException(
+                    status_code=409, detail="Team routing agents cannot be claimed"
+                )
+            # Owner may only be unset or the caller; never take another human's agent.
+            if agent.owner_id is not None and agent.owner_id != human.id:
+                raise HTTPException(status_code=409, detail="Agent is already owned by another human")
+            stored = agent.registration_token or ""
+            if not stored or not hmac.compare_digest(stored, presented_token):
+                raise HTTPException(status_code=403, detail="Invalid agent credentials")
+            if agent.project_id != project.id and await _membership_handle_taken(
+                project, agent.name, session=session
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="Agent name collides with an active member mention_handle",
+                )
+
+            if agent.owner_id is None:
+                try:
+                    agent = await _set_agent_owner(agent_id, human.id, session=session)
+                except ValueError as exc:
+                    raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+            # Create or revive the binding (same upsert semantics as bind).
+            existing_row = await session.execute(
+                select(TeamProjectAgentBinding).where(
+                    cast(Any, TeamProjectAgentBinding.team_project_id) == team_project.id,
+                    cast(Any, TeamProjectAgentBinding.agent_id) == agent_id,
+                )
+            )
+            binding = existing_row.scalars().first()
+            if binding is not None:
+                if binding.status != "active":
+                    binding.status = "active"
+                    binding.bound_by_human_id = human.id
+                    binding.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                    session.add(binding)
+                await session.commit()
+                await session.refresh(binding)
+                await session.refresh(agent)
+                return JSONResponse(
+                    {
+                        "binding": _hub_binding_payload(binding),
+                        "agent": _hub_agent_payload(agent),
+                    },
+                    status_code=200,
+                )
+            insert_stmt = sqlite_insert(TeamProjectAgentBinding).values(
+                team_project_id=team_project.id,
+                agent_id=agent_id,
+                status="active",
+                bound_by_human_id=human.id,
+            )
+            result = await session.execute(
+                insert_stmt.on_conflict_do_nothing(
+                    index_elements=["team_project_id", "agent_id"]
+                )
+            )
+            created = bool(cast(Any, result).rowcount)
+            await session.commit()
+            existing_row = await session.execute(
+                select(TeamProjectAgentBinding).where(
+                    cast(Any, TeamProjectAgentBinding.team_project_id) == team_project.id,
+                    cast(Any, TeamProjectAgentBinding.agent_id) == agent_id,
+                )
+            )
+            binding = existing_row.scalars().one()
+            await session.refresh(agent)
+            return JSONResponse(
+                {
+                    "binding": _hub_binding_payload(binding),
+                    "agent": _hub_agent_payload(agent),
+                },
+                status_code=201 if created else 200,
+            )
+
     def _oauth_metadata_disabled_response() -> JSONResponse:
         return JSONResponse({"mcp_oauth": False}, status_code=404)
 
