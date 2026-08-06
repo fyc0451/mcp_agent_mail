@@ -2294,6 +2294,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 .where(
                     cast(Any, Agent.project_id) == project.id,
                     cast(Any, Agent.program) != _HUB_HUMAN_RELAY_PROGRAM,
+                    cast(Any, Agent.program) != _SESSION_LEAD_PROGRAM,
                 )
                 .order_by(Agent.name)
             )
@@ -3094,17 +3095,22 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             "updated_at": str(binding.updated_at),
         }
 
-    def _hub_session_lead_name(human_id: int, client_session_id: str) -> str:
-        fragment = re.sub(r"[^A-Za-z0-9._-]+", "-", client_session_id)[:32].strip("-.") or "s"
+    def _hub_session_lead_name(human_id: int, lead_label: str) -> str:
+        fragment = re.sub(r"[^A-Za-z0-9._-]+", "-", lead_label)[:32].strip("-.") or "lead"
         return f"SessionLead{human_id}-{fragment}"
 
-    @fastapi_app.post(
-        "/hub/api/projects/{project_slug}/session-leads",
+    @fastapi_app.put(
+        "/hub/api/projects/{project_slug}/session-lead",
         response_class=JSONResponse,
     )
     async def hub_upsert_session_lead(project_slug: str, request: Request) -> JSONResponse:
         """Create or reuse the caller's managed lead Agent for a client session,
-        and atomically make it the caller's membership default."""
+        and atomically make it the caller's membership default.
+
+        client_session_id is an opaque client-computed hash (session+generation
+        SHA-256) used only as the idempotency key — the Hub never receives
+        session names, paths, or panes. lead_label names the managed Agent.
+        """
         await ensure_schema()
         body = await _hub_json_body(request)
         raw_session_id = body.get("client_session_id")
@@ -3113,6 +3119,13 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             raise HTTPException(
                 status_code=400,
                 detail="client_session_id must be 1-128 letters, numbers, '.', '_' or '-'",
+            )
+        raw_label = body.get("lead_label")
+        lead_label = raw_label.strip() if isinstance(raw_label, str) else ""
+        if not lead_label or len(lead_label) > 128:
+            raise HTTPException(
+                status_code=400,
+                detail="lead_label is required and must be at most 128 characters",
             )
         async with get_session() as session:
             team_project = await _hub_team_project(project_slug, session=session)
@@ -3146,7 +3159,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     binding.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
                     session.add(binding)
             else:
-                lead_name = _hub_session_lead_name(human.id, client_session_id)
+                lead_name = _hub_session_lead_name(human.id, lead_label)
                 if await _membership_handle_taken(project, lead_name, session=session):
                     raise HTTPException(
                         status_code=409,
@@ -3206,15 +3219,17 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             await session.refresh(agent)
             return JSONResponse(
                 {
-                    "binding": _hub_session_lead_payload(binding),
                     "agent": _hub_agent_payload(agent),
+                    "client_session_id": client_session_id,
+                    "active": True,
+                    "binding": _hub_session_lead_payload(binding),
                     "membership_default_agent_id": membership.default_agent_id,
                 },
                 status_code=201 if created else 200,
             )
 
     @fastapi_app.get(
-        "/hub/api/projects/{project_slug}/session-leads",
+        "/hub/api/projects/{project_slug}/session-lead",
         response_class=JSONResponse,
     )
     async def hub_list_session_leads(project_slug: str, request: Request) -> JSONResponse:
@@ -3244,17 +3259,26 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             return JSONResponse({"bindings": bindings})
 
     @fastapi_app.delete(
-        "/hub/api/projects/{project_slug}/session-leads/{client_session_id}",
+        "/hub/api/projects/{project_slug}/session-lead",
         response_class=JSONResponse,
     )
     async def hub_unbind_session_lead(
         project_slug: str,
-        client_session_id: str,
         request: Request,
     ) -> JSONResponse:
-        """Unbind a session lead: stops routing (default cleared, inbox
-        fallback off) but preserves the binding row, Agent and all messages."""
+        """Unbind a session lead: stops routing (inbox fallback off) but
+        preserves the binding row, Agent and all messages. The caller's
+        default is cleared only while the record is still active AND the
+        default points at this lead — anything else is an idempotent no-op."""
         await ensure_schema()
+        body = await _hub_json_body(request)
+        raw_session_id = body.get("client_session_id")
+        client_session_id = raw_session_id.strip() if isinstance(raw_session_id, str) else ""
+        if not _CLIENT_SESSION_ID_RE.fullmatch(client_session_id):
+            raise HTTPException(
+                status_code=400,
+                detail="client_session_id must be 1-128 letters, numbers, '.', '_' or '-'",
+            )
         async with get_session() as session:
             team_project = await _hub_team_project(project_slug, session=session)
             human = await _hub_human(request, session=session)
@@ -3272,12 +3296,14 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             binding = existing_row.scalars().first()
             if binding is None:
                 raise HTTPException(status_code=404, detail="Session lead binding not found")
-            if binding.status != "unbound":
+            was_active = binding.status == "active"
+            if was_active:
                 binding.status = "unbound"
                 binding.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
                 session.add(binding)
-            # Routing off: if the caller's default is this lead, clear it.
-            if membership.default_agent_id == binding.agent_id:
+            # Default cleared only while the record was still active AND the
+            # caller's default points at this lead (contract #1062).
+            if was_active and membership.default_agent_id == binding.agent_id:
                 membership.default_agent_id = None
                 session.add(membership)
             await session.commit()

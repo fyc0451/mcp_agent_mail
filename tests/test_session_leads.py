@@ -89,9 +89,24 @@ async def _join_active(
     assert approve.status_code == 200
 
 
-def _upsert_lead(client: AsyncClient, headers: dict[str, str], session_id: str, slug: str = "core"):
-    return client.post(
-        f"/hub/api/projects/{slug}/session-leads",
+def _upsert_lead(
+    client: AsyncClient,
+    headers: dict[str, str],
+    session_id: str,
+    slug: str = "core",
+    label: str = "Mac 终端",
+):
+    return client.put(
+        f"/hub/api/projects/{slug}/session-lead",
+        headers=headers,
+        json={"client_session_id": session_id, "lead_label": label},
+    )
+
+
+def _delete_lead(client: AsyncClient, headers: dict[str, str], session_id: str, slug: str = "core"):
+    return client.request(
+        "DELETE",
+        f"/hub/api/projects/{slug}/session-lead",
         headers=headers,
         json={"client_session_id": session_id},
     )
@@ -117,10 +132,14 @@ async def test_create_lead_sets_default_atomically_and_hides_token(hub):
         created = await _upsert_lead(client, bob, "mac-terminal-1")
         assert created.status_code == 201, created.text
         payload = created.json()
+        assert payload["client_session_id"] == "mac-terminal-1"
+        assert payload["active"] is True
         assert payload["membership_default_agent_id"] == payload["agent"]["id"]
         assert payload["agent"]["owner_id"] == bob_id
         assert payload["binding"]["status"] == "active"
         assert payload["binding"]["client_session_id"] == "mac-terminal-1"
+        assert payload["agent"]["name"].startswith("SessionLead")
+        assert "Mac" in payload["agent"]["name"]
         # 全程无 Agent Mail token: 响应里绝不出 registration_token
         assert "registration_token" not in created.text
 
@@ -253,9 +272,7 @@ async def test_lead_messages_fall_back_to_human_inbox_with_dedupe(hub):
             assert len(items) == 1  # 仍只有一条
 
         # 解除绑定后: 新消息不再回落
-        unbound = await client.delete(
-            "/hub/api/projects/core/session-leads/mac-1", headers=bob
-        )
+        unbound = await _delete_lead(client, bob, "mac-1")
         assert unbound.status_code == 200
         assert unbound.json()["status"] == "unbound"
         membership_view = await client.get("/hub/api/projects/core/membership", headers=bob)
@@ -311,13 +328,13 @@ async def test_unbind_keeps_history_and_reupsert_revives(hub):
         binding_id = created.json()["binding"]["id"]
         agent_id = created.json()["agent"]["id"]
 
-        unbound = await client.delete("/hub/api/projects/core/session-leads/mac-1", headers=bob)
+        unbound = await _delete_lead(client, bob, "mac-1")
         assert unbound.status_code == 200
         assert unbound.json()["id"] == binding_id
         assert unbound.json()["status"] == "unbound"
 
         # 历史保留: 列表仍可见 unbound 行, agent 行仍在
-        listed = await client.get("/hub/api/projects/core/session-leads", headers=bob)
+        listed = await client.get("/hub/api/projects/core/session-lead", headers=bob)
         assert listed.status_code == 200
         rows = listed.json()["bindings"]
         assert len(rows) == 1 and rows[0]["status"] == "unbound"
@@ -346,5 +363,93 @@ async def test_unbind_keeps_history_and_reupsert_revives(hub):
         assert reactivated.json()["agent"]["retired"] is False
 
         # 解绑不存在的 session 404
-        missing = await client.delete("/hub/api/projects/core/session-leads/nope", headers=bob)
+        missing = await _delete_lead(client, bob, "nope")
         assert missing.status_code == 404
+
+
+@pytest.mark.anyio
+async def test_session_lead_hidden_from_agent_lists(hub):
+    """team-session-lead 必须与 team-human-relay 一样从普通管理列表隐藏。"""
+    settings, app = hub
+    root = _headers(settings, "oidc|root", admin=True)
+    bob = _headers(settings, "oidc|bob")
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        await _setup_team(client, root)
+        bob_id = await _register_human(client, bob, "Bob")
+        await _join_active(client, root, bob, bob_id, "bob")
+        await _upsert_lead(client, bob, "mac-1")
+
+        listed = await client.get("/hub/api/projects/core/agents", headers=bob)
+        assert listed.status_code == 200
+        programs = [a.get("program") for a in listed.json()["agents"]]
+        assert "team-session-lead" not in programs
+        assert "team-human-relay" not in programs
+
+
+@pytest.mark.anyio
+async def test_fallback_inbox_item_kind_is_stable_enum(hub):
+    settings, app = hub
+    root = _headers(settings, "oidc|root", admin=True)
+    alice = _headers(settings, "oidc|alice")
+    bob = _headers(settings, "oidc|bob")
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        await _setup_team(client, root)
+        alice_id = await _register_human(client, alice, "Alice")
+        bob_id = await _register_human(client, bob, "Bob")
+        await _join_active(client, root, alice, alice_id, "alice")
+        await _join_active(client, root, bob, bob_id, "bob")
+        await _upsert_lead(client, alice, "wsl-1")
+        await _upsert_lead(client, bob, "mac-1")
+
+        support = await client.post(
+            "/hub/api/projects/core/support-requests",
+            headers=alice,
+            json={"subject": "kind 检查", "body_md": "x", "mention_handles": ["bob"]},
+        )
+        assert support.status_code == 201
+        async with get_session() as session:
+            item = (
+                await session.execute(
+                    select(HumanInboxItem).where(HumanInboxItem.human_id == bob_id)
+                )
+            ).scalars().one()
+            assert item.kind == "managed_session_agent"
+            assert item.source_channel_message_id is not None
+
+
+@pytest.mark.anyio
+async def test_delete_only_clears_default_while_active(hub):
+    """契约: 仅当记录仍 active 且 default 指向该 lead 时才清 default。"""
+    settings, app = hub
+    root = _headers(settings, "oidc|root", admin=True)
+    bob = _headers(settings, "oidc|bob")
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        await _setup_team(client, root)
+        bob_id = await _register_human(client, bob, "Bob")
+        await _join_active(client, root, bob, bob_id, "bob")
+        created = await _upsert_lead(client, bob, "mac-1")
+        agent_id = created.json()["agent"]["id"]
+
+        # 第一次 DELETE: active + default=lead -> 清 default
+        first = await _delete_lead(client, bob, "mac-1")
+        assert first.status_code == 200
+        membership = await client.get("/hub/api/projects/core/membership", headers=bob)
+        assert membership.json()["default_agent_id"] is None
+
+        # 手动把 default 再指回 lead(此时 binding 已 unbound)
+        restore = await client.patch(
+            "/hub/api/projects/core/membership",
+            headers=bob,
+            json={"default_agent_id": agent_id},
+        )
+        assert restore.status_code == 200
+
+        # 第二次 DELETE: 记录已 unbound -> default 必须保留(幂等不动)
+        second = await _delete_lead(client, bob, "mac-1")
+        assert second.status_code == 200
+        assert second.json()["status"] == "unbound"
+        membership = await client.get("/hub/api/projects/core/membership", headers=bob)
+        assert membership.json()["default_agent_id"] == agent_id
