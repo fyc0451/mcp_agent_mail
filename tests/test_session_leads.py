@@ -453,3 +453,43 @@ async def test_delete_only_clears_default_while_active(hub):
         assert second.json()["status"] == "unbound"
         membership = await client.get("/hub/api/projects/core/membership", headers=bob)
         assert membership.json()["default_agent_id"] == agent_id
+
+
+@pytest.mark.anyio
+async def test_chat_history_shows_human_via_lead(hub):
+    """#1063: 受管 lead 作为 support sender 时,chat history 必须把 sender 归
+    Human(display_name/human_id/kind),lead 名只经 sender_agent 透出。"""
+    settings, app = hub
+    root = _headers(settings, "oidc|root", admin=True)
+    alice = _headers(settings, "oidc|alice")
+    bob = _headers(settings, "oidc|bob")
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        await _setup_team(client, root)
+        alice_id = await _register_human(client, alice, "Alice")
+        bob_id = await _register_human(client, bob, "Bob")
+        await _join_active(client, root, alice, alice_id, "alice")
+        await _join_active(client, root, bob, bob_id, "bob")
+        await _upsert_lead(client, alice, "wsl-1")
+        bob_lead = await _upsert_lead(client, bob, "mac-1")
+        lead_name = bob_lead.json()["agent"]["name"]
+
+        # bob 以自己的 lead 为默认发 support(bob 是 sender)
+        posted = await client.post(
+            "/hub/api/projects/core/support-requests",
+            headers=bob,
+            json={"subject": "via lead", "body_md": "来自 bob", "mention_handles": ["alice"]},
+        )
+        assert posted.status_code == 201
+
+        history = await client.get("/hub/api/projects/core/chat/messages", headers=alice)
+        assert history.status_code == 200
+        messages = history.json()["messages"]
+        assert messages
+        own = next(m for m in messages if m["subject"] == "via lead")
+        assert own["sender_name"] == "Bob"
+        assert own["sender_human_id"] == bob_id
+        assert own["sender_kind"] == "session_lead"
+        assert own["sender_agent"] == lead_name
+        # 受管 lead 不得呈现为独立团队成员: sender_name 不能是 lead 名
+        assert own["sender_name"] != lead_name

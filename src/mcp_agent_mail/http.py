@@ -2466,6 +2466,11 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 ):
                     mention_handles = [token[1:] for token in tokens]
                     body_md = content
+                is_relay = sender.program == _HUB_HUMAN_RELAY_PROGRAM
+                is_session_lead = sender.program == _SESSION_LEAD_PROGRAM
+                # M3: 受管 lead 是 Human 的代理,不是独立团队成员——sender 归
+                # Human(display_name/human_id),lead 名只经 sender_agent 透出,
+                # 前端据此显示 "付彦超 · via codex-main" 并识别自己的消息。
                 items.append({
                     "id": message.id,
                     "subject": message.subject,
@@ -2476,11 +2481,11 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     "sender_name": sender_human.display_name if sender_human else sender.name,
                     "sender_human_id": sender_human.id if sender_human else None,
                     "sender_kind": (
-                        "human" if sender.program == _HUB_HUMAN_RELAY_PROGRAM else "agent"
+                        "human"
+                        if is_relay
+                        else ("session_lead" if is_session_lead else "agent")
                     ),
-                    "sender_agent": (
-                        None if sender.program == _HUB_HUMAN_RELAY_PROGRAM else sender.name
-                    ),
+                    "sender_agent": None if is_relay else sender.name,
                 })
             items.reverse()
             return JSONResponse(
