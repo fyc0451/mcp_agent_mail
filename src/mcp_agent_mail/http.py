@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import base64
 import contextlib
+import hashlib
 import hmac
 import importlib
 import json
@@ -1847,7 +1848,11 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 and sender.retired_at is None
                 and await _agent_in_project_scope(project, sender, session=session)
             ):
-                return sender, "agent"
+                return sender, (
+                    "session_lead"
+                    if sender.program == _SESSION_LEAD_PROGRAM
+                    else "agent"
+                )
 
         if project.id is None or human.id is None:
             raise HTTPException(status_code=409, detail="Human sender identity is unavailable")
@@ -2446,23 +2451,19 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             if channel is None:
                 return JSONResponse({"channel": "support", "messages": [], "count": 0})
             rows = await session.execute(
-                select(ChannelMessage, Agent, Human)
+                select(ChannelMessage, Agent, Human, SessionLeadBinding)
                 .join(Agent, cast(Any, Agent.id) == ChannelMessage.sender_id)
                 .outerjoin(Human, cast(Any, Human.id) == Agent.owner_id)
+                .outerjoin(
+                    SessionLeadBinding,
+                    cast(Any, SessionLeadBinding.agent_id) == Agent.id,
+                )
                 .where(cast(Any, ChannelMessage.channel_id) == channel.id)
                 .order_by(cast(Any, ChannelMessage.id).desc())
                 .limit(200)
             )
-            lead_rows = await session.execute(
-                select(SessionLeadBinding).where(
-                    cast(Any, SessionLeadBinding.team_project_id) == team_project.id
-                )
-            )
-            lead_labels = {
-                binding.agent_id: binding.lead_label for binding in lead_rows.scalars().all()
-            }
             items = []
-            for message, sender, sender_human in rows.all():
+            for message, sender, sender_human, lead_binding in rows.all():
                 body_md = message.body_md
                 mention_handles: list[str] = []
                 prefix, separator, content = body_md.partition("\n\n")
@@ -2487,7 +2488,11 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     "mention_handles": mention_handles,
                     "importance": message.importance,
                     "created_ts": str(message.created_ts),
-                    "sender_name": sender_human.display_name if sender_human else sender.name,
+                    "sender_name": (
+                        sender_human.display_name
+                        if sender_human is not None
+                        else ("Team member" if is_relay or is_session_lead else sender.name)
+                    ),
                     "sender_human_id": sender_human.id if sender_human else None,
                     "sender_kind": (
                         "human"
@@ -2497,8 +2502,11 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     "sender_agent": (
                         None
                         if is_relay
-                        else (lead_labels.get(sender.id) or None
-                              if is_session_lead else sender.name)
+                        else (
+                            lead_binding.lead_label or None
+                            if is_session_lead and lead_binding is not None
+                            else (None if is_session_lead else sender.name)
+                        )
                     ),
                 })
             items.reverse()
@@ -2556,6 +2564,22 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 membership,
                 session=session,
             )
+            if sender.program == _SESSION_LEAD_PROGRAM:
+                lead_row = await session.execute(
+                    select(SessionLeadBinding).where(
+                        cast(Any, SessionLeadBinding.agent_id) == sender.id,
+                    )
+                )
+                lead_binding = lead_row.scalars().first()
+                sender_agent_label = (
+                    lead_binding.lead_label or None
+                    if lead_binding is not None
+                    else None
+                )
+            elif sender.program == _HUB_HUMAN_RELAY_PROGRAM:
+                sender_agent_label = None
+            else:
+                sender_agent_label = sender.name
             rows = await session.execute(
                 select(ProjectHumanMembership).where(
                     cast(Any, ProjectHumanMembership.project_id) == project.id,
@@ -2625,7 +2649,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             {
                 "channel": "support",
                 "message_id": message.id,
-                "sender_agent": sender.name,
+                "sender_agent": sender_agent_label,
                 "sender_kind": sender_kind,
                 "sender_human": membership.mention_handle,
                 "mention_handles": mention_handles,
@@ -2652,7 +2676,14 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             if unread_only:
                 conditions.append(cast(Any, HumanInboxItem.read_ts).is_(None))
             rows = await session.execute(
-                select(HumanInboxItem, Message, Agent, TeamProject, Human)
+                select(
+                    HumanInboxItem,
+                    Message,
+                    Agent,
+                    TeamProject,
+                    Human,
+                    SessionLeadBinding,
+                )
                 .join(Message, cast(Any, Message.id) == HumanInboxItem.message_id)
                 .join(Agent, cast(Any, Agent.id) == Message.sender_id)
                 .join(
@@ -2660,14 +2691,14 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     cast(Any, TeamProject.routing_project_id) == HumanInboxItem.project_id,
                 )
                 .outerjoin(Human, cast(Any, Human.id) == Agent.owner_id)
+                .outerjoin(
+                    SessionLeadBinding,
+                    cast(Any, SessionLeadBinding.agent_id) == Agent.id,
+                )
                 .where(*conditions)
                 .order_by(cast(Any, HumanInboxItem.created_ts).desc())
                 .limit(limit)
             )
-            lead_rows = await session.execute(select(SessionLeadBinding))
-            lead_labels = {
-                binding.agent_id: binding.lead_label for binding in lead_rows.scalars().all()
-            }
             items = [
                 {
                     "id": item.id,
@@ -2683,7 +2714,11 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                         sender_human.display_name
                         if sender_human is not None
                         and sender.program in (_HUB_HUMAN_RELAY_PROGRAM, _SESSION_LEAD_PROGRAM)
-                        else sender.name
+                        else (
+                            "Team member"
+                            if sender.program in (_HUB_HUMAN_RELAY_PROGRAM, _SESSION_LEAD_PROGRAM)
+                            else sender.name
+                        )
                     ),
                     "sender_kind": (
                         "human"
@@ -2693,13 +2728,17 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     "sender_agent": (
                         None
                         if sender.program == _HUB_HUMAN_RELAY_PROGRAM
-                        else (lead_labels.get(sender.id) or None
-                              if sender.program == _SESSION_LEAD_PROGRAM else sender.name)
+                        else (
+                            lead_binding.lead_label or None
+                            if sender.program == _SESSION_LEAD_PROGRAM
+                            and lead_binding is not None
+                            else (None if sender.program == _SESSION_LEAD_PROGRAM else sender.name)
+                        )
                     ),
                     "read_ts": str(item.read_ts) if item.read_ts else None,
                     "created_ts": str(item.created_ts),
                 }
-                for item, message, sender, project, sender_human in rows.all()
+                for item, message, sender, project, sender_human, lead_binding in rows.all()
             ]
             return JSONResponse({"items": items})
 
@@ -3131,9 +3170,14 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             "updated_at": str(binding.updated_at),
         }
 
-    def _hub_session_lead_name(human_id: int, lead_label: str) -> str:
+    def _hub_session_lead_name(
+        human_id: int,
+        client_session_id: str,
+        lead_label: str,
+    ) -> str:
         fragment = re.sub(r"[^A-Za-z0-9._-]+", "-", lead_label)[:32].strip("-.") or "lead"
-        return f"SessionLead{human_id}-{fragment}"
+        session_hash = hashlib.sha256(client_session_id.encode()).hexdigest()[:12]
+        return f"SessionLead{human_id}-{fragment}-{session_hash}"
 
     @fastapi_app.put(
         "/hub/api/projects/{project_slug}/session-lead",
@@ -3179,7 +3223,8 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             # 同一 human+project 任意时刻仅一个 active lead(#1064):
             # 关键段按 (team_project, human) 串行,先保证单 active 再 upsert。
             lead_lock = _session_lead_locks.setdefault(
-                (team_project.id, human.id), asyncio.Lock()
+                (cast(int, team_project.id), human.id),
+                asyncio.Lock(),
             )
             async with lead_lock:
                 await session.execute(
@@ -3223,7 +3268,11 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                         binding.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
                         session.add(binding)
                 else:
-                    lead_name = _hub_session_lead_name(human.id, lead_label)
+                    lead_name = _hub_session_lead_name(
+                        human.id,
+                        client_session_id,
+                        lead_label,
+                    )
                     if await _membership_handle_taken(project, lead_name, session=session):
                         raise HTTPException(
                             status_code=409,
@@ -3308,19 +3357,16 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 raise HTTPException(status_code=404, detail="Project not found")
             await _hub_active_membership(project, human, session=session)
             rows = await session.execute(
-                select(SessionLeadBinding, Agent)
-                .join(Agent, cast(Any, Agent.id) == SessionLeadBinding.agent_id)
-                .where(
+                select(SessionLeadBinding).where(
                     cast(Any, SessionLeadBinding.team_project_id) == team_project.id,
                     cast(Any, SessionLeadBinding.human_id) == human.id,
                 )
                 .order_by(cast(Any, SessionLeadBinding.created_at))
             )
-            bindings = []
-            for binding, agent in rows.all():
-                payload = _hub_session_lead_payload(binding)
-                payload["agent_name"] = agent.name
-                bindings.append(payload)
+            bindings = [
+                _hub_session_lead_payload(binding)
+                for binding in rows.scalars().all()
+            ]
             return JSONResponse({"bindings": bindings})
 
     @fastapi_app.delete(

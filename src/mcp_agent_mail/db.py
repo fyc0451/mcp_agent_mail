@@ -957,6 +957,44 @@ def _setup_fts(connection: Any) -> None:
     ]:
         connection.exec_driver_sql(index_sql)
 
+    # M3 Session-Team: repair any pre-index duplicate active rows, preferring
+    # the membership default and then the newest binding, before enforcing the
+    # invariant across all server processes.
+    connection.exec_driver_sql(
+        """
+        UPDATE session_lead_bindings
+        SET status = 'unbound', updated_at = CURRENT_TIMESTAMP
+        WHERE status = 'active' AND id NOT IN (
+            SELECT id FROM (
+                SELECT slb.id,
+                       row_number() OVER (
+                           PARTITION BY slb.team_project_id, slb.human_id
+                           ORDER BY
+                               CASE WHEN phm.default_agent_id = slb.agent_id THEN 0 ELSE 1 END,
+                               slb.updated_at DESC,
+                               slb.id DESC
+                       ) AS rank
+                FROM session_lead_bindings AS slb
+                JOIN team_projects AS tp ON tp.id = slb.team_project_id
+                LEFT JOIN project_human_memberships AS phm
+                  ON phm.project_id = tp.routing_project_id
+                 AND phm.human_id = slb.human_id
+                WHERE slb.status = 'active'
+            ) AS ranked
+            WHERE rank = 1
+        )
+        """
+    )
+    connection.exec_driver_sql(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_slb_team_human_active "
+        "ON session_lead_bindings (team_project_id, human_id) "
+        "WHERE status = 'active'"
+    )
+    connection.exec_driver_sql(
+        "UPDATE human_inbox_items SET kind = 'session_lead' "
+        "WHERE kind = 'managed_session_agent'"
+    )
+
 
 def get_database_path(settings: Settings | None = None) -> Path | None:
     """Extract the filesystem path to the SQLite database file from settings.

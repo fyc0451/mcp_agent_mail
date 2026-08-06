@@ -15,6 +15,7 @@ from __future__ import annotations
 import pytest
 from authlib.jose import jwt
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import select
 
 from mcp_agent_mail import config as _config
@@ -338,6 +339,7 @@ async def test_unbind_keeps_history_and_reupsert_revives(hub):
         assert listed.status_code == 200
         rows = listed.json()["bindings"]
         assert len(rows) == 1 and rows[0]["status"] == "unbound"
+        assert "SessionLead" not in listed.text
         async with get_session() as session:
             agent = await session.get(Agent, agent_id)
             assert agent is not None
@@ -481,6 +483,9 @@ async def test_chat_history_shows_human_via_lead(hub):
             json={"subject": "via lead", "body_md": "来自 bob", "mention_handles": ["alice"]},
         )
         assert posted.status_code == 201
+        assert posted.json()["sender_kind"] == "session_lead"
+        assert posted.json()["sender_agent"] == "Mac 终端"
+        assert lead_name not in posted.text
 
         history = await client.get("/hub/api/projects/core/chat/messages", headers=alice)
         assert history.status_code == 200
@@ -516,6 +521,7 @@ async def test_single_active_lead_per_human_project(hub):
         assert first.status_code == 201
         second = await _upsert_lead(client, bob, "session-new")
         assert second.status_code == 201
+        assert first.json()["agent"]["id"] != second.json()["agent"]["id"]
         async with get_session() as session:
             rows = (
                 await session.execute(
@@ -548,6 +554,32 @@ async def test_single_active_lead_per_human_project(hub):
             ).scalars().all()
             assert len(rows) == 1
             winner_id = rows[0].agent_id
+            active_binding = rows[0]
+            winner_agent = await session.get(Agent, winner_id)
+            assert winner_agent is not None
+            conflicting_agent = Agent(
+                project_id=winner_agent.project_id,
+                name="SessionLead-db-conflict",
+                program="team-session-lead",
+                model="hub",
+                owner_id=bob_id,
+            )
+            session.add(conflicting_agent)
+            await session.flush()
+            assert conflicting_agent.id is not None
+            session.add(
+                SessionLeadBinding(
+                    team_project_id=active_binding.team_project_id,
+                    human_id=bob_id,
+                    client_session_id="db-conflict",
+                    agent_id=conflicting_agent.id,
+                    lead_label="db-conflict",
+                    status="active",
+                )
+            )
+            with pytest.raises(IntegrityError):
+                await session.commit()
+            await session.rollback()
         membership = await client.get("/hub/api/projects/core/membership", headers=bob)
         assert membership.json()["default_agent_id"] == winner_id
 
@@ -567,9 +599,9 @@ async def test_inbox_shows_human_and_lead_label_not_internal_name(hub):
         bob_id = await _register_human(client, bob, "Bob")
         await _join_active(client, root, alice, alice_id, "alice")
         await _join_active(client, root, bob, bob_id, "bob")
-        await _upsert_lead(client, alice, "wsl-1")
-        bob_lead = await _upsert_lead(client, bob, "mac-1")
-        lead_name = bob_lead.json()["agent"]["name"]
+        alice_lead = await _upsert_lead(client, alice, "wsl-1", label="codex-main")
+        await _upsert_lead(client, bob, "mac-1", label="kimi-main")
+        lead_name = alice_lead.json()["agent"]["name"]
 
         support = await client.post(
             "/hub/api/projects/core/support-requests",
@@ -585,7 +617,7 @@ async def test_inbox_shows_human_and_lead_label_not_internal_name(hub):
         own = next(item for item in items if item["subject"] == "inbox 显示")
         assert own["sender_name"] == "Alice"
         assert own["sender_kind"] == "session_lead"
-        assert own["sender_agent"] is not None
+        assert own["sender_agent"] == "codex-main"
         assert lead_name not in str(own)
 
 

@@ -530,11 +530,11 @@ class SessionLeadBinding(SQLModel, table=True):
 
     The Hub creates and owns the lifecycle of a routing-project-local lead
     Agent so a human can be addressed and receive team messages without any
-    client-side Agent Mail token. Sessions sharing one lead_label also share
-    the same Agent row (per human+project at most one is ever active). The
-    row is the management record only: unbinding flips ``status`` to
-    ``unbound`` (routing stops) while the Agent row, messages and this
-    history are all preserved.
+    client-side Agent Mail token. Each client session gets its own internal
+    Agent row so historical messages keep the correct display label. The row
+    is the management record only: unbinding flips ``status`` to ``unbound``
+    (routing stops) while the Agent row, messages and this history are all
+    preserved.
     """
 
     __tablename__ = "session_lead_bindings"
@@ -542,7 +542,15 @@ class SessionLeadBinding(SQLModel, table=True):
         UniqueConstraint(
             "team_project_id", "human_id", "client_session_id", name="uq_slb_team_human_session"
         ),
+        UniqueConstraint("agent_id", name="uq_slb_agent"),
         Index("ix_slb_agent_status", "agent_id", "status"),
+        Index(
+            "uq_slb_team_human_active",
+            "team_project_id",
+            "human_id",
+            unique=True,
+            sqlite_where=text("status = 'active'"),
+        ),
     )
 
     id: Optional[int] = Field(default=None, primary_key=True)
