@@ -7,23 +7,15 @@ import pytest
 from authlib.jose import JsonWebKey, JsonWebToken
 from fastapi.testclient import TestClient
 
-from mcp_agent_mail.human_auth import (
-    HumanAuthConfig,
-    _validated_bind_host,
-    create_app,
-)
+from mcp_agent_mail.human_auth import HumanAuthConfig, _validated_bind_host, create_app
 
 
 def test_bind_host_requires_explicit_private_http_opt_in():
     assert _validated_bind_host("127.0.0.1") == "127.0.0.1"
     assert _validated_bind_host("::1") == "::1"
-    assert (
-        _validated_bind_host(
-            "10.18.160.11",
-            allow_private_http=True,
-        )
-        == "10.18.160.11"
-    )
+    assert _validated_bind_host(
+        "10.18.160.11", allow_private_http=True,
+    ) == "10.18.160.11"
 
     with pytest.raises(ValueError, match="allow-private-http"):
         _validated_bind_host("10.18.160.11")
@@ -41,7 +33,9 @@ def _bootstrapped_client(tmp_path):
     )
     app = create_app(config)
     credentials = tmp_path / "admin.json"
-    assert app.state.store.bootstrap_admin(username="fyc", display_name="付彦超", credentials_path=credentials)
+    assert app.state.store.bootstrap_admin(
+        username="fyc", display_name="付彦超", credentials_path=credentials
+    )
     return app, TestClient(app), credentials
 
 
@@ -80,7 +74,9 @@ def test_private_state_permissions_and_idempotent_bootstrap(tmp_path):
     assert stat.S_IMODE(store.key_path.stat().st_mode) == 0o600
     assert stat.S_IMODE(credentials.stat().st_mode) == 0o600
     original = credentials.read_bytes()
-    assert not store.bootstrap_admin(username="fyc", display_name="Changed", credentials_path=credentials)
+    assert not store.bootstrap_admin(
+        username="fyc", display_name="Changed", credentials_path=credentials
+    )
     assert credentials.read_bytes() == original
 
 
@@ -121,7 +117,9 @@ def test_invitation_registration_approval_and_disable(tmp_path):
     invite_code = invitation.json()["invite_code"]
     assert invite_code not in client.get("/admin/users", headers=admin_headers).text
     with app.state.store._connect() as connection:
-        stored_invitation = connection.execute("SELECT code_hash FROM invitations").fetchone()
+        stored_invitation = connection.execute(
+            "SELECT code_hash FROM invitations"
+        ).fetchone()
     assert stored_invitation["code_hash"] != invite_code
 
     registration = {
@@ -138,13 +136,10 @@ def test_invitation_registration_approval_and_disable(tmp_path):
         "status": "pending",
     }
     assert client.post("/register", json={**registration, "username": "bob"}).status_code == 400
-    assert (
-        client.post(
-            "/token",
-            json={"username": "alice", "password": registration["password"]},
-        ).status_code
-        == 401
-    )
+    assert client.post(
+        "/token",
+        json={"username": "alice", "password": registration["password"]},
+    ).status_code == 401
 
     users = client.get("/admin/users", headers=admin_headers)
     assert users.status_code == 200
@@ -165,15 +160,14 @@ def test_invitation_registration_approval_and_disable(tmp_path):
     assert login.status_code == 200
     assert login.json()["profile"]["roles"] == ["writer"]
     alice_token = login.json()["access_token"]
-    assert client.get("/me", headers={"Authorization": f"Bearer {alice_token}"}).status_code == 200
-    assert (
-        client.post(
-            "/admin/invitations",
-            headers={"Authorization": f"Bearer {alice_token}"},
-            json={"expires_in": 3600},
-        ).status_code
-        == 403
-    )
+    assert client.get(
+        "/me", headers={"Authorization": f"Bearer {alice_token}"}
+    ).status_code == 200
+    assert client.post(
+        "/admin/invitations",
+        headers={"Authorization": f"Bearer {alice_token}"},
+        json={"expires_in": 3600},
+    ).status_code == 403
 
     disabled = client.patch(
         "/admin/users/alice",
@@ -181,50 +175,42 @@ def test_invitation_registration_approval_and_disable(tmp_path):
         json={"status": "disabled"},
     )
     assert disabled.status_code == 200
-    assert client.get("/me", headers={"Authorization": f"Bearer {alice_token}"}).status_code == 401
-    assert (
-        client.post(
-            "/token",
-            json={"username": "alice", "password": registration["password"]},
-        ).status_code
-        == 401
-    )
+    assert client.get(
+        "/me", headers={"Authorization": f"Bearer {alice_token}"}
+    ).status_code == 401
+    assert client.post(
+        "/token",
+        json={"username": "alice", "password": registration["password"]},
+    ).status_code == 401
 
 
 def test_invitation_admin_guards_and_invalid_code(tmp_path):
     _, client, credentials = _bootstrapped_client(tmp_path)
-    admin_token = client.post("/token", json=json.loads(credentials.read_text())).json()["access_token"]
+    admin_token = client.post(
+        "/token", json=json.loads(credentials.read_text())
+    ).json()["access_token"]
     admin_headers = {"Authorization": f"Bearer {admin_token}"}
 
-    assert (
-        client.post(
-            "/register",
-            json={
-                "username": "alice",
-                "display_name": "Alice",
-                "password": "alice-password-123",
-                "invite_code": "not-an-invitation",
-            },
-        ).status_code
-        == 400
-    )
+    assert client.post(
+        "/register",
+        json={
+            "username": "alice",
+            "display_name": "Alice",
+            "password": "alice-password-123",
+            "invite_code": "not-an-invitation",
+        },
+    ).status_code == 400
     assert client.get("/admin/users").status_code == 401
-    assert (
-        client.post(
-            "/admin/invitations",
-            headers=admin_headers,
-            json={"expires_in": 60},
-        ).status_code
-        == 422
-    )
-    assert (
-        client.patch(
-            "/admin/users/fyc",
-            headers=admin_headers,
-            json={"status": "disabled"},
-        ).status_code
-        == 400
-    )
+    assert client.post(
+        "/admin/invitations",
+        headers=admin_headers,
+        json={"expires_in": 60},
+    ).status_code == 422
+    assert client.patch(
+        "/admin/users/fyc",
+        headers=admin_headers,
+        json={"status": "disabled"},
+    ).status_code == 400
 
 
 def test_existing_user_database_is_migrated_without_recreating_accounts(tmp_path):
@@ -277,7 +263,9 @@ def test_existing_user_database_is_migrated_without_recreating_accounts(tmp_path
 
 def test_concurrent_registration_consumes_invitation_once(tmp_path):
     app, client, credentials = _bootstrapped_client(tmp_path)
-    admin_token = client.post("/token", json=json.loads(credentials.read_text())).json()["access_token"]
+    admin_token = client.post(
+        "/token", json=json.loads(credentials.read_text())
+    ).json()["access_token"]
     invitation = client.post(
         "/admin/invitations",
         headers={"Authorization": f"Bearer {admin_token}"},
