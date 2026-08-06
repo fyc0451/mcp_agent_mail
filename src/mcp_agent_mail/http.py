@@ -44,6 +44,7 @@ from .app import (
     _set_agent_owner,
     _tool_metrics_snapshot,
     _upsert_project_human_membership,
+    _validate_default_agent,
     build_mcp_server,
     get_project_sibling_data,
     refresh_project_sibling_suggestions,
@@ -61,6 +62,7 @@ from .models import (
     Message,
     Project,
     ProjectHumanMembership,
+    SessionLeadBinding,
     TeamProject,
     TeamProjectAgentBinding,
 )
@@ -3073,6 +3075,214 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     },
                     status_code=201 if created else 200,
                 )
+
+    # M3 Session-Team: managed session-lead Agents. A lead Agent is created and
+    # owned by the Hub inside the routing project — the client never needs an
+    # Agent Mail token, and no registration_token is ever issued or returned.
+    _CLIENT_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+    _SESSION_LEAD_PROGRAM = "team-session-lead"
+
+    def _hub_session_lead_payload(binding: SessionLeadBinding) -> dict[str, Any]:
+        return {
+            "id": binding.id,
+            "team_project_id": binding.team_project_id,
+            "human_id": binding.human_id,
+            "client_session_id": binding.client_session_id,
+            "agent_id": binding.agent_id,
+            "status": binding.status,
+            "created_at": str(binding.created_at),
+            "updated_at": str(binding.updated_at),
+        }
+
+    def _hub_session_lead_name(human_id: int, client_session_id: str) -> str:
+        fragment = re.sub(r"[^A-Za-z0-9._-]+", "-", client_session_id)[:32].strip("-.") or "s"
+        return f"SessionLead{human_id}-{fragment}"
+
+    @fastapi_app.post(
+        "/hub/api/projects/{project_slug}/session-leads",
+        response_class=JSONResponse,
+    )
+    async def hub_upsert_session_lead(project_slug: str, request: Request) -> JSONResponse:
+        """Create or reuse the caller's managed lead Agent for a client session,
+        and atomically make it the caller's membership default."""
+        await ensure_schema()
+        body = await _hub_json_body(request)
+        raw_session_id = body.get("client_session_id")
+        client_session_id = raw_session_id.strip() if isinstance(raw_session_id, str) else ""
+        if not _CLIENT_SESSION_ID_RE.fullmatch(client_session_id):
+            raise HTTPException(
+                status_code=400,
+                detail="client_session_id must be 1-128 letters, numbers, '.', '_' or '-'",
+            )
+        async with get_session() as session:
+            team_project = await _hub_team_project(project_slug, session=session)
+            human = await _hub_human(request, session=session)
+            if human.id is None:
+                raise HTTPException(status_code=404, detail="Human identity is not registered")
+            project = await session.get(Project, team_project.routing_project_id)
+            if project is None or project.archived_at is not None:
+                raise HTTPException(status_code=404, detail="Project not found")
+            membership = await _hub_active_membership(project, human, session=session)
+
+            existing_row = await session.execute(
+                select(SessionLeadBinding).where(
+                    cast(Any, SessionLeadBinding.team_project_id) == team_project.id,
+                    cast(Any, SessionLeadBinding.human_id) == human.id,
+                    cast(Any, SessionLeadBinding.client_session_id) == client_session_id,
+                )
+            )
+            binding = existing_row.scalars().first()
+            created = False
+            if binding is not None:
+                agent = await session.get(Agent, binding.agent_id)
+                if agent is None:
+                    raise HTTPException(status_code=409, detail="Managed lead agent is unavailable")
+                if agent.retired_at is not None:
+                    # The Hub owns the managed lifecycle: reuse reactivates.
+                    agent.retired_at = None
+                    session.add(agent)
+                if binding.status != "active":
+                    binding.status = "active"
+                    binding.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                    session.add(binding)
+            else:
+                lead_name = _hub_session_lead_name(human.id, client_session_id)
+                if await _membership_handle_taken(project, lead_name, session=session):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Managed lead name collides with an active member mention_handle",
+                    )
+                agent_insert = sqlite_insert(Agent).values(
+                    project_id=project.id,
+                    name=lead_name,
+                    program="team-session-lead",
+                    model="hub",
+                    task_description="Hub-managed session lead agent",
+                    owner_id=human.id,
+                    contact_policy="open",
+                )
+                await session.execute(
+                    agent_insert.on_conflict_do_nothing(index_elements=["project_id", "name"])
+                )
+                agent_row = await session.execute(
+                    select(Agent).where(
+                        cast(Any, Agent.project_id) == project.id,
+                        cast(Any, Agent.name) == lead_name,
+                    )
+                )
+                agent = agent_row.scalars().first()
+                if agent is None or agent.owner_id != human.id:
+                    raise HTTPException(status_code=409, detail="Managed lead agent is unavailable")
+                binding_insert = sqlite_insert(SessionLeadBinding).values(
+                    team_project_id=team_project.id,
+                    human_id=human.id,
+                    client_session_id=client_session_id,
+                    agent_id=agent.id,
+                    status="active",
+                )
+                await session.execute(
+                    binding_insert.on_conflict_do_nothing(
+                        index_elements=["team_project_id", "human_id", "client_session_id"]
+                    )
+                )
+                binding_row = await session.execute(
+                    select(SessionLeadBinding).where(
+                        cast(Any, SessionLeadBinding.team_project_id) == team_project.id,
+                        cast(Any, SessionLeadBinding.human_id) == human.id,
+                        cast(Any, SessionLeadBinding.client_session_id) == client_session_id,
+                    )
+                )
+                binding = binding_row.scalars().first()
+                if binding is None:
+                    raise HTTPException(status_code=409, detail="Session lead binding conflict")
+                created = True
+
+            # Atomically make the lead the caller's default (same transaction).
+            await _validate_default_agent(project, human.id, agent.id, session=session)
+            membership.default_agent_id = agent.id
+            session.add(membership)
+            await session.commit()
+            await session.refresh(binding)
+            await session.refresh(agent)
+            return JSONResponse(
+                {
+                    "binding": _hub_session_lead_payload(binding),
+                    "agent": _hub_agent_payload(agent),
+                    "membership_default_agent_id": membership.default_agent_id,
+                },
+                status_code=201 if created else 200,
+            )
+
+    @fastapi_app.get(
+        "/hub/api/projects/{project_slug}/session-leads",
+        response_class=JSONResponse,
+    )
+    async def hub_list_session_leads(project_slug: str, request: Request) -> JSONResponse:
+        """List the caller's own session-lead bindings (active + history)."""
+        await ensure_schema()
+        async with get_session() as session:
+            team_project = await _hub_team_project(project_slug, session=session)
+            human = await _hub_human(request, session=session)
+            project = await session.get(Project, team_project.routing_project_id)
+            if project is None:
+                raise HTTPException(status_code=404, detail="Project not found")
+            await _hub_active_membership(project, human, session=session)
+            rows = await session.execute(
+                select(SessionLeadBinding, Agent)
+                .join(Agent, cast(Any, Agent.id) == SessionLeadBinding.agent_id)
+                .where(
+                    cast(Any, SessionLeadBinding.team_project_id) == team_project.id,
+                    cast(Any, SessionLeadBinding.human_id) == human.id,
+                )
+                .order_by(cast(Any, SessionLeadBinding.created_at))
+            )
+            bindings = []
+            for binding, agent in rows.all():
+                payload = _hub_session_lead_payload(binding)
+                payload["agent_name"] = agent.name
+                bindings.append(payload)
+            return JSONResponse({"bindings": bindings})
+
+    @fastapi_app.delete(
+        "/hub/api/projects/{project_slug}/session-leads/{client_session_id}",
+        response_class=JSONResponse,
+    )
+    async def hub_unbind_session_lead(
+        project_slug: str,
+        client_session_id: str,
+        request: Request,
+    ) -> JSONResponse:
+        """Unbind a session lead: stops routing (default cleared, inbox
+        fallback off) but preserves the binding row, Agent and all messages."""
+        await ensure_schema()
+        async with get_session() as session:
+            team_project = await _hub_team_project(project_slug, session=session)
+            human = await _hub_human(request, session=session)
+            project = await session.get(Project, team_project.routing_project_id)
+            if project is None:
+                raise HTTPException(status_code=404, detail="Project not found")
+            membership = await _hub_active_membership(project, human, session=session)
+            existing_row = await session.execute(
+                select(SessionLeadBinding).where(
+                    cast(Any, SessionLeadBinding.team_project_id) == team_project.id,
+                    cast(Any, SessionLeadBinding.human_id) == human.id,
+                    cast(Any, SessionLeadBinding.client_session_id) == client_session_id,
+                )
+            )
+            binding = existing_row.scalars().first()
+            if binding is None:
+                raise HTTPException(status_code=404, detail="Session lead binding not found")
+            if binding.status != "unbound":
+                binding.status = "unbound"
+                binding.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                session.add(binding)
+            # Routing off: if the caller's default is this lead, clear it.
+            if membership.default_agent_id == binding.agent_id:
+                membership.default_agent_id = None
+                session.add(membership)
+            await session.commit()
+            await session.refresh(binding)
+            return JSONResponse(_hub_session_lead_payload(binding))
 
     def _oauth_metadata_disabled_response() -> JSONResponse:
         return JSONResponse({"mcp_oauth": False}, status_code=404)

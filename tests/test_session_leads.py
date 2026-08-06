@@ -1,0 +1,350 @@
+"""M3 Session-Team: Hub-managed session-lead Agents.
+
+Covers #1058 acceptance:
+  * JWT human (active member) creates/reuses a managed lead Agent for
+    (TeamProject + human + client_session_id) — no Agent Mail token involved,
+    and no registration_token ever appears in responses
+  * the lead is atomically set as the caller's membership default
+  * team messages addressed to an ACTIVE lead fall back to the human's durable
+    inbox with sender/project/message/thread preserved and dedupe
+  * unbind only stops routing (default cleared, fallback off); history stays
+"""
+
+from __future__ import annotations
+
+import pytest
+from authlib.jose import jwt
+from httpx import ASGITransport, AsyncClient
+from sqlmodel import select
+
+from mcp_agent_mail import config as _config
+from mcp_agent_mail.app import build_mcp_server
+from mcp_agent_mail.db import get_session
+from mcp_agent_mail.http import build_http_app
+from mcp_agent_mail.models import (
+    Agent,
+    HumanInboxItem,
+    Project,
+    ProjectHumanMembership,
+    SessionLeadBinding,
+)
+
+
+def _configure_hub_jwt(monkeypatch):
+    monkeypatch.setenv("HTTP_JWT_ENABLED", "true")
+    monkeypatch.setenv("HTTP_JWT_ALGORITHMS", "HS256")
+    monkeypatch.setenv("HTTP_JWT_SECRET", "hub-lead-secret")
+    monkeypatch.setenv("HTTP_RBAC_ENABLED", "true")
+    monkeypatch.setenv("HTTP_RBAC_WRITER_ROLES", "writer")
+    monkeypatch.setenv("HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED", "false")
+    _config.clear_settings_cache()
+    return _config.get_settings()
+
+
+def _headers(settings, subject: str, *, admin: bool = False) -> dict[str, str]:
+    roles = ["writer", "admin"] if admin else ["writer"]
+    token = jwt.encode(
+        {"alg": "HS256"},
+        {"sub": subject, settings.http.jwt_role_claim: roles},
+        settings.http.jwt_secret,
+    ).decode("utf-8")
+    return {"Authorization": f"Bearer {token}"}
+
+
+async def _register_human(client: AsyncClient, headers: dict[str, str], name: str) -> int:
+    resp = await client.put("/hub/api/humans/me", headers=headers, json={"display_name": name})
+    assert resp.status_code == 200
+    return resp.json()["id"]
+
+
+async def _setup_team(client: AsyncClient, root: dict[str, str], slug: str = "core") -> None:
+    await _register_human(client, root, "Root")
+    resp = await client.post(
+        "/hub/api/projects",
+        headers=root,
+        json={"name": f"Team {slug}", "slug": slug, "mention_handle": "root"},
+    )
+    assert resp.status_code == 201
+
+
+async def _join_active(
+    client: AsyncClient,
+    admin_headers: dict[str, str],
+    member_headers: dict[str, str],
+    human_id: int,
+    handle: str,
+    slug: str = "core",
+) -> None:
+    join = await client.post(
+        f"/hub/api/projects/{slug}/join-requests",
+        headers=member_headers,
+        json={"mention_handle": handle},
+    )
+    assert join.status_code == 201
+    approve = await client.patch(
+        f"/hub/api/projects/{slug}/members/{human_id}",
+        headers=admin_headers,
+        json={"status": "active"},
+    )
+    assert approve.status_code == 200
+
+
+def _upsert_lead(client: AsyncClient, headers: dict[str, str], session_id: str, slug: str = "core"):
+    return client.post(
+        f"/hub/api/projects/{slug}/session-leads",
+        headers=headers,
+        json={"client_session_id": session_id},
+    )
+
+
+@pytest.fixture
+def hub(isolated_env, monkeypatch):
+    settings = _configure_hub_jwt(monkeypatch)
+    return settings, build_http_app(settings, build_mcp_server())
+
+
+@pytest.mark.anyio
+async def test_create_lead_sets_default_atomically_and_hides_token(hub):
+    settings, app = hub
+    root = _headers(settings, "oidc|root", admin=True)
+    bob = _headers(settings, "oidc|bob")
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        await _setup_team(client, root)
+        bob_id = await _register_human(client, bob, "Bob")
+        await _join_active(client, root, bob, bob_id, "bob")
+
+        created = await _upsert_lead(client, bob, "mac-terminal-1")
+        assert created.status_code == 201, created.text
+        payload = created.json()
+        assert payload["membership_default_agent_id"] == payload["agent"]["id"]
+        assert payload["agent"]["owner_id"] == bob_id
+        assert payload["binding"]["status"] == "active"
+        assert payload["binding"]["client_session_id"] == "mac-terminal-1"
+        # 全程无 Agent Mail token: 响应里绝不出 registration_token
+        assert "registration_token" not in created.text
+
+        async with get_session() as session:
+            agent = await session.get(Agent, payload["agent"]["id"])
+            assert agent is not None
+            assert agent.registration_token is None  # 不签发任何 agent token
+            membership = (
+                await session.execute(
+                    select(ProjectHumanMembership).where(
+                        ProjectHumanMembership.human_id == bob_id
+                    )
+                )
+            ).scalars().one()
+            assert membership.default_agent_id == agent.id
+
+        # 复用: 幂等返回同一 binding + agent
+        again = await _upsert_lead(client, bob, "mac-terminal-1")
+        assert again.status_code == 200
+        assert again.json()["binding"]["id"] == payload["binding"]["id"]
+        assert again.json()["agent"]["id"] == payload["agent"]["id"]
+        async with get_session() as session:
+            rows = (await session.execute(select(SessionLeadBinding))).scalars().all()
+            assert len(rows) == 1
+
+
+@pytest.mark.anyio
+async def test_lead_requires_membership_and_valid_session_id(hub):
+    settings, app = hub
+    root = _headers(settings, "oidc|root", admin=True)
+    bob = _headers(settings, "oidc|bob")
+    carol = _headers(settings, "oidc|carol")
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        await _setup_team(client, root)
+        bob_id = await _register_human(client, bob, "Bob")
+        await _register_human(client, carol, "Carol")
+        await _join_active(client, root, bob, bob_id, "bob")
+
+        # 非成员 403
+        outsider = await _upsert_lead(client, carol, "s1")
+        assert outsider.status_code == 403
+        # 未认证 401
+        unauthenticated = await client.post(
+            "/hub/api/projects/core/session-leads", json={"client_session_id": "s1"}
+        )
+        assert unauthenticated.status_code == 401
+        # 非法 client_session_id 400
+        for bad in ("", "has space", "x" * 129, "-lead"):
+            resp = await _upsert_lead(client, bob, bad)
+            assert resp.status_code == 400, bad
+
+
+@pytest.mark.anyio
+async def test_lead_messages_fall_back_to_human_inbox_with_dedupe(hub):
+    settings, app = hub
+    root = _headers(settings, "oidc|root", admin=True)
+    alice = _headers(settings, "oidc|alice")
+    bob = _headers(settings, "oidc|bob")
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        await _setup_team(client, root)
+        alice_id = await _register_human(client, alice, "Alice")
+        bob_id = await _register_human(client, bob, "Bob")
+        await _join_active(client, root, alice, alice_id, "alice")
+        await _join_active(client, root, bob, bob_id, "bob")
+        # alice 作为普通成员先注册自己的 lead(发送方)
+        await _upsert_lead(client, alice, "wsl-1")
+        # bob 的 lead(接收方)
+        bob_lead = await _upsert_lead(client, bob, "mac-1")
+        bob_agent_id = bob_lead.json()["agent"]["id"]
+
+        # alice 通过支持请求 @bob → 投递到 bob 的 lead(其默认),再回落 bob 收件箱
+        support = await client.post(
+            "/hub/api/projects/core/support-requests",
+            headers=alice,
+            json={"subject": "求确认", "body_md": "麻烦看下", "mention_handles": ["bob"]},
+        )
+        assert support.status_code == 201, support.text
+
+        async with get_session() as session:
+            items = (
+                await session.execute(
+                    select(HumanInboxItem).where(HumanInboxItem.human_id == bob_id)
+                )
+            ).scalars().all()
+            assert len(items) == 1
+            item = items[0]
+            assert item.source_channel_message_id is not None
+            from mcp_agent_mail.models import Message
+
+            message = await session.get(Message, item.message_id)
+            assert message is not None
+            assert message.subject == "求确认"
+            assert message.sender_id is not None  # sender/project/message 保留
+            project = await session.get(Project, item.project_id)
+            assert project is not None
+
+        # 去重: 同一来源消息再次投递(重放)不产生第二条收件箱条目
+        from mcp_agent_mail.app import _deliver_channel_mentions
+        from mcp_agent_mail.models import ChannelMessage
+
+        async with get_session() as session:
+            source = (
+                await session.execute(
+                    select(ChannelMessage).where(
+                        ChannelMessage.id == items[0].source_channel_message_id
+                    )
+                )
+            ).scalars().one()
+            sender = await session.get(Agent, source.sender_id)
+            routing = await session.get(Project, items[0].project_id)
+            assert sender is not None and routing is not None
+
+        class _Ctx:
+            async def info(self, message: str) -> None:
+                pass
+
+        from typing import cast as _cast
+
+        from fastmcp import Context as _Context
+
+        await _deliver_channel_mentions(_cast(_Context, _Ctx()), routing, sender, source, ["bob"])
+        async with get_session() as session:
+            items = (
+                await session.execute(
+                    select(HumanInboxItem).where(HumanInboxItem.human_id == bob_id)
+                )
+            ).scalars().all()
+            assert len(items) == 1  # 仍只有一条
+
+        # 解除绑定后: 新消息不再回落
+        unbound = await client.delete(
+            "/hub/api/projects/core/session-leads/mac-1", headers=bob
+        )
+        assert unbound.status_code == 200
+        assert unbound.json()["status"] == "unbound"
+        membership_view = await client.get("/hub/api/projects/core/membership", headers=bob)
+        assert membership_view.json()["default_agent_id"] is None
+
+        # 解绑后直接 @lead agent 名: 投递到 agent 邮箱,但不再回落人工收件箱
+        async with get_session() as session:
+            lead_agent = await session.get(Agent, bob_agent_id)
+            assert lead_agent is not None
+            routing_row = await session.execute(
+                select(Project).where(Project.id == lead_agent.project_id)
+            )
+            routing = routing_row.scalars().one()
+            sender_row = await session.execute(
+                select(Agent).where(
+                    Agent.project_id == routing.id, Agent.name != lead_agent.name
+                )
+            )
+            alice_sender = sender_row.scalars().first()
+            assert alice_sender is not None
+            msg = ChannelMessage(
+                channel_id=source.channel_id,
+                sender_id=alice_sender.id,
+                subject="direct-to-lead",
+                body_md=f"@{lead_agent.name} 直接点名",
+            )
+            session.add(msg)
+            await session.commit()
+            await session.refresh(msg)
+        await _deliver_channel_mentions(_cast(_Context, _Ctx()), routing, alice_sender, msg, [lead_agent.name])
+        async with get_session() as session:
+            items = (
+                await session.execute(
+                    select(HumanInboxItem).where(HumanInboxItem.human_id == bob_id)
+                )
+            ).scalars().all()
+            assert len(items) == 1  # 解绑后不再回落新增
+        assert bob_agent_id
+
+
+@pytest.mark.anyio
+async def test_unbind_keeps_history_and_reupsert_revives(hub):
+    settings, app = hub
+    root = _headers(settings, "oidc|root", admin=True)
+    bob = _headers(settings, "oidc|bob")
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        await _setup_team(client, root)
+        bob_id = await _register_human(client, bob, "Bob")
+        await _join_active(client, root, bob, bob_id, "bob")
+
+        created = await _upsert_lead(client, bob, "mac-1")
+        binding_id = created.json()["binding"]["id"]
+        agent_id = created.json()["agent"]["id"]
+
+        unbound = await client.delete("/hub/api/projects/core/session-leads/mac-1", headers=bob)
+        assert unbound.status_code == 200
+        assert unbound.json()["id"] == binding_id
+        assert unbound.json()["status"] == "unbound"
+
+        # 历史保留: 列表仍可见 unbound 行, agent 行仍在
+        listed = await client.get("/hub/api/projects/core/session-leads", headers=bob)
+        assert listed.status_code == 200
+        rows = listed.json()["bindings"]
+        assert len(rows) == 1 and rows[0]["status"] == "unbound"
+        async with get_session() as session:
+            agent = await session.get(Agent, agent_id)
+            assert agent is not None
+
+        # 重新 upsert 复活同一 binding 行与同一 agent
+        revived = await _upsert_lead(client, bob, "mac-1")
+        assert revived.status_code == 200
+        assert revived.json()["binding"]["id"] == binding_id
+        assert revived.json()["agent"]["id"] == agent_id
+        assert revived.json()["binding"]["status"] == "active"
+
+        # 直接停用 agent 后再 upsert: 受管生命周期自动恢复 active
+        async with get_session() as session:
+            from datetime import datetime, timezone
+
+            agent = await session.get(Agent, agent_id)
+            assert agent is not None
+            agent.retired_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            session.add(agent)
+            await session.commit()
+        reactivated = await _upsert_lead(client, bob, "mac-1")
+        assert reactivated.status_code == 200
+        assert reactivated.json()["agent"]["retired"] is False
+
+        # 解绑不存在的 session 404
+        missing = await client.delete("/hub/api/projects/core/session-leads/nope", headers=bob)
+        assert missing.status_code == 404

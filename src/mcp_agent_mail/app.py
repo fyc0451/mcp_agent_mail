@@ -76,6 +76,7 @@ from .models import (
     ProjectHumanMembership,
     ProjectSiblingSuggestion,
     Product,
+    SessionLeadBinding,
     TeamProject,
     TeamProjectAgentBinding,
     ProductProjectLink,
@@ -4519,6 +4520,54 @@ async def _get_agents_batch_lenient(project: Project, names: Sequence[str]) -> d
     return resolved
 
 
+async def _fallback_session_lead_inbox(
+    project: Project,
+    message: Message,
+    recipient_agent_ids: Sequence[int],
+    *,
+    source_channel_message_id: int | None,
+    session: AsyncSession,
+) -> None:
+    """M3: mirror team messages addressed to ACTIVE session-lead agents into
+    the owning human's durable inbox (人工收件箱).
+
+    The shared Message row already carries sender/project/thread; here we only
+    add per-human inbox entries. Dedupe: one entry per (message, human) — the
+    uq_hii_message_human constraint is the final guard, so we skip humans that
+    already have an entry for this message.
+    """
+    if project.id is None or message.id is None or not recipient_agent_ids:
+        return
+    binding_rows = await session.execute(
+        select(SessionLeadBinding).where(
+            cast(Any, SessionLeadBinding.agent_id).in_(list(recipient_agent_ids)),
+            cast(Any, SessionLeadBinding.status) == "active",
+        )
+    )
+    human_ids = list(dict.fromkeys(binding.human_id for binding in binding_rows.scalars().all()))
+    if not human_ids:
+        return
+    existing_rows = await session.execute(
+        select(HumanInboxItem.human_id).where(
+            cast(Any, HumanInboxItem.message_id) == message.id,
+            cast(Any, HumanInboxItem.human_id).in_(human_ids),
+        )
+    )
+    already = {int(human_id) for human_id in existing_rows.scalars().all()}
+    for human_id in human_ids:
+        if human_id in already:
+            continue
+        session.add(
+            HumanInboxItem(
+                project_id=project.id,
+                human_id=human_id,
+                message_id=message.id,
+                source_channel_message_id=source_channel_message_id,
+                kind="mention",
+            )
+        )
+
+
 async def _create_message(
     project: Project,
     sender: Agent,
@@ -4557,6 +4606,13 @@ async def _create_message(
             assert recipient.id is not None
             entry = MessageRecipient(message_id=message.id, agent_id=recipient.id, kind=kind)
             session.add(entry)
+        await _fallback_session_lead_inbox(
+            project,
+            message,
+            [recipient.id for recipient, _kind in recipients if recipient.id is not None],
+            source_channel_message_id=None,
+            session=session,
+        )
         sender.last_active_ts = _naive_utc()
         session.add(sender)
         await session.commit()
@@ -4896,6 +4952,13 @@ async def _write_channel_mention_receipt(
                             receipt_message_id=message.id,
                         )
                     )
+                await _fallback_session_lead_inbox(
+                    target_project,
+                    message,
+                    [recipient.id for recipient in new_recipients if recipient.id is not None],
+                    source_channel_message_id=source.id,
+                    session=session,
+                )
                 try:
                     await session.commit()
                     await session.refresh(message)

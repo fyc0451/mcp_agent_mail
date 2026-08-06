@@ -523,3 +523,32 @@ class HumanInboxItem(SQLModel, table=True):
     kind: str = Field(default="mention", max_length=16)
     read_ts: Optional[datetime] = Field(default=None)
     created_ts: datetime = Field(default_factory=_utcnow_naive)
+
+
+class SessionLeadBinding(SQLModel, table=True):
+    """M3 managed session-lead Agent for a (TeamProject, human, client session).
+
+    The Hub creates and owns the lifecycle of a routing-project-local lead
+    Agent so a human can be addressed and receive team messages without any
+    client-side Agent Mail token. The row is the management record only:
+    unbinding flips ``status`` to ``unbound`` (routing stops) while the Agent
+    row, messages and this history are all preserved.
+    """
+
+    __tablename__ = "session_lead_bindings"
+    __table_args__ = (
+        UniqueConstraint(
+            "team_project_id", "human_id", "client_session_id", name="uq_slb_team_human_session"
+        ),
+        UniqueConstraint("agent_id", name="uq_slb_agent"),
+        Index("ix_slb_agent_status", "agent_id", "status"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    team_project_id: int = Field(foreign_key="team_projects.id", index=True)
+    human_id: int = Field(foreign_key="humans.id", index=True)
+    client_session_id: str = Field(max_length=128)
+    agent_id: int = Field(foreign_key="agents.id", index=True)
+    status: str = Field(default="active", max_length=16)  # active | unbound
+    created_at: datetime = Field(default_factory=_utcnow_naive)
+    updated_at: datetime = Field(default_factory=_utcnow_naive)
