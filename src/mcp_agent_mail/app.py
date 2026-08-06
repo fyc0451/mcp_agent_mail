@@ -252,9 +252,26 @@ class HubAuditEventListDTO(TypedDict):
     count: int
 
 
-_HUB_AUDIT_EVENT_TYPES = frozenset({"channel_message_posted", "channel_mention_delivery"})
-_HUB_AUDIT_OUTCOMES = frozenset({"succeeded", "delivered", "already_delivered", "skipped", "delivered_human_inbox"})
-_HUB_AUDIT_REASONS = frozenset({"unknown", "ambiguous", "block_all", "target_failed"})
+_HUB_AUDIT_EVENT_TYPES = frozenset(
+    {"channel_message_posted", "channel_mention_delivery", "agent_lifecycle"}
+)
+_HUB_AUDIT_SOURCE_TYPES = frozenset({"channel_message", "agent"})
+_HUB_AUDIT_OUTCOMES = frozenset(
+    {
+        "succeeded",
+        "delivered",
+        "already_delivered",
+        "skipped",
+        "delivered_human_inbox",
+        "retired",
+        "already_retired",
+        "restored",
+        "already_active",
+    }
+)
+_HUB_AUDIT_REASONS = frozenset(
+    {"unknown", "ambiguous", "block_all", "target_failed", "stale"}
+)
 
 # ty currently struggles to type SQLModel-mapped SQLAlchemy expressions.
 # Provide lightweight wrappers to keep type checking focused on our code.
@@ -2127,6 +2144,7 @@ def _new_hub_audit_event(
     event_type: str,
     source_id: int,
     outcome: str,
+    source_type: str = "channel_message",
     reason: str | None = None,
     target_project_id: int | None = None,
     target_agent_id: int | None = None,
@@ -2135,6 +2153,8 @@ def _new_hub_audit_event(
     """Build an audit row from controlled values; arbitrary metadata is forbidden."""
     if event_type not in _HUB_AUDIT_EVENT_TYPES:
         raise ValueError(f"Unsupported Hub audit event_type: {event_type}")
+    if source_type not in _HUB_AUDIT_SOURCE_TYPES:
+        raise ValueError(f"Unsupported Hub audit source_type: {source_type}")
     if outcome not in _HUB_AUDIT_OUTCOMES:
         raise ValueError(f"Unsupported Hub audit outcome: {outcome}")
     if reason is not None and reason not in _HUB_AUDIT_REASONS:
@@ -2143,7 +2163,7 @@ def _new_hub_audit_event(
         project_id=project_id,
         actor_agent_id=actor_agent_id,
         event_type=event_type,
-        source_type="channel_message",
+        source_type=source_type,
         source_id=source_id,
         outcome=outcome,
         reason=reason,
@@ -5536,6 +5556,7 @@ async def sweep_stale_agents(
     threshold_seconds: int,
     project_id: Optional[int] = None,
     exclude_agent_id: Optional[int] = None,
+    actor_agent_id: Optional[int] = None,
     require_no_active_reservations: bool = False,
     now: Optional[datetime] = None,
 ) -> list[dict[str, Any]]:
@@ -5611,6 +5632,29 @@ async def sweep_stale_agents(
                 }
             )
         await session.commit()
+    audit_events: list[HubAuditEvent] = []
+    for entry in retired:
+        try:
+            audit_events.append(
+                _new_hub_audit_event(
+                    project_id=int(entry["project_id"]),
+                    actor_agent_id=actor_agent_id,
+                    event_type="agent_lifecycle",
+                    source_type="agent",
+                    source_id=int(entry["agent_id"]),
+                    outcome="retired",
+                    reason="stale",
+                    target_project_id=int(entry["project_id"]),
+                    target_agent_id=int(entry["agent_id"]),
+                )
+            )
+        except Exception:
+            logger.warning(
+                "Failed to build stale-agent audit event agent_id=%s",
+                entry.get("agent_id"),
+                exc_info=True,
+            )
+    await _record_hub_audit_events(audit_events)
     return retired
 
 
@@ -7551,13 +7595,38 @@ def build_mcp_server() -> FastMCP:
             token_param="registration_token",
             action="retire_agent",
         )
+        actor = await _resolve_session_agent_for_project(ctx, project)
+        actor_id = actor.id if actor is not None else agent.id
 
+        already_retired = False
         async with get_session() as session:
             db_agent = await session.get(Agent, agent.id)
             if db_agent:
+                already_retired = db_agent.retired_at is not None
                 db_agent.retired_at = datetime.now(timezone.utc).replace(tzinfo=None)
                 session.add(db_agent)
                 await session.commit()
+
+        if project.id is not None and agent.id is not None:
+            try:
+                audit_event = _new_hub_audit_event(
+                    project_id=project.id,
+                    actor_agent_id=actor_id,
+                    event_type="agent_lifecycle",
+                    source_type="agent",
+                    source_id=agent.id,
+                    outcome="already_retired" if already_retired else "retired",
+                    target_project_id=project.id,
+                    target_agent_id=agent.id,
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to build retire-agent audit event agent_id=%s",
+                    agent.id,
+                    exc_info=True,
+                )
+            else:
+                await _record_hub_audit_events([audit_event])
 
         await ctx.info(f"Retired agent '{agent_name}' from project '{project.human_key}'. Message history preserved.")
         return {
@@ -7607,6 +7676,7 @@ def build_mcp_server() -> FastMCP:
             threshold_seconds=effective_threshold,
             project_id=project.id,
             exclude_agent_id=actor.id,
+            actor_agent_id=actor.id,
             require_no_active_reservations=require_no_active_reservations,
         )
         retired_names = [entry["agent_name"] for entry in retired]
@@ -7645,13 +7715,38 @@ def build_mcp_server() -> FastMCP:
             token_param="registration_token",
             action="unretire_agent",
         )
+        actor = await _resolve_session_agent_for_project(ctx, project)
+        actor_id = actor.id if actor is not None else agent.id
 
+        already_active = False
         async with get_session() as session:
             db_agent = await session.get(Agent, agent.id)
             if db_agent:
+                already_active = db_agent.retired_at is None
                 db_agent.retired_at = None
                 session.add(db_agent)
                 await session.commit()
+
+        if project.id is not None and agent.id is not None:
+            try:
+                audit_event = _new_hub_audit_event(
+                    project_id=project.id,
+                    actor_agent_id=actor_id,
+                    event_type="agent_lifecycle",
+                    source_type="agent",
+                    source_id=agent.id,
+                    outcome="already_active" if already_active else "restored",
+                    target_project_id=project.id,
+                    target_agent_id=agent.id,
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to build unretire-agent audit event agent_id=%s",
+                    agent.id,
+                    exc_info=True,
+                )
+            else:
+                await _record_hub_audit_events([audit_event])
 
         await ctx.info(f"Restored agent '{agent_name}' in project '{project.human_key}' to active status.")
         return {

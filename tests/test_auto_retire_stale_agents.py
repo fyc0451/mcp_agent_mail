@@ -19,7 +19,7 @@ from sqlalchemy import select as sa_select, update as sa_update
 
 from mcp_agent_mail.app import build_mcp_server, sweep_stale_agents
 from mcp_agent_mail.db import get_session
-from mcp_agent_mail.models import Agent, FileReservation, Project
+from mcp_agent_mail.models import Agent, FileReservation, HubAuditEvent, Project
 
 
 def _naive_utc(when: datetime | None = None) -> datetime:
@@ -97,6 +97,19 @@ async def test_sweep_retires_only_agents_past_threshold(isolated_env):
             assert active_after is not None
             assert stale_after.retired_at is not None
             assert active_after.retired_at is None
+            audit = (
+                await session.execute(
+                    sa_select(HubAuditEvent).where(
+                        cast(Any, HubAuditEvent.event_type) == "agent_lifecycle"
+                    )
+                )
+            ).scalar_one()
+            assert audit.actor_agent_id is None
+            assert audit.source_type == "agent"
+            assert audit.source_id == stale_id
+            assert audit.target_agent_id == stale_id
+            assert audit.outcome == "retired"
+            assert audit.reason == "stale"
 
 
 @pytest.mark.asyncio
@@ -235,6 +248,18 @@ async def test_on_demand_sweep_is_project_scoped_and_never_retires_caller(isolat
         assert retired_by_name[caller.data["name"]] is None
         assert retired_by_name[stale_local.data["name"]] is not None
         assert retired_by_name[stale_other.data["name"]] is None
+        async with get_session() as session:
+            audit = (
+                await session.execute(
+                    sa_select(HubAuditEvent).where(
+                        cast(Any, HubAuditEvent.event_type) == "agent_lifecycle"
+                    )
+                )
+            ).scalar_one()
+            assert audit.actor_agent_id == caller.data["id"]
+            assert audit.target_agent_id == stale_local.data["id"]
+            assert audit.outcome == "retired"
+            assert audit.reason == "stale"
 
 
 @pytest.mark.asyncio

@@ -174,6 +174,47 @@ async def test_repeat_delivery_appends_already_delivered_attempt(audit_hub):
 
 
 @pytest.mark.asyncio
+async def test_retire_and_unretire_write_agent_lifecycle_audit(isolated_env):
+    async with Client(build_mcp_server()) as client:
+        agent = await _register(client, "/audit/lifecycle", "BlueLake")
+
+        await client.call_tool(
+            "retire_agent",
+            {
+                "project_key": agent["project"],
+                "agent_name": agent["name"],
+                "registration_token": agent["token"],
+            },
+        )
+        await client.call_tool(
+            "unretire_agent",
+            {
+                "project_key": agent["project"],
+                "agent_name": agent["name"],
+                "registration_token": agent["token"],
+            },
+        )
+        listed = await client.call_tool(
+            "list_hub_audit_events",
+            {
+                "project_key": agent["project"],
+                "event_type": "agent_lifecycle",
+                "registration_token": agent["token"],
+            },
+        )
+
+    assert [event["outcome"] for event in listed.data["events"]] == [
+        "retired",
+        "restored",
+    ]
+    for event in listed.data["events"]:
+        assert event["source_type"] == "agent"
+        assert event["source_id"] == event["actor_agent_id"]
+        assert event["target_agent_id"] == event["actor_agent_id"]
+        assert event["target_project_id"] == event["project_id"]
+
+
+@pytest.mark.asyncio
 async def test_audit_storage_failure_never_rolls_back_post_or_receipt(audit_hub, monkeypatch):
     client, sender = audit_hub
     recipient = await _register(client, sender["project"], "GreenHill")

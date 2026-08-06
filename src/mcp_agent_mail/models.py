@@ -382,7 +382,7 @@ class MentionDelivery(SQLModel, table=True):
 
 
 class HubAuditEvent(SQLModel, table=True):
-    """Append-only, field-whitelisted audit event for Hub channel actions.
+    """Append-only, field-whitelisted audit event for Hub actions.
 
     Audit rows intentionally store only trusted identifiers and controlled
     outcome/reason values. Message text, registration tokens, exception text,
