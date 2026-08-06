@@ -537,6 +537,7 @@ async def test_human_support_request_broadcasts_via_default_agent(
     app = build_http_app(settings, build_mcp_server())
     alice = _hub_headers(settings, "oidc|alice")
     bob = _hub_headers(settings, "oidc|bob")
+    dave = _hub_headers(settings, "oidc|dave")
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as http:
         posted = await http.post(
@@ -561,6 +562,22 @@ async def test_human_support_request_broadcasts_via_default_agent(
         assert inbox.status_code == 200
         assert len(inbox.json()["items"]) == 1
         assert inbox.json()["items"][0]["subject"] == "终端求助 · demo/w1:p1"
+
+        chat = await http.get(
+            "/hub/api/projects/support-team/chat/messages", headers=bob,
+        )
+        assert chat.status_code == 200
+        assert chat.json()["count"] == 1
+        assert chat.json()["messages"][0]["subject"] == "终端求助 · demo/w1:p1"
+        assert chat.json()["messages"][0]["body_md"] == "当前构建失败, 请团队协助排查。"
+        assert set(chat.json()["messages"][0]["mention_handles"]) == {"bob", "carol"}
+        assert chat.json()["messages"][0]["sender_name"] == "oidc|alice"
+        assert chat.json()["messages"][0]["sender_agent"] == sender["name"]
+
+        removed = await http.get(
+            "/hub/api/projects/support-team/chat/messages", headers=dave,
+        )
+        assert removed.status_code == 403
 
     async with get_session() as session:
         message = (await session.execute(select(ChannelMessage))).scalars().one()
@@ -641,6 +658,18 @@ async def test_human_support_request_can_target_member_without_sender_agent(
         assert inbox.status_code == 200
         assert inbox.json()["items"][0]["sender_kind"] == "human"
         assert inbox.json()["items"][0]["sender_name"] == "oidc|carol"
+
+        chat = await http.get(
+            "/hub/api/projects/support-target/chat/messages", headers=dave,
+        )
+        assert chat.status_code == 200
+        assert [item["subject"] for item in chat.json()["messages"]] == [
+            "只找 Bob", "Human 直接发送",
+        ]
+        assert chat.json()["messages"][-1]["sender_kind"] == "human"
+        assert chat.json()["messages"][-1]["sender_name"] == "oidc|carol"
+        assert chat.json()["messages"][-1]["sender_agent"] is None
+        assert chat.json()["messages"][-1]["mention_handles"] == ["dave"]
 
         team_agents = await http.get(
             "/hub/api/projects/support-target/agents", headers=carol,

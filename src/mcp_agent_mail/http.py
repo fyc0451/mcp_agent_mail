@@ -2416,6 +2416,74 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         async def info(self, message: str) -> None:
             structlog.get_logger("hub-support").info("delivery", message=message)
 
+    @fastapi_app.get(
+        "/hub/api/projects/{project_slug}/chat/messages",
+        response_class=JSONResponse,
+    )
+    async def hub_list_chat_messages(
+        project_slug: str,
+        request: Request,
+    ) -> JSONResponse:
+        """Return recent shared support-channel history to active members."""
+        await ensure_schema()
+        async with get_session() as session:
+            human = await _hub_human(request, session=session)
+            team_project = await _hub_team_project(project_slug, session=session)
+            project = await session.get(Project, team_project.routing_project_id)
+            if project is None or project.archived_at is not None:
+                raise HTTPException(status_code=404, detail="Project not found")
+            await _hub_active_membership(project, human, session=session)
+            channel_row = await session.execute(
+                select(Channel).where(
+                    cast(Any, Channel.project_id) == project.id,
+                    cast(Any, Channel.name) == "support",
+                )
+            )
+            channel = channel_row.scalars().first()
+            if channel is None:
+                return JSONResponse({"channel": "support", "messages": [], "count": 0})
+            rows = await session.execute(
+                select(ChannelMessage, Agent, Human)
+                .join(Agent, cast(Any, Agent.id) == ChannelMessage.sender_id)
+                .outerjoin(Human, cast(Any, Human.id) == Agent.owner_id)
+                .where(cast(Any, ChannelMessage.channel_id) == channel.id)
+                .order_by(cast(Any, ChannelMessage.id).desc())
+                .limit(200)
+            )
+            items = []
+            for message, sender, sender_human in rows.all():
+                body_md = message.body_md
+                mention_handles: list[str] = []
+                prefix, separator, content = body_md.partition("\n\n")
+                tokens = prefix.split()
+                if separator and tokens and all(
+                    token.startswith("@")
+                    and _MENTION_HANDLE_VALIDATOR_RE.fullmatch(token[1:])
+                    for token in tokens
+                ):
+                    mention_handles = [token[1:] for token in tokens]
+                    body_md = content
+                items.append({
+                    "id": message.id,
+                    "subject": message.subject,
+                    "body_md": body_md,
+                    "mention_handles": mention_handles,
+                    "importance": message.importance,
+                    "created_ts": str(message.created_ts),
+                    "sender_name": sender_human.display_name if sender_human else sender.name,
+                    "sender_human_id": sender_human.id if sender_human else None,
+                    "sender_kind": (
+                        "human" if sender.program == _HUB_HUMAN_RELAY_PROGRAM else "agent"
+                    ),
+                    "sender_agent": (
+                        None if sender.program == _HUB_HUMAN_RELAY_PROGRAM else sender.name
+                    ),
+                })
+            items.reverse()
+            return JSONResponse(
+                {"channel": "support", "messages": items, "count": len(items)}
+            )
+
     @fastapi_app.post(
         "/hub/api/projects/{project_slug}/support-requests",
         response_class=JSONResponse,
