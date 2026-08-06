@@ -25,6 +25,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import select, text, update
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError, NoResultFound
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
@@ -56,6 +57,7 @@ from .models import (
     Project,
     ProjectHumanMembership,
     TeamProject,
+    TeamProjectAgentBinding,
 )
 from .storage import (
     ProjectArchive,
@@ -2313,6 +2315,178 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             )
             await session.commit()
             return JSONResponse({"updated": cast(Any, result).rowcount or 0})
+
+    # M3a: explicit Agent ↔ TeamProject binding. Bind/unbind only reference an
+    # existing agent id + team project slug — never a local path — and never
+    # trigger Herdr/shell/worktree/task execution (pure Hub metadata).
+    def _hub_is_global_admin(request: Request) -> bool:
+        """Global admin = JWT whose role claim carries 'admin' (issuer convention)."""
+        claims = getattr(request.state, "jwt_claims", None)
+        if not isinstance(claims, dict):
+            return False
+        roles_raw = claims.get(settings.http.jwt_role_claim, [])
+        if isinstance(roles_raw, str):
+            roles = {roles_raw}
+        elif isinstance(roles_raw, (list, tuple)):
+            roles = {str(role) for role in roles_raw}
+        else:
+            roles = set()
+        return "admin" in roles
+
+    async def _hub_binding_admin(
+        request: Request,
+        team_project: TeamProject,
+        *,
+        session: AsyncSession,
+    ) -> Human:
+        """Only a global admin or the group's active admin may bind/unbind."""
+        human = await _hub_human(request, session=session)
+        if _hub_is_global_admin(request):
+            return human
+        project = await session.get(Project, team_project.routing_project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail="Project not found")
+        await _hub_active_membership(project, human, session=session, admin=True)
+        return human
+
+    def _hub_binding_payload(binding: TeamProjectAgentBinding) -> dict[str, Any]:
+        return {
+            "id": binding.id,
+            "team_project_id": binding.team_project_id,
+            "agent_id": binding.agent_id,
+            "status": binding.status,
+            "bound_by_human_id": binding.bound_by_human_id,
+            "created_at": str(binding.created_at),
+            "updated_at": str(binding.updated_at),
+        }
+
+    @fastapi_app.post(
+        "/hub/api/projects/{project_slug}/agent-bindings",
+        response_class=JSONResponse,
+    )
+    async def hub_bind_agent(project_slug: str, request: Request) -> JSONResponse:
+        await ensure_schema()
+        body = await _hub_json_body(request)
+        agent_id = body.get("agent_id")
+        if isinstance(agent_id, bool) or not isinstance(agent_id, int):
+            raise HTTPException(status_code=400, detail="agent_id must be an integer")
+        async with get_session() as session:
+            team_project = await _hub_team_project(project_slug, session=session)
+            human = await _hub_binding_admin(request, team_project, session=session)
+            agent = await session.get(Agent, agent_id)
+            if agent is None:
+                raise HTTPException(status_code=404, detail="Agent not found")
+            if agent.retired_at is not None:
+                raise HTTPException(status_code=409, detail="Cannot bind a retired agent")
+            existing_row = await session.execute(
+                select(TeamProjectAgentBinding).where(
+                    cast(Any, TeamProjectAgentBinding.team_project_id) == team_project.id,
+                    cast(Any, TeamProjectAgentBinding.agent_id) == agent_id,
+                )
+            )
+            binding = existing_row.scalars().first()
+            if binding is not None:
+                if binding.status != "active":
+                    # Re-binding revives the kept history row (idempotent).
+                    binding.status = "active"
+                    binding.bound_by_human_id = human.id
+                    binding.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                    session.add(binding)
+                    await session.commit()
+                await session.refresh(binding)
+                return JSONResponse(_hub_binding_payload(binding), status_code=200)
+            # Atomic upsert: a concurrent bind of the same pair no-ops on the
+            # unique constraint instead of raising, so no poisoned session /
+            # IntegrityError retry path is needed. rowcount 1 = we inserted.
+            insert_stmt = sqlite_insert(TeamProjectAgentBinding).values(
+                team_project_id=team_project.id,
+                agent_id=agent_id,
+                status="active",
+                bound_by_human_id=human.id,
+            )
+            result = await session.execute(
+                insert_stmt.on_conflict_do_nothing(
+                    index_elements=["team_project_id", "agent_id"]
+                )
+            )
+            created = bool(cast(Any, result).rowcount)
+            await session.commit()
+            # Return the authoritative row (ours or the concurrent winner's).
+            existing_row = await session.execute(
+                select(TeamProjectAgentBinding).where(
+                    cast(Any, TeamProjectAgentBinding.team_project_id) == team_project.id,
+                    cast(Any, TeamProjectAgentBinding.agent_id) == agent_id,
+                )
+            )
+            binding = existing_row.scalars().one()
+            return JSONResponse(
+                _hub_binding_payload(binding), status_code=201 if created else 200
+            )
+
+    @fastapi_app.delete(
+        "/hub/api/projects/{project_slug}/agent-bindings/{agent_id}",
+        response_class=JSONResponse,
+    )
+    async def hub_unbind_agent(
+        project_slug: str,
+        agent_id: int,
+        request: Request,
+    ) -> JSONResponse:
+        await ensure_schema()
+        async with get_session() as session:
+            team_project = await _hub_team_project(project_slug, session=session)
+            await _hub_binding_admin(request, team_project, session=session)
+            existing_row = await session.execute(
+                select(TeamProjectAgentBinding).where(
+                    cast(Any, TeamProjectAgentBinding.team_project_id) == team_project.id,
+                    cast(Any, TeamProjectAgentBinding.agent_id) == agent_id,
+                )
+            )
+            binding = existing_row.scalars().first()
+            if binding is None:
+                raise HTTPException(status_code=404, detail="Agent binding not found")
+            if binding.status != "unbound":
+                # Unbind keeps the row as history; only status/timestamp move.
+                binding.status = "unbound"
+                binding.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                session.add(binding)
+                await session.commit()
+            await session.refresh(binding)
+            return JSONResponse(_hub_binding_payload(binding))
+
+    @fastapi_app.get(
+        "/hub/api/projects/{project_slug}/agent-bindings",
+        response_class=JSONResponse,
+    )
+    async def hub_list_agent_bindings(project_slug: str, request: Request) -> JSONResponse:
+        await ensure_schema()
+        async with get_session() as session:
+            team_project = await _hub_team_project(project_slug, session=session)
+            human = await _hub_human(request, session=session)
+            project = await session.get(Project, team_project.routing_project_id)
+            if project is None:
+                raise HTTPException(status_code=404, detail="Project not found")
+            caller = await _hub_active_membership(project, human, session=session)
+            is_admin = caller.role == "admin" or _hub_is_global_admin(request)
+            conditions = [
+                cast(Any, TeamProjectAgentBinding.team_project_id) == team_project.id
+            ]
+            if not is_admin:
+                # Ordinary members see active bindings only; unbind history is
+                # an admin view.
+                conditions.append(cast(Any, TeamProjectAgentBinding.status) == "active")
+            rows = await session.execute(
+                select(TeamProjectAgentBinding, Agent)
+                .join(Agent, cast(Any, Agent.id) == TeamProjectAgentBinding.agent_id)
+                .where(*conditions)
+                .order_by(cast(Any, TeamProjectAgentBinding.created_at))
+            )
+            bindings = []
+            for binding, agent in rows.all():
+                payload = _hub_binding_payload(binding)
+                payload["agent_name"] = agent.name
+                bindings.append(payload)
+            return JSONResponse({"bindings": bindings})
 
     def _oauth_metadata_disabled_response() -> JSONResponse:
         return JSONResponse({"mcp_oauth": False}, status_code=404)
@@ -5020,6 +5194,10 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
 
         def _should_spa_fallback(path: str) -> bool:
             if _is_api_path(path):
+                return False
+            # JSON API areas must keep real 404s for API clients; the SPA
+            # fallback is only for browser page loads.
+            if path == "/hub/api" or path.startswith("/hub/api/"):
                 return False
             return not (path == "/mail" or path.startswith("/mail/"))
 

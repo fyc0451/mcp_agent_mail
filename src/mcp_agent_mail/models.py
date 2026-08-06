@@ -52,6 +52,29 @@ class TeamProject(SQLModel, table=True):
     archived_at: Optional[datetime] = Field(default=None)
 
 
+class TeamProjectAgentBinding(SQLModel, table=True):
+    """Explicit binding of an existing Agent identity to a TeamProject.
+
+    Binding only references an existing agent id — it never accepts or scans
+    local paths. Unbinding keeps the row with ``status="unbound"`` as history;
+    re-binding revives the same row (idempotent per team_project+agent pair).
+    """
+
+    __tablename__ = "team_project_agent_bindings"
+    __table_args__ = (
+        UniqueConstraint("team_project_id", "agent_id", name="uq_tpab_team_agent"),
+        Index("ix_tpab_agent_status", "agent_id", "status"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    team_project_id: int = Field(foreign_key="team_projects.id", index=True)
+    agent_id: int = Field(foreign_key="agents.id", index=True)
+    status: str = Field(default="active", max_length=16)  # active | unbound
+    bound_by_human_id: Optional[int] = Field(default=None, foreign_key="humans.id")
+    created_at: datetime = Field(default_factory=_utcnow_naive)
+    updated_at: datetime = Field(default_factory=_utcnow_naive)
+
+
 class Product(SQLModel, table=True):
     """Logical grouping across multiple repositories for product-wide inbox/search and threads."""
 
