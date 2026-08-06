@@ -2123,10 +2123,10 @@ Common variables you may set:
 ### Standalone beta Human issuer
 
 `mcp_agent_mail.human_auth` is a small RS256 issuer for deployments that do not
-yet have an external IdP. It runs as a separate process, binds to loopback only,
-and keeps its signing key, user DB, and generated bootstrap credentials outside
-the source tree with mode `0600`. Agent Cockpit may proxy `/token`, but it never
-receives the signing key.
+yet have an external IdP. It runs as a separate process, binds to loopback by
+default, and keeps its signing key, user DB, and generated bootstrap credentials
+outside the source tree with mode `0600`. Agent Cockpit may proxy `/token`, but
+it never receives the signing key.
 
 Use `deploy/systemd/mcp-agent-mail-human-auth.service` as a deployment template,
 then configure the Hub with:
@@ -2144,6 +2144,12 @@ Do not commit or copy the generated `initial-admin.json`, user database, or
 private signing key into chat, logs, or source control. For remote deployments,
 keep the issuer on loopback and expose the login flow only through an
 authenticated HTTPS reverse proxy.
+
+On a trusted company network without a reverse proxy, an operator may bind an
+exact RFC1918/ULA address by passing both `--host <private-ip>` and the explicit
+`--allow-private-http` acknowledgement. Wildcard, public, and hostname binds
+remain rejected. This mode sends passwords and JWTs as private-network HTTP and
+must not be exposed beyond that trusted network.
 
 The beta issuer also provides an invitation-only account lifecycle:
 

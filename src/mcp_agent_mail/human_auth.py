@@ -11,6 +11,7 @@ import base64
 import contextlib
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
 import re
@@ -33,6 +34,12 @@ _PASSWORD_MAX_BYTES = 256
 _SCRYPT_N = 2**14
 _SCRYPT_R = 8
 _SCRYPT_P = 1
+_PRIVATE_HTTP_V4 = (
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+)
+_PRIVATE_HTTP_V6 = ipaddress.ip_network("fc00::/7")
 
 
 @dataclass(frozen=True)
@@ -159,21 +166,12 @@ class HumanAuthStore:
                 )
                 """
             )
-            columns = {
-                row["name"]
-                for row in connection.execute("PRAGMA table_info(users)").fetchall()
-            }
+            columns = {row["name"] for row in connection.execute("PRAGMA table_info(users)").fetchall()}
             if "status" not in columns:
-                connection.execute(
-                    "ALTER TABLE users ADD COLUMN status TEXT NOT NULL DEFAULT 'active'"
-                )
-                connection.execute(
-                    "UPDATE users SET status = 'disabled' WHERE active = 0"
-                )
+                connection.execute("ALTER TABLE users ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")
+                connection.execute("UPDATE users SET status = 'disabled' WHERE active = 0")
             if "created_at" not in columns:
-                connection.execute(
-                    "ALTER TABLE users ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0"
-                )
+                connection.execute("ALTER TABLE users ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0")
                 connection.execute(
                     "UPDATE users SET created_at = ? WHERE created_at = 0",
                     (int(time.time()),),
@@ -214,9 +212,7 @@ class HumanAuthStore:
         if not display_name or len(display_name) > 128:
             raise ValueError("Invalid bootstrap display name")
         with self._connect() as connection:
-            existing = connection.execute(
-                "SELECT subject FROM users WHERE username = ?", (username,)
-            ).fetchone()
+            existing = connection.execute("SELECT subject FROM users WHERE username = ?", (username,)).fetchone()
             if existing is not None:
                 return False
             if connection.execute("SELECT 1 FROM users LIMIT 1").fetchone() is not None:
@@ -319,9 +315,7 @@ class HumanAuthStore:
             ).fetchone()
             if invitation is None:
                 raise ValueError("Invalid or expired invitation")
-            existing = connection.execute(
-                "SELECT 1 FROM users WHERE username = ?", (username,)
-            ).fetchone()
+            existing = connection.execute("SELECT 1 FROM users WHERE username = ?", (username,)).fetchone()
             if existing is not None:
                 raise FileExistsError("Username is already registered")
             subject = f"human:{username}"
@@ -366,9 +360,7 @@ class HumanAuthStore:
             for row in rows
         ]
 
-    def set_user_status(
-        self, *, actor_subject: str, username: str, status: str
-    ) -> dict[str, Any]:
+    def set_user_status(self, *, actor_subject: str, username: str, status: str) -> dict[str, Any]:
         if status not in {"active", "disabled"}:
             raise ValueError("Status must be active or disabled")
         username = username.strip().lower()
@@ -467,18 +459,12 @@ def create_app(config: HumanAuthConfig) -> FastAPI:
         if not authorization.startswith("Bearer "):
             raise HTTPException(status_code=401, detail="Authentication required")
         try:
-            claims = JsonWebToken(["RS256"]).decode(
-                authorization[7:].strip(), store._key
-            )
+            claims = JsonWebToken(["RS256"]).decode(authorization[7:].strip(), store._key)
             claims.validate()
         except (JoseError, ValueError, TypeError):
             raise HTTPException(status_code=401, detail="Authentication required") from None
         audience = claims.get("aud")
-        if (
-            claims.get("iss") != config.issuer
-            or audience != config.audience
-            or not isinstance(claims.get("sub"), str)
-        ):
+        if claims.get("iss") != config.issuer or audience != config.audience or not isinstance(claims.get("sub"), str):
             raise HTTPException(status_code=401, detail="Authentication required")
         user = store.active_user(claims["sub"])
         if user is None:
@@ -528,13 +514,9 @@ def create_app(config: HumanAuthConfig) -> FastAPI:
         return {"account": account}
 
     @app.post("/admin/invitations", status_code=201)
-    async def create_invitation(
-        request: Request, body: InvitationRequest
-    ) -> dict[str, Any]:
+    async def create_invitation(request: Request, body: InvitationRequest) -> dict[str, Any]:
         admin_user = authenticated_user(request, admin=True)
-        return store.create_invitation(
-            created_by=admin_user["subject"], expires_in=body.expires_in
-        )
+        return store.create_invitation(created_by=admin_user["subject"], expires_in=body.expires_in)
 
     @app.get("/admin/users")
     async def list_users(request: Request) -> dict[str, Any]:
@@ -542,9 +524,7 @@ def create_app(config: HumanAuthConfig) -> FastAPI:
         return {"users": store.list_users()}
 
     @app.patch("/admin/users/{username}")
-    async def update_user(
-        username: str, request: Request, body: UserStatusRequest
-    ) -> dict[str, Any]:
+    async def update_user(username: str, request: Request, body: UserStatusRequest) -> dict[str, Any]:
         admin_user = authenticated_user(request, admin=True)
         try:
             user = store.set_user_status(
@@ -568,6 +548,26 @@ def _validated_issuer(value: str) -> str:
     return value.rstrip("/")
 
 
+def _validated_bind_host(value: str, *, allow_private_http: bool = False) -> str:
+    """Keep the issuer loopback-only unless an exact private IP is opted in."""
+    if value == "localhost":
+        return value
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError as exc:
+        raise ValueError("bind host must be loopback or RFC1918/ULA private IP") from exc
+    if address.is_loopback:
+        return value
+    private_lan = (address.version == 4 and any(address in network for network in _PRIVATE_HTTP_V4)) or (
+        address.version == 6 and address in _PRIVATE_HTTP_V6
+    )
+    if not private_lan:
+        raise ValueError("bind host must be loopback or RFC1918/ULA private IP")
+    if not allow_private_http:
+        raise ValueError("private bind requires explicit --allow-private-http")
+    return value
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run the standalone beta Human JWT issuer")
     parser.add_argument("--host", default="127.0.0.1")
@@ -578,9 +578,19 @@ def main() -> None:
     parser.add_argument("--bootstrap-username")
     parser.add_argument("--bootstrap-display-name")
     parser.add_argument("--bootstrap-credentials-file", type=Path)
+    parser.add_argument(
+        "--allow-private-http",
+        action="store_true",
+        help="allow an exact RFC1918/ULA bind address on a trusted private network",
+    )
     args = parser.parse_args()
-    if args.host not in {"127.0.0.1", "::1", "localhost"}:
-        parser.error("beta issuer must bind to loopback; expose it through an authenticated HTTPS proxy")
+    try:
+        _validated_bind_host(
+            args.host,
+            allow_private_http=args.allow_private_http,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
     config = HumanAuthConfig(
         data_dir=args.data_dir,
         issuer=_validated_issuer(args.issuer),
