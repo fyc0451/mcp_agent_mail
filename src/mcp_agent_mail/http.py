@@ -512,6 +512,7 @@ _SLUG_VALIDATOR_RE = re.compile(r"^[a-z0-9_-]+$", re.IGNORECASE)
 _AGENT_NAME_VALIDATOR_RE = re.compile(r"^[A-Za-z0-9]+$")
 _MENTION_HANDLE_VALIDATOR_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _TIMESTAMP_VALIDATOR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}")
+_HUB_HUMAN_RELAY_PROGRAM = "team-human-relay"
 
 _LIKE_ESCAPE_CHAR = "!"
 
@@ -1822,6 +1823,59 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             )
         return handle
 
+    async def _hub_support_sender(
+        project: Project,
+        human: Human,
+        membership: ProjectHumanMembership,
+        *,
+        session: AsyncSession,
+    ) -> tuple[Agent, str]:
+        """Resolve a support-message sender without requiring a user Agent.
+
+        A configured, usable default Agent remains the preferred sender. Humans
+        without one use an internal per-project relay row so the existing
+        Message schema and delivery machinery stay intact. Relay rows are never
+        exposed by Team Agent management APIs.
+        """
+        if membership.default_agent_id is not None:
+            sender = await session.get(Agent, membership.default_agent_id)
+            if (
+                sender is not None
+                and sender.owner_id == human.id
+                and sender.retired_at is None
+                and await _agent_in_project_scope(project, sender, session=session)
+            ):
+                return sender, "agent"
+
+        if project.id is None or human.id is None:
+            raise HTTPException(status_code=409, detail="Human sender identity is unavailable")
+        relay_name = f"TeamHumanRelay{human.id}"
+        relay_insert = sqlite_insert(Agent).values(
+            project_id=project.id,
+            name=relay_name,
+            program=_HUB_HUMAN_RELAY_PROGRAM,
+            model="hub",
+            task_description="Internal Team Hub relay for Human messages",
+            owner_id=human.id,
+            contact_policy="open",
+        )
+        await session.execute(
+            relay_insert.on_conflict_do_nothing(index_elements=["project_id", "name"])
+        )
+        relay_row = await session.execute(
+            select(Agent).where(
+                cast(Any, Agent.project_id) == project.id,
+                cast(Any, Agent.name) == relay_name,
+                cast(Any, Agent.program) == _HUB_HUMAN_RELAY_PROGRAM,
+                cast(Any, Agent.owner_id) == human.id,
+                cast(Any, Agent.retired_at).is_(None),
+            )
+        )
+        relay = relay_row.scalars().first()
+        if relay is None:
+            raise HTTPException(status_code=409, detail="Human sender relay is unavailable")
+        return relay, "human"
+
     @fastapi_app.put("/hub/api/humans/me", response_class=JSONResponse)
     async def hub_upsert_human(request: Request) -> JSONResponse:
         await ensure_schema()
@@ -2235,7 +2289,10 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             await _hub_active_membership(project, human, session=session)
             rows = await session.execute(
                 select(Agent)
-                .where(cast(Any, Agent.project_id) == project.id)
+                .where(
+                    cast(Any, Agent.project_id) == project.id,
+                    cast(Any, Agent.program) != _HUB_HUMAN_RELAY_PROGRAM,
+                )
                 .order_by(Agent.name)
             )
             agents = [_hub_agent_payload(agent) for agent in rows.scalars().all()]
@@ -2252,6 +2309,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     cast(Any, TeamProjectAgentBinding.team_project_id) == team_project.id,
                     cast(Any, TeamProjectAgentBinding.status) == "active",
                     cast(Any, Agent.project_id) != project.id,
+                    cast(Any, Agent.program) != _HUB_HUMAN_RELAY_PROGRAM,
                 )
                 .order_by(Agent.name)
             )
@@ -2367,7 +2425,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         project_slug: str,
         request: Request,
     ) -> JSONResponse:
-        """Post a real team support message through the caller's default Agent."""
+        """Post a real team support message as the Human or their default Agent."""
         await ensure_schema()
         body = await _hub_json_body(request)
         allowed = {"subject", "body_md", "importance", "mention_handles"}
@@ -2402,22 +2460,12 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             if project is None or project.archived_at is not None:
                 raise HTTPException(status_code=404, detail="Project not found")
             membership = await _hub_active_membership(project, human, session=session)
-            if membership.default_agent_id is None:
-                raise HTTPException(
-                    status_code=409,
-                    detail="Set a usable default Agent before contacting the team",
-                )
-            sender = await session.get(Agent, membership.default_agent_id)
-            if (
-                sender is None
-                or sender.owner_id != human.id
-                or sender.retired_at is not None
-                or not await _agent_in_project_scope(project, sender, session=session)
-            ):
-                raise HTTPException(
-                    status_code=409,
-                    detail="The configured default Agent is unavailable",
-                )
+            sender, sender_kind = await _hub_support_sender(
+                project,
+                human,
+                membership,
+                session=session,
+            )
             rows = await session.execute(
                 select(ProjectHumanMembership).where(
                     cast(Any, ProjectHumanMembership.project_id) == project.id,
@@ -2488,6 +2536,8 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 "channel": "support",
                 "message_id": message.id,
                 "sender_agent": sender.name,
+                "sender_kind": sender_kind,
+                "sender_human": membership.mention_handle,
                 "mention_handles": mention_handles,
                 "deliveries": deliveries,
             },
@@ -2512,13 +2562,14 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             if unread_only:
                 conditions.append(cast(Any, HumanInboxItem.read_ts).is_(None))
             rows = await session.execute(
-                select(HumanInboxItem, Message, Agent, TeamProject)
+                select(HumanInboxItem, Message, Agent, TeamProject, Human)
                 .join(Message, cast(Any, Message.id) == HumanInboxItem.message_id)
                 .join(Agent, cast(Any, Agent.id) == Message.sender_id)
                 .join(
                     TeamProject,
                     cast(Any, TeamProject.routing_project_id) == HumanInboxItem.project_id,
                 )
+                .outerjoin(Human, cast(Any, Human.id) == Agent.owner_id)
                 .where(*conditions)
                 .order_by(cast(Any, HumanInboxItem.created_ts).desc())
                 .limit(limit)
@@ -2532,11 +2583,18 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     "body_md": message.body_md,
                     "importance": message.importance,
                     "kind": item.kind,
-                    "sender_name": sender.name,
+                    "sender_name": (
+                        sender_human.display_name
+                        if sender.program == _HUB_HUMAN_RELAY_PROGRAM and sender_human is not None
+                        else sender.name
+                    ),
+                    "sender_kind": (
+                        "human" if sender.program == _HUB_HUMAN_RELAY_PROGRAM else "agent"
+                    ),
                     "read_ts": str(item.read_ts) if item.read_ts else None,
                     "created_ts": str(item.created_ts),
                 }
-                for item, message, sender, project in rows.all()
+                for item, message, sender, project, sender_human in rows.all()
             ]
             return JSONResponse({"items": items})
 

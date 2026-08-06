@@ -571,7 +571,7 @@ async def test_human_support_request_broadcasts_via_default_agent(
 
 
 @pytest.mark.anyio
-async def test_human_support_request_can_target_member_and_requires_sender_agent(
+async def test_human_support_request_can_target_member_without_sender_agent(
     isolated_env, monkeypatch,
 ):
     server = build_mcp_server()
@@ -587,6 +587,7 @@ async def test_human_support_request_can_target_member_and_requires_sender_agent
             "/m3a/support-target", "oidc|bob", "bob", default_agent_id=recipient_id,
         )
         await _mk_membership("/m3a/support-target", "oidc|carol", "carol")
+        await _mk_membership("/m3a/support-target", "oidc|dave", "dave")
         async with get_session() as session:
             routing_project = (
                 await session.execute(
@@ -606,6 +607,7 @@ async def test_human_support_request_can_target_member_and_requires_sender_agent
     app = build_http_app(settings, build_mcp_server())
     alice = _hub_headers(settings, "oidc|alice")
     carol = _hub_headers(settings, "oidc|carol")
+    dave = _hub_headers(settings, "oidc|dave")
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as http:
         targeted = await http.post(
@@ -621,13 +623,32 @@ async def test_human_support_request_can_target_member_and_requires_sender_agent
         assert targeted.json()["mention_handles"] == ["bob"]
         assert targeted.json()["deliveries"][0]["status"] == "delivered"
 
-        no_sender = await http.post(
+        human_sender = await http.post(
             "/hub/api/projects/support-target/support-requests",
             headers=carol,
-            json={"subject": "无默认 Agent", "body_md": "不能冒用其他 Agent。"},
+            json={
+                "subject": "Human 直接发送",
+                "body_md": "没有默认 Agent 也能联系 Dave。",
+                "mention_handles": ["dave"],
+            },
         )
-        assert no_sender.status_code == 409
-        assert "default Agent" in no_sender.json()["detail"]
+        assert human_sender.status_code == 201
+        assert human_sender.json()["sender_kind"] == "human"
+        assert human_sender.json()["sender_human"] == "carol"
+        assert human_sender.json()["deliveries"][0]["status"] == "delivered_human_inbox"
+
+        inbox = await http.get("/hub/api/inbox", headers=dave)
+        assert inbox.status_code == 200
+        assert inbox.json()["items"][0]["sender_kind"] == "human"
+        assert inbox.json()["items"][0]["sender_name"] == "oidc|carol"
+
+        team_agents = await http.get(
+            "/hub/api/projects/support-target/agents", headers=carol,
+        )
+        assert team_agents.status_code == 200
+        assert {agent["name"] for agent in team_agents.json()["agents"]} == {
+            "BlueLake", "RedStone",
+        }
 
     async with get_session() as session:
         recipient = (
