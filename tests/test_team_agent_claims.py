@@ -440,3 +440,118 @@ async def test_concurrent_claims_by_different_humans_cas(hub):
             assert len(rows) == 1
             assert rows[0].status == "active"
             assert rows[0].bound_by_human_id == winner_owner
+
+
+@pytest.mark.anyio
+async def test_write_transaction_revalidates_token_and_membership(hub, monkeypatch):
+    """#1013: the write transaction re-checks token + membership after the
+    per-agent lock. Token compare must fire at least twice (outer pre-screen +
+    inner revalidation); the helper itself is covered helper-level below."""
+    import hmac as hmac_mod
+
+    import mcp_agent_mail.http as http_module
+
+    settings, app = hub
+    compare_calls = {"n": 0}
+    real_compare = hmac_mod.compare_digest
+
+    def counting_compare(a, b):
+        compare_calls["n"] += 1
+        return real_compare(a, b)
+
+    monkeypatch.setattr(http_module.hmac, "compare_digest", counting_compare)
+
+    root = _headers(settings, "oidc|root", admin=True)
+    bob = _headers(settings, "oidc|bob")
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        await _setup_team(client, root)
+        bob_id = await _register_human(client, bob, "Bob")
+        await _join_active(client, root, bob, bob_id, "bob")
+        _aid, slug = await _mk_agent("/workspaces/w1", "BlueLake")
+
+        claimed = await _claim(client, bob, slug, "BlueLake", "tok-secret")
+        assert claimed.status_code == 201
+        assert compare_calls["n"] >= 2
+
+
+@pytest.mark.anyio
+async def test_claim_write_window_helper_rejects_stale_state(isolated_env):
+    """Helper-level proof (#1013): the write-window revalidation refuses a
+    rotated token, an archived source project, and a removed membership."""
+    from fastapi import HTTPException
+
+    from mcp_agent_mail.db import ensure_schema
+    from mcp_agent_mail.http import _revalidate_claim_write_window
+    from mcp_agent_mail.models import Human, ProjectHumanMembership, TeamProject
+
+    await ensure_schema()
+    async with get_session() as session:
+        team = TeamProject(slug="core", name="Core", routing_project_id=0)
+        source = Project(slug="ws", human_key="/workspaces/w1")
+        routing = Project(slug="routing-x", human_key="routing:x")
+        session.add_all([team, source, routing])
+        await session.flush()
+        team.routing_project_id = routing.id
+        human = Human(subject="oidc|bob", display_name="Bob")
+        session.add(human)
+        await session.flush()
+        membership = ProjectHumanMembership(
+            project_id=routing.id, human_id=human.id, mention_handle="bob", status="active"
+        )
+        agent = Agent(
+            project_id=source.id, name="BlueLake", program="t", model="t",
+            registration_token="tok-secret",
+        )
+        session.add_all([membership, agent])
+        await session.commit()
+
+        # 正常状态放行
+        await _revalidate_claim_write_window(agent, "tok-secret", routing, human, session=session)
+
+        # token 轮换 -> 403
+        agent.registration_token = "tok-new"
+        with pytest.raises(HTTPException) as rotated:
+            await _revalidate_claim_write_window(agent, "tok-secret", routing, human, session=session)
+        assert rotated.value.status_code == 403
+        agent.registration_token = "tok-secret"
+
+        # source project 归档 -> 403
+        source.archived_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        with pytest.raises(HTTPException) as archived:
+            await _revalidate_claim_write_window(agent, "tok-secret", routing, human, session=session)
+        assert archived.value.status_code == 403
+        source.archived_at = None
+
+        # membership 被移除 -> 403
+        membership.status = "removed"
+        with pytest.raises(HTTPException) as removed:
+            await _revalidate_claim_write_window(agent, "tok-secret", routing, human, session=session)
+        assert removed.value.status_code == 403
+
+
+@pytest.mark.anyio
+async def test_rotated_token_rejected_at_write_time(hub):
+    """Token rotated after pre-screen state was read must fail the claim."""
+    settings, app = hub
+    root = _headers(settings, "oidc|root", admin=True)
+    bob = _headers(settings, "oidc|bob")
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        await _setup_team(client, root)
+        bob_id = await _register_human(client, bob, "Bob")
+        await _join_active(client, root, bob, bob_id, "bob")
+        agent_id, slug = await _mk_agent("/workspaces/w1", "BlueLake")
+
+        # 轮换 token 后旧 token 必须失败 (写事务内复核新值)
+        async with get_session() as session:
+            agent = await session.get(Agent, agent_id)
+            assert agent is not None
+            agent.registration_token = "tok-rotated"
+            session.add(agent)
+            await session.commit()
+
+        stale = await _claim(client, bob, slug, "BlueLake", "tok-secret")
+        assert stale.status_code == 403
+        fresh = await _claim(client, bob, slug, "BlueLake", "tok-rotated")
+        assert fresh.status_code == 201

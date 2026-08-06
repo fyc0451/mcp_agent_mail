@@ -24,7 +24,7 @@ from fastapi.exception_handlers import http_exception_handler
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import func, select, text, update
+from sqlalchemy import select, text, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError, NoResultFound
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -94,6 +94,38 @@ async def _project_slug_from_id(pid: int | None) -> str | None:
         row = await session.execute(text("SELECT slug FROM projects WHERE id = :pid"), {"pid": pid})
         res = row.fetchone()
         return res[0] if res and res[0] else None
+
+
+async def _revalidate_claim_write_window(
+    agent: Agent,
+    presented_token: str,
+    project: Project,
+    human: Human,
+    *,
+    session: AsyncSession,
+) -> None:
+    """Re-check claim preconditions inside the write transaction (#1013).
+
+    While a claim waited on the per-agent lock, the token may have rotated,
+    the source project may have been archived, or the caller's membership may
+    have been removed. Nothing may be written unless all still hold. Token
+    comparison is constant-time and failures stay opaque.
+    """
+    stored = agent.registration_token or ""
+    if not stored or not hmac.compare_digest(stored, presented_token):
+        raise HTTPException(status_code=403, detail="Invalid agent credentials")
+    source = await session.get(Project, agent.project_id)
+    if source is None or source.archived_at is not None:
+        raise HTTPException(status_code=403, detail="Invalid agent credentials")
+    membership_row = await session.execute(
+        select(ProjectHumanMembership).where(
+            cast(Any, ProjectHumanMembership.project_id) == project.id,
+            cast(Any, ProjectHumanMembership.human_id) == human.id,
+        )
+    )
+    membership = membership_row.scalars().first()
+    if membership is None or membership.status != "active":
+        raise HTTPException(status_code=403, detail="Active project membership is required")
 
 
 async def _ensure_ack_escalation_holder(
@@ -2780,7 +2812,10 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 agent_row = await session.execute(
                     select(Agent).where(
                         cast(Any, Agent.project_id) == source_project.id,
-                        func.lower(Agent.name) == agent_name.strip().lower(),
+                        # Exact match (#1013): the registry stores the precise
+                        # name; a case-insensitive first() could pick the wrong
+                        # case-variant twin.
+                        cast(Any, Agent.name) == agent_name.strip(),
                     )
                 )
                 agent = agent_row.scalars().first()
@@ -2804,6 +2839,14 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 agent = await claim_session.get(Agent, agent_id)
                 if agent is None:
                     raise HTTPException(status_code=403, detail="Invalid agent credentials")
+                # Re-validate inside the write transaction (#1013): while this
+                # request waited on the lock, the token may have rotated, the
+                # source project may have been archived, or the caller's
+                # membership may have been removed. Nothing may be written
+                # unless all of them still hold.
+                await _revalidate_claim_write_window(
+                    agent, presented_token, project, human, session=claim_session
+                )
                 if agent.retired_at is not None:
                     raise HTTPException(status_code=409, detail="Cannot claim a retired agent")
                 # Team routing agents are managed, not claimable.
