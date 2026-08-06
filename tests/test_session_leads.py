@@ -415,7 +415,7 @@ async def test_fallback_inbox_item_kind_is_stable_enum(hub):
                     select(HumanInboxItem).where(HumanInboxItem.human_id == bob_id)
                 )
             ).scalars().one()
-            assert item.kind == "managed_session_agent"
+            assert item.kind == "session_lead"
             assert item.source_channel_message_id is not None
 
 

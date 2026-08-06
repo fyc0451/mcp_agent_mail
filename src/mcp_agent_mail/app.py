@@ -4563,7 +4563,7 @@ async def _fallback_session_lead_inbox(
                 human_id=human_id,
                 message_id=message.id,
                 source_channel_message_id=source_channel_message_id,
-                kind="managed_session_agent",
+                kind="session_lead",
             )
         )
 
