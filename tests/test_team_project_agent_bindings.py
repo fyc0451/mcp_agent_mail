@@ -23,7 +23,7 @@ from mcp_agent_mail import config as _config
 from mcp_agent_mail.app import build_mcp_server
 from mcp_agent_mail.db import get_session
 from mcp_agent_mail.http import build_http_app
-from mcp_agent_mail.models import Agent, Project, TeamProjectAgentBinding
+from mcp_agent_mail.models import Agent, Project, TeamProject, TeamProjectAgentBinding
 
 
 def _configure_hub_jwt(monkeypatch):
@@ -63,13 +63,19 @@ async def _create_team(client: AsyncClient, headers: dict[str, str], slug: str, 
     return resp.json()
 
 
-async def _mk_workspace_agent(name: str) -> int:
+async def _mk_workspace_agent(name: str, *, owner_id: int | None = None) -> int:
     """An existing Agent identity living in an unrelated workspace project."""
     async with get_session() as session:
         project = Project(slug=f"workspace-{name.lower()}", human_key=f"/workspaces/{name.lower()}")
         session.add(project)
         await session.flush()
-        agent = Agent(project_id=project.id, name=name, program="test", model="test")
+        agent = Agent(
+            project_id=project.id,
+            name=name,
+            program="test",
+            model="test",
+            owner_id=owner_id,
+        )
         session.add(agent)
         await session.commit()
         await session.refresh(agent)
@@ -103,6 +109,52 @@ async def _join_and_approve(
 def hub(isolated_env, monkeypatch):
     settings = _configure_hub_jwt(monkeypatch)
     return settings, build_http_app(settings, build_mcp_server())
+
+
+@pytest.mark.anyio
+async def test_agent_directory_is_scoped_token_free_and_excludes_team_routing(hub):
+    settings, app = hub
+    alice = _headers(settings, "oidc|alice")
+    root = _headers(settings, "oidc|root", admin=True)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        alice_id = await _register_human(client, alice, "Alice")
+        root_id = await _register_human(client, root, "Root")
+        await _create_team(client, root, "core", "root")
+        owned_id = await _mk_workspace_agent("BlueLake", owner_id=alice_id)
+        other_id = await _mk_workspace_agent("RedStone", owner_id=root_id)
+        unowned_id = await _mk_workspace_agent("GreenCastle")
+
+        async with get_session() as session:
+            team = (
+                await session.execute(select(TeamProject).where(TeamProject.slug == "core"))
+            ).scalars().one()
+            routing_agent = Agent(
+                project_id=team.routing_project_id,
+                name="TeamOnly",
+                program="test",
+                model="test",
+                owner_id=alice_id,
+            )
+            session.add(routing_agent)
+            await session.commit()
+            await session.refresh(routing_agent)
+            routing_id = routing_agent.id
+
+        mine = await client.get("/hub/api/agents", headers=alice)
+        assert mine.status_code == 200
+        assert [item["id"] for item in mine.json()["agents"]] == [owned_id]
+
+        all_agents = await client.get("/hub/api/agents", headers=root)
+        assert all_agents.status_code == 200
+        payloads = all_agents.json()["agents"]
+        assert {item["id"] for item in payloads} == {owned_id, other_id, unowned_id}
+        assert routing_id not in {item["id"] for item in payloads}
+        for item in payloads:
+            assert "registration_token" not in item
+            assert "token" not in item
+            assert "human_key" not in item
+            assert item["project_slug"].startswith("workspace-")
 
 
 @pytest.mark.anyio

@@ -1831,6 +1831,44 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             human = await _hub_human(request, session=session)
             return JSONResponse(_hub_human_payload(human))
 
+    @fastapi_app.get("/hub/api/agents", response_class=JSONResponse)
+    async def hub_list_agent_directory(request: Request) -> JSONResponse:
+        """List safe Agent candidates for explicit TeamProject binding.
+
+        Ordinary Humans see only Agents they own. Global administrators may
+        select unowned or other-owned Agents, but logical TeamProject routing
+        Agents are excluded so one group's internal identity cannot be bound
+        into another group. Registration credentials and project human keys
+        never leave the Hub.
+        """
+        await ensure_schema()
+        async with get_session() as session:
+            human = await _hub_human(request, session=session)
+            statement = (
+                select(Agent, Project)
+                .join(Project, cast(Any, Project.id) == Agent.project_id)
+                .outerjoin(
+                    TeamProject,
+                    cast(Any, TeamProject.routing_project_id) == Project.id,
+                )
+                .where(
+                    cast(Any, Agent.retired_at).is_(None),
+                    cast(Any, Project.archived_at).is_(None),
+                    cast(Any, TeamProject.id).is_(None),
+                )
+                .order_by(Agent.name, cast(Any, Agent.id))
+                .limit(500)
+            )
+            if not _hub_is_global_admin(request):
+                statement = statement.where(cast(Any, Agent.owner_id) == human.id)
+            rows = await session.execute(statement)
+            agents = []
+            for agent, project in rows.all():
+                payload = _hub_agent_payload(agent)
+                payload["project_slug"] = project.slug
+                agents.append(payload)
+            return JSONResponse({"agents": agents})
+
     @fastapi_app.get("/hub/api/projects", response_class=JSONResponse)
     async def hub_list_projects(request: Request) -> JSONResponse:
         """List only user-created logical groups, never technical mail projects."""
