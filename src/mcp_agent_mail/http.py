@@ -2767,6 +2767,8 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
     # and never echoed to responses, exceptions, or logs; unknown selectors and
     # bad tokens get the same opaque refusal.
     _claim_locks: dict[int, asyncio.Lock] = {}
+    # Exposed for race-controlled tests (pre-acquire an agent's lock).
+    fastapi_app.state.hub_claim_locks = _claim_locks
 
     @fastapi_app.post(
         "/hub/api/projects/{project_slug}/agent-claims",

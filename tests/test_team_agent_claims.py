@@ -555,3 +555,118 @@ async def test_rotated_token_rejected_at_write_time(hub):
         assert stale.status_code == 403
         fresh = await _claim(client, bob, slug, "BlueLake", "tok-rotated")
         assert fresh.status_code == 201
+
+
+@pytest.mark.anyio
+async def test_claim_blocked_on_lock_observes_rotated_token(hub, monkeypatch):
+    """#1014 controlled race: pre-acquire the agent's claim lock so the request
+    blocks after the outer pre-screen; rotate the token in an independent
+    transaction; the write transaction must then refuse with 403 and leave
+    owner/binding untouched."""
+    import hmac as hmac_mod
+
+    import mcp_agent_mail.http as http_module
+
+    settings, app = hub
+    prescreen_done = asyncio.Event()
+    real_compare = hmac_mod.compare_digest
+
+    def spy_compare(a, b):
+        prescreen_done.set()
+        return real_compare(a, b)
+
+    monkeypatch.setattr(http_module.hmac, "compare_digest", spy_compare)
+
+    root = _headers(settings, "oidc|root", admin=True)
+    bob = _headers(settings, "oidc|bob")
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        await _setup_team(client, root)
+        bob_id = await _register_human(client, bob, "Bob")
+        await _join_active(client, root, bob, bob_id, "bob")
+        agent_id, slug = await _mk_agent("/workspaces/w1", "BlueLake")
+
+        lock = app.state.hub_claim_locks.setdefault(agent_id, asyncio.Lock())
+        await lock.acquire()
+        try:
+            request_task = asyncio.create_task(_claim(client, bob, slug, "BlueLake", "tok-secret"))
+            # 请求完成外层预审后正阻塞在锁上
+            await asyncio.wait_for(prescreen_done.wait(), timeout=5)
+            await asyncio.sleep(0)  # 让请求任务推进到锁等待点
+
+            # 独立事务轮换 token
+            async with get_session() as session:
+                agent = await session.get(Agent, agent_id)
+                assert agent is not None
+                agent.registration_token = "tok-rotated"
+                session.add(agent)
+                await session.commit()
+        finally:
+            lock.release()
+
+        resp = await asyncio.wait_for(request_task, timeout=10)
+        assert resp.status_code == 403
+        assert resp.json()["detail"] == "Invalid agent credentials"
+        async with get_session() as session:
+            agent = await session.get(Agent, agent_id)
+            assert agent is not None and agent.owner_id is None
+            assert (await session.execute(select(TeamProjectAgentBinding))).scalars().all() == []
+
+
+@pytest.mark.anyio
+async def test_claim_blocked_on_lock_observes_removed_membership(hub, monkeypatch):
+    """Same controlled race, but the caller's membership is removed while the
+    request waits on the lock: the write transaction must refuse."""
+    import hmac as hmac_mod
+
+    import mcp_agent_mail.http as http_module
+    from mcp_agent_mail.models import ProjectHumanMembership
+
+    settings, app = hub
+    prescreen_done = asyncio.Event()
+    real_compare = hmac_mod.compare_digest
+
+    def spy_compare(a, b):
+        prescreen_done.set()
+        return real_compare(a, b)
+
+    monkeypatch.setattr(http_module.hmac, "compare_digest", spy_compare)
+
+    root = _headers(settings, "oidc|root", admin=True)
+    bob = _headers(settings, "oidc|bob")
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        await _setup_team(client, root)
+        bob_id = await _register_human(client, bob, "Bob")
+        await _join_active(client, root, bob, bob_id, "bob")
+        agent_id, slug = await _mk_agent("/workspaces/w1", "BlueLake")
+
+        lock = app.state.hub_claim_locks.setdefault(agent_id, asyncio.Lock())
+        await lock.acquire()
+        try:
+            request_task = asyncio.create_task(_claim(client, bob, slug, "BlueLake", "tok-secret"))
+            await asyncio.wait_for(prescreen_done.wait(), timeout=5)
+            await asyncio.sleep(0)
+
+            async with get_session() as session:
+                rows = (
+                    await session.execute(
+                        select(ProjectHumanMembership).where(
+                            ProjectHumanMembership.human_id == bob_id
+                        )
+                    )
+                ).scalars().all()
+                assert rows
+                for membership in rows:
+                    membership.status = "removed"
+                    session.add(membership)
+                await session.commit()
+        finally:
+            lock.release()
+
+        resp = await asyncio.wait_for(request_task, timeout=10)
+        assert resp.status_code == 403
+        async with get_session() as session:
+            agent = await session.get(Agent, agent_id)
+            assert agent is not None and agent.owner_id is None
+            assert (await session.execute(select(TeamProjectAgentBinding))).scalars().all() == []
