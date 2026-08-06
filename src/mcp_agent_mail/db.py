@@ -942,6 +942,8 @@ def _setup_fts(connection: Any) -> None:
         "ALTER TABLE session_lead_bindings ADD COLUMN lead_label VARCHAR(128) DEFAULT ''",
         # M3 session-team: reply capability token hash (SHA-256 hex).
         "ALTER TABLE session_lead_bindings ADD COLUMN reply_token_hash VARCHAR(64) DEFAULT NULL",
+        # M3 session-team: original mention handles for reply-key replays.
+        "ALTER TABLE session_lead_reply_keys ADD COLUMN mention_handles VARCHAR(8192) DEFAULT '[]'",
     ]:
         with suppress(Exception):  # Column already exists — safe to ignore
             connection.exec_driver_sql(migration_sql)

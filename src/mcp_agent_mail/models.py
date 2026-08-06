@@ -587,4 +587,7 @@ class SessionLeadReplyKey(SQLModel, table=True):
     binding_id: int = Field(foreign_key="session_lead_bindings.id", index=True)
     idem_key: str = Field(max_length=128)
     message_id: Optional[int] = Field(default=None, foreign_key="channel_messages.id")
+    # Original mention handles (JSON array); replays MUST reuse these, never
+    # the retry request's handles, so a recovered delivery matches the first.
+    mention_handles: str = Field(default="[]", max_length=8192)
     created_ts: datetime = Field(default_factory=_utcnow_naive)

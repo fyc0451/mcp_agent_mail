@@ -287,3 +287,96 @@ async def test_reply_credentials_are_opaque(hub):
         # 超长 token 400
         too_long = await _reply(client, "wsl-1", "x" * 129)
         assert too_long.status_code == 400
+
+
+@pytest.mark.anyio
+async def test_replay_recovers_failed_mention_delivery(hub, monkeypatch):
+    """#1101: 首次请求已提交 message+key 但投递抛错; 同 key 重放必须用原始
+    handles 恢复幂等投递, message 仍恰一条, 返回 already_delivered+真实 deliveries。"""
+    import mcp_agent_mail.http as http_module
+
+    settings, app = hub
+    root = _headers(settings, "oidc|root", admin=True)
+    alice = _headers(settings, "oidc|alice")
+    bob = _headers(settings, "oidc|bob")
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        await _setup_team(client, root)
+        alice_id = await _register_human(client, alice, "Alice")
+        bob_id = await _register_human(client, bob, "Bob")
+        await _join_active(client, root, alice, alice_id, "alice")
+        await _join_active(client, root, bob, bob_id, "bob")
+        await _mk_lead(client, bob, "mac-1")
+        token = (await _mk_lead(client, alice, "wsl-1")).json()["reply_token"]
+
+        # 首次: 投递阶段抛错(message+key 已提交)
+        real_deliver = http_module._deliver_channel_mentions
+        fail_once = {"armed": True}
+
+        async def flaky_deliver(*args, **kwargs):
+            if fail_once["armed"]:
+                fail_once["armed"] = False
+                raise RuntimeError("simulated delivery crash")
+            return await real_deliver(*args, **kwargs)
+
+        monkeypatch.setattr(http_module, "_deliver_channel_mentions", flaky_deliver)
+        with pytest.raises(RuntimeError, match="simulated delivery crash"):
+            await _reply(client, "wsl-1", token, subject="崩溃恢复", idem="k-crash", mentions=["bob"])
+        # message+key 已提交(投递崩溃不影响已提交状态)
+        async with get_session() as session:
+            messages = (
+                await session.execute(
+                    select(ChannelMessage).where(ChannelMessage.subject == "崩溃恢复")
+                )
+            ).scalars().all()
+            assert len(messages) == 1
+            items = (
+                await session.execute(
+                    select(HumanInboxItem).where(HumanInboxItem.human_id == bob_id)
+                )
+            ).scalars().all()
+            assert len(items) == 0  # 投递崩了, bob 尚未收到
+
+        # 重放: 恢复投递, 用原始 handles, message 仍 1 条
+        replay = await _reply(client, "wsl-1", token, subject="崩溃恢复", idem="k-crash", mentions=["bob"])
+        assert replay.status_code == 200
+        assert replay.json()["status"] == "already_delivered"
+        deliveries = replay.json()["deliveries"]
+        assert deliveries  # 真实 deliveries, 不为空
+        async with get_session() as session:
+            messages = (
+                await session.execute(
+                    select(ChannelMessage).where(ChannelMessage.subject == "崩溃恢复")
+                )
+            ).scalars().all()
+            assert len(messages) == 1
+            items = (
+                await session.execute(
+                    select(HumanInboxItem).where(HumanInboxItem.human_id == bob_id)
+                )
+            ).scalars().all()
+            assert len(items) == 1  # 恢复投递成功, bob 收到了
+
+
+@pytest.mark.anyio
+async def test_rotate_reply_token_requires_bool(hub):
+    settings, app = hub
+    root = _headers(settings, "oidc|root", admin=True)
+    bob = _headers(settings, "oidc|bob")
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        await _setup_team(client, root)
+        bob_id = await _register_human(client, bob, "Bob")
+        await _join_active(client, root, bob, bob_id, "bob")
+        created = await _mk_lead(client, bob, "s1")
+        token1 = created.json()["reply_token"]
+
+        # 字符串 "false" 不得触发轮换
+        bad = await client.put(
+            "/hub/api/projects/core/session-lead",
+            headers=bob,
+            json={"client_session_id": "s1", "lead_label": "codex-main", "rotate_reply_token": "false"},
+        )
+        assert bad.status_code == 400
+        still = await _reply(client, "s1", token1)
+        assert still.status_code == 201

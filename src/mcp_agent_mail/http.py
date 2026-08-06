@@ -3212,9 +3212,10 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
 
         Auth = the binding-scoped reply token (hash stored only). The managed
         lead posts to the support channel; Human-via-lead attribution and the
-        Human Inbox fallback stay intact. idempotency_key occupies its slot in
-        the SAME transaction as the message, so concurrent duplicates deliver
-        exactly once and failed attempts can be retried safely.
+        Human Inbox fallback stay intact. The idempotency key occupies its
+        slot in the SAME transaction as the message, and a replay re-runs the
+        (idempotent) mention delivery with the ORIGINAL handles, so a crashed
+        first attempt never silently loses the notification (#1101).
         """
         await ensure_schema()
         body = await _hub_json_body(request)
@@ -3254,6 +3255,10 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         idem_key = raw_key.strip() if isinstance(raw_key, str) else ""
         if raw_key is not None and (not idem_key or len(idem_key) > 128):
             raise HTTPException(status_code=400, detail="idempotency_key must be 1-128 characters")
+
+        replay_message: ChannelMessage | None = None
+        replay_handles: list[str] = []
+        replay_sender: Agent | None = None
 
         async with get_session() as session:
             team_project = await _hub_team_project(project_slug, session=session)
@@ -3295,97 +3300,117 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                         detail=f"Active team member not found: {missing[0]}",
                     )
 
-            # 幂等占位与消息写入同一事务(#1096 验收 1)
             key_row = None
+            fresh_insert = True
             if idem_key:
                 key_insert = sqlite_insert(SessionLeadReplyKey).values(
                     binding_id=binding.id,
                     idem_key=idem_key,
+                    mention_handles=json.dumps(mention_handles),
                 )
                 result = await session.execute(
                     key_insert.on_conflict_do_nothing(
                         index_elements=["binding_id", "idem_key"]
                     )
                 )
-                if not cast(Any, result).rowcount:
-                    existing_key = await session.execute(
-                        select(SessionLeadReplyKey).where(
-                            cast(Any, SessionLeadReplyKey.binding_id) == binding.id,
-                            cast(Any, SessionLeadReplyKey.idem_key) == idem_key,
+                fresh_insert = bool(cast(Any, result).rowcount)
+                if not fresh_insert:
+                    # 重放: 加载原消息与原始 handles, 恢复幂等投递(#1101)
+                    key_row = (
+                        await session.execute(
+                            select(SessionLeadReplyKey).where(
+                                cast(Any, SessionLeadReplyKey.binding_id) == binding.id,
+                                cast(Any, SessionLeadReplyKey.idem_key) == idem_key,
+                            )
                         )
-                    )
-                    key_row = existing_key.scalars().one()
-                    return JSONResponse(
-                        {
-                            "status": "already_delivered",
-                            "message_id": key_row.message_id,
-                            "client_session_id": client_session_id,
-                        }
-                    )
-                key_row_row = await session.execute(
-                    select(SessionLeadReplyKey).where(
-                        cast(Any, SessionLeadReplyKey.binding_id) == binding.id,
-                        cast(Any, SessionLeadReplyKey.idem_key) == idem_key,
-                    )
-                )
-                key_row = key_row_row.scalars().first()
+                    ).scalars().one()
+                    replay_message = await session.get(ChannelMessage, key_row.message_id)
+                    if replay_message is None:
+                        raise HTTPException(status_code=409, detail="Reply replay state is inconsistent")
+                    replay_handles = json.loads(key_row.mention_handles or "[]")
+                    replay_sender = sender
+                    await session.refresh(replay_message)
+                    await session.refresh(replay_sender)
+                    await session.refresh(project)
+                else:
+                    key_row = (
+                        await session.execute(
+                            select(SessionLeadReplyKey).where(
+                                cast(Any, SessionLeadReplyKey.binding_id) == binding.id,
+                                cast(Any, SessionLeadReplyKey.idem_key) == idem_key,
+                            )
+                        )
+                    ).scalars().first()
 
-            channel_insert = sqlite_insert(Channel).values(
-                project_id=project.id,
-                name="support",
-                created_ts=datetime.now(timezone.utc).replace(tzinfo=None),
-            )
-            await session.execute(
-                channel_insert.on_conflict_do_nothing(index_elements=["project_id", "name"])
-            )
-            channel_row = await session.execute(
-                select(Channel).where(
-                    cast(Any, Channel.project_id) == project.id,
-                    cast(Any, Channel.name) == "support",
+            if replay_message is None:
+                channel_insert = sqlite_insert(Channel).values(
+                    project_id=project.id,
+                    name="support",
+                    created_ts=datetime.now(timezone.utc).replace(tzinfo=None),
                 )
-            )
-            channel = channel_row.scalars().one()
-            message = ChannelMessage(
-                channel_id=cast(int, channel.id),
-                sender_id=cast(int, sender.id),
-                subject=subject.strip(),
-                body_md=(
-                    (" ".join(f"@{handle}" for handle in mention_handles) + "\n\n")
-                    if mention_handles
-                    else ""
+                await session.execute(
+                    channel_insert.on_conflict_do_nothing(index_elements=["project_id", "name"])
                 )
-                + body_md.strip(),
-                importance=importance,
-                attachments=[],
-            )
-            sender.last_active_ts = datetime.now(timezone.utc).replace(tzinfo=None)
-            session.add(sender)
-            session.add(message)
-            await session.flush()
-            assert message.id is not None
-            if key_row is not None:
-                key_row.message_id = message.id
-                session.add(key_row)
-            await session.commit()
-            await session.refresh(message)
-            sender_id = sender.id
+                channel_row = await session.execute(
+                    select(Channel).where(
+                        cast(Any, Channel.project_id) == project.id,
+                        cast(Any, Channel.name) == "support",
+                    )
+                )
+                channel = channel_row.scalars().one()
+                message = ChannelMessage(
+                    channel_id=cast(int, channel.id),
+                    sender_id=cast(int, sender.id),
+                    subject=subject.strip(),
+                    body_md=(
+                        (" ".join(f"@{handle}" for handle in mention_handles) + "\n\n")
+                        if mention_handles
+                        else ""
+                    )
+                    + body_md.strip(),
+                    importance=importance,
+                    attachments=[],
+                )
+                sender.last_active_ts = datetime.now(timezone.utc).replace(tzinfo=None)
+                session.add(sender)
+                session.add(message)
+                await session.flush()
+                assert message.id is not None
+                if key_row is not None:
+                    key_row.message_id = message.id
+                    session.add(key_row)
+                await session.commit()
+                await session.refresh(message)
+                await session.refresh(sender)
+                await session.refresh(project)
+                replay_sender = sender
+                replay_message = message
+                replay_handles = mention_handles
 
         deliveries = await _deliver_channel_mentions(
             cast(Any, _HubHTTPDeliveryContext()),
             project,
-            sender,
-            message,
-            mention_handles,
+            replay_sender,
+            replay_message,
+            replay_handles,
         )
+        if fresh_insert or not idem_key:
+            return JSONResponse(
+                {
+                    "status": "delivered",
+                    "message_id": replay_message.id,
+                    "client_session_id": client_session_id,
+                    "deliveries": deliveries,
+                },
+                status_code=201,
+            )
         return JSONResponse(
             {
-                "status": "delivered",
-                "message_id": message.id,
+                "status": "already_delivered",
+                "message_id": replay_message.id,
                 "client_session_id": client_session_id,
-                "sender_agent_id": sender_id,
                 "deliveries": deliveries,
-            },
-            status_code=201,
+            }
         )
 
     def _hub_session_lead_payload(binding: SessionLeadBinding) -> dict[str, Any]:
@@ -3442,7 +3467,10 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 status_code=400,
                 detail="lead_label is required, must be at most 128 characters and contain no control characters",
             )
-        rotate_token = bool(body.get("rotate_reply_token"))
+        rotate_raw = body.get("rotate_reply_token")
+        if rotate_raw is not None and not isinstance(rotate_raw, bool):
+            raise HTTPException(status_code=400, detail="rotate_reply_token must be a boolean")
+        rotate_token = bool(rotate_raw)
         async with get_session() as session:
             team_project = await _hub_team_project(project_slug, session=session)
             human = await _hub_human(request, session=session)
