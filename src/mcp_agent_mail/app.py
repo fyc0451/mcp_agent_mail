@@ -76,6 +76,8 @@ from .models import (
     ProjectHumanMembership,
     ProjectSiblingSuggestion,
     Product,
+    TeamProject,
+    TeamProjectAgentBinding,
     ProductProjectLink,
     WindowIdentity,
 )
@@ -4129,9 +4131,72 @@ async def _active_agent_names(project: Project, *, session: AsyncSession) -> set
 async def _membership_collides_with_agent(
     project: Project, mention_handle: str, *, session: AsyncSession
 ) -> bool:
-    """True if a mention_handle collides with an active agent name in the project."""
+    """True if a mention_handle collides with an active agent name addressable
+    in the project — local agents, plus externally bound ones (M3b-1)."""
     active = await _active_agent_names(project, session=session)
-    return mention_handle.lower() in {name.lower() for name in active}
+    if mention_handle.lower() in {name.lower() for name in active}:
+        return True
+    if project.id is None:
+        return False
+    team_project = await _team_project_for_routing(project.id, session=session)
+    if team_project is None or team_project.id is None:
+        return False
+    bound_rows = await session.execute(
+        select(Agent.name)
+        .join(
+            TeamProjectAgentBinding,
+            cast(Any, TeamProjectAgentBinding.agent_id) == Agent.id,
+        )
+        .where(
+            cast(Any, TeamProjectAgentBinding.team_project_id) == team_project.id,
+            cast(Any, TeamProjectAgentBinding.status) == "active",
+            cast(Any, Agent.retired_at).is_(None),
+        )
+    )
+    bound = {str(name) for name in bound_rows.scalars().all()}
+    return mention_handle.lower() in {name.lower() for name in bound}
+
+
+async def _team_project_for_routing(
+    routing_project_id: int, *, session: AsyncSession
+) -> TeamProject | None:
+    """Return the live TeamProject backed by this routing project, if any."""
+    result = await session.execute(
+        select(TeamProject).where(
+            cast(Any, TeamProject.routing_project_id) == routing_project_id,
+            cast(Any, TeamProject.archived_at).is_(None),
+        )
+    )
+    return result.scalars().first()
+
+
+async def _is_agent_bound_active(
+    team_project_id: int, agent_id: int, *, session: AsyncSession
+) -> bool:
+    """True if the agent currently has an active binding to the TeamProject."""
+    result = await session.execute(
+        select(TeamProjectAgentBinding.id).where(
+            cast(Any, TeamProjectAgentBinding.team_project_id) == team_project_id,
+            cast(Any, TeamProjectAgentBinding.agent_id) == agent_id,
+            cast(Any, TeamProjectAgentBinding.status) == "active",
+        )
+    )
+    return result.scalars().first() is not None
+
+
+async def _agent_in_project_scope(
+    project: Project, agent: Agent, *, session: AsyncSession
+) -> bool:
+    """Agent is usable in this project: local, or actively bound to the
+    TeamProject backed by this routing project (M3b-1 unified model)."""
+    if agent.project_id == project.id:
+        return True
+    if project.id is None or agent.id is None:
+        return False
+    team_project = await _team_project_for_routing(project.id, session=session)
+    if team_project is None or team_project.id is None:
+        return False
+    return await _is_agent_bound_active(team_project.id, agent.id, session=session)
 
 
 async def _membership_handle_taken(
@@ -4186,7 +4251,8 @@ async def _agent_referenced_as_default(
 async def _validate_default_agent(
     project: Project, human_id: int, default_agent_id: int | None, *, session: AsyncSession
 ) -> None:
-    """default agent must belong to the same project and be owned by this human."""
+    """default agent must be owned by this human and usable in the project —
+    local to it, or actively bound to its TeamProject (M3b-1)."""
     if default_agent_id is None:
         return
     result = await session.execute(
@@ -4197,9 +4263,9 @@ async def _validate_default_agent(
     agent = result.scalars().first()
     if agent is None:
         raise ValueError(f"default agent 不存在: {default_agent_id}")
-    if agent.project_id != project.id:
+    if not await _agent_in_project_scope(project, agent, session=session):
         raise ValueError(
-            f"default agent 必须属于同一项目: agent={agent.project_id}, project={project.id}"
+            f"default agent 必须属于同一项目或已绑定到该团队群组: agent={agent.project_id}, project={project.id}"
         )
     if agent.owner_id != human_id:
         raise ValueError(
@@ -4580,6 +4646,7 @@ async def _resolve_channel_mentions(
         ]
         human_by_key: dict[str, ProjectHumanMembership] = {}
         default_agents: dict[int, Agent] = {}
+        default_home_projects: dict[int, Project] = {}
         if human_candidates:
             membership_rows = await session.execute(
                 select(ProjectHumanMembership).where(
@@ -4602,6 +4669,68 @@ async def _resolve_channel_mentions(
                 default_agents = {
                     agent.id: agent for agent in agent_rows.scalars().all() if agent.id is not None
                 }
+                home_ids = {
+                    agent.project_id for agent in default_agents.values()
+                }
+                if home_ids:
+                    home_rows = await session.execute(
+                        select(Project).where(cast(Any, Project.id).in_(home_ids))
+                    )
+                    default_home_projects = {
+                        home.id: home for home in home_rows.scalars().all() if home.id is not None
+                    }
+
+        # M3b-1: the same unmatched candidates may address an external Agent
+        # actively bound to the TeamProject backed by this routing project.
+        # Bound agents are addressable from their HOME project mailbox;
+        # unbound/retired bindings never resolve. Local agents win on name
+        # collision; multiple bound agents sharing a name are ambiguous.
+        # The same binding set decides whether a foreign (out-of-project)
+        # default agent is still usable for @human routing.
+        bound_by_name: dict[str, list[tuple[Project, Agent]]] = defaultdict(list)
+        bound_agent_ids: set[int] = set()
+        if channel_project.id is not None:
+            team_project = await _team_project_for_routing(channel_project.id, session=session)
+        else:
+            team_project = None
+        if team_project is not None and team_project.id is not None and human_candidates:
+            bound_rows = await session.execute(
+                select(TeamProjectAgentBinding, Agent, Project)
+                .join(Agent, cast(Any, Agent.id) == TeamProjectAgentBinding.agent_id)
+                .join(Project, cast(Any, Project.id) == Agent.project_id)
+                .where(
+                    cast(Any, TeamProjectAgentBinding.team_project_id) == team_project.id,
+                    cast(Any, TeamProjectAgentBinding.status) == "active",
+                    cast(Any, Agent.retired_at).is_(None),
+                    func.lower(Agent.name).in_(human_candidates),
+                )
+            )
+            bound_seen: dict[str, set[int]] = defaultdict(set)
+            for _binding, bound_agent, home_project in bound_rows.all():
+                key = bound_agent.name.lower()
+                if bound_agent.id is None or bound_agent.id in bound_seen[key]:
+                    continue
+                bound_seen[key].add(bound_agent.id)
+                bound_agent_ids.add(bound_agent.id)
+                bound_by_name[key].append((home_project, bound_agent))
+            # Foreign default agents may be bound but excluded above when they
+            # were not mention candidates; check usability for all of them.
+            foreign_default_ids = [
+                agent.id
+                for agent in default_agents.values()
+                if agent.id is not None
+                and agent.project_id != channel_project.id
+                and agent.id not in bound_agent_ids
+            ]
+            if foreign_default_ids:
+                binding_rows = await session.execute(
+                    select(TeamProjectAgentBinding.agent_id).where(
+                        cast(Any, TeamProjectAgentBinding.team_project_id) == team_project.id,
+                        cast(Any, TeamProjectAgentBinding.agent_id).in_(foreign_default_ids),
+                        cast(Any, TeamProjectAgentBinding.status) == "active",
+                    )
+                )
+                bound_agent_ids.update(int(row) for row in binding_rows.scalars().all())
 
     resolutions: list[_ChannelMentionResolution] = []
     sender_key = sender.name.lower()
@@ -4621,6 +4750,13 @@ async def _resolve_channel_mentions(
             agent = local_by_name.get(key)
             project = channel_project if agent is not None else None
         if agent is None or project is None:
+            bound_matches = bound_by_name.get(key, [])
+            if len(bound_matches) > 1:
+                resolutions.append(_ChannelMentionResolution(name=name, reason="ambiguous"))
+                continue
+            if bound_matches:
+                project, agent = bound_matches[0]
+        if agent is None or project is None:
             membership = human_by_key.get(key)
             if membership is not None and membership.human_id is not None:
                 default_agent = (
@@ -4629,9 +4765,12 @@ async def _resolve_channel_mentions(
                     else None
                 )
                 if default_agent is not None and (
-                    default_agent.project_id != channel_project.id
-                    or default_agent.owner_id != membership.human_id
+                    default_agent.owner_id != membership.human_id
                     or default_agent.retired_at is not None
+                    or (
+                        default_agent.project_id != channel_project.id
+                        and default_agent.id not in bound_agent_ids
+                    )
                 ):
                     # Re-check the ownership invariant at the delivery boundary.
                     # Normal APIs enforce it when assigning a default, but old or
@@ -4641,12 +4780,21 @@ async def _resolve_channel_mentions(
                 if default_agent is not None and default_agent.contact_policy == "block_all":
                     resolutions.append(
                         _ChannelMentionResolution(
-                            name=name, agent=default_agent, project=channel_project, reason="block_all"
+                            name=name,
+                            agent=default_agent,
+                            project=default_home_projects.get(default_agent.project_id, channel_project),
+                            reason="block_all",
                         )
                     )
                 elif default_agent is not None:
                     resolutions.append(
-                        _ChannelMentionResolution(name=name, agent=default_agent, project=channel_project)
+                        _ChannelMentionResolution(
+                            name=name,
+                            agent=default_agent,
+                            # Bound foreign defaults receive the receipt in their
+                            # HOME project mailbox, not the routing project.
+                            project=default_home_projects.get(default_agent.project_id, channel_project),
+                        )
                     )
                 else:
                     resolutions.append(

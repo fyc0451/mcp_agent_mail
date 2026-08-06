@@ -32,12 +32,14 @@ from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoin
 from starlette.types import Receive, Scope, Send
 
 from .app import (
+    _agent_in_project_scope,
     _agent_referenced_as_default,
     _deliver_channel_mentions,
     _ensure_human,
     _expire_stale_file_reservations,
     _format_cross_project_agent_address,
     _human_by_subject,
+    _membership_handle_taken,
     _sender_display_name,
     _set_agent_owner,
     _tool_metrics_snapshot,
@@ -2156,16 +2158,38 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         await ensure_schema()
         async with get_session() as session:
             human = await _hub_human(request, session=session)
-            project = await _hub_project(project_slug, session=session)
+            team_project = await _hub_team_project(project_slug, session=session)
+            project = await session.get(Project, team_project.routing_project_id)
+            if project is None or project.archived_at is not None:
+                raise HTTPException(status_code=404, detail="Project not found")
             await _hub_active_membership(project, human, session=session)
             rows = await session.execute(
                 select(Agent)
                 .where(cast(Any, Agent.project_id) == project.id)
                 .order_by(Agent.name)
             )
-            return JSONResponse(
-                {"agents": [_hub_agent_payload(agent) for agent in rows.scalars().all()]}
+            agents = [_hub_agent_payload(agent) for agent in rows.scalars().all()]
+            # M3b-1: actively bound external agents are first-class members of
+            # the group namespace — listed (so they can be picked as a default
+            # agent) but never exposing credentials. Payload stays token-free.
+            bound_rows = await session.execute(
+                select(Agent)
+                .join(
+                    TeamProjectAgentBinding,
+                    cast(Any, TeamProjectAgentBinding.agent_id) == Agent.id,
+                )
+                .where(
+                    cast(Any, TeamProjectAgentBinding.team_project_id) == team_project.id,
+                    cast(Any, TeamProjectAgentBinding.status) == "active",
+                    cast(Any, Agent.project_id) != project.id,
+                )
+                .order_by(Agent.name)
             )
+            for agent in bound_rows.scalars().all():
+                payload = _hub_agent_payload(agent)
+                payload["bound_external"] = True
+                agents.append(payload)
+            return JSONResponse({"agents": agents})
 
     @fastapi_app.patch(
         "/hub/api/projects/{project_slug}/agents/{agent_id}",
@@ -2184,9 +2208,11 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         async with get_session() as session:
             human = await _hub_human(request, session=session)
             project = await _hub_project(project_slug, session=session)
+            if project.id is None:
+                raise HTTPException(status_code=404, detail="Project not found")
             membership = await _hub_active_membership(project, human, session=session)
             agent = await _hub_agent_for_update(agent_id, session=session)
-            if agent is None or agent.project_id != project.id:
+            if agent is None or not await _agent_in_project_scope(project, agent, session=session):
                 raise HTTPException(status_code=404, detail="Agent not found")
 
             if "owner_id" in body:
@@ -2199,7 +2225,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     raise HTTPException(status_code=400, detail="owner_id must be an integer or null")
                 if owner_id is not None:
                     owner_membership = await _hub_membership(
-                        agent.project_id,
+                        project.id,
                         owner_id,
                         session=session,
                     )
@@ -2281,7 +2307,10 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
 
         async with get_session() as session:
             human = await _hub_human(request, session=session)
-            project = await _hub_project(project_slug, session=session)
+            team_project = await _hub_team_project(project_slug, session=session)
+            project = await session.get(Project, team_project.routing_project_id)
+            if project is None or project.archived_at is not None:
+                raise HTTPException(status_code=404, detail="Project not found")
             membership = await _hub_active_membership(project, human, session=session)
             if membership.default_agent_id is None:
                 raise HTTPException(
@@ -2291,9 +2320,9 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             sender = await session.get(Agent, membership.default_agent_id)
             if (
                 sender is None
-                or sender.project_id != project.id
                 or sender.owner_id != human.id
                 or sender.retired_at is not None
+                or not await _agent_in_project_scope(project, sender, session=session)
             ):
                 raise HTTPException(
                     status_code=409,
@@ -2518,6 +2547,18 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 raise HTTPException(status_code=404, detail="Agent not found")
             if agent.retired_at is not None:
                 raise HTTPException(status_code=409, detail="Cannot bind a retired agent")
+            project = await session.get(Project, team_project.routing_project_id)
+            if project is None or project.archived_at is not None:
+                raise HTTPException(status_code=404, detail="Project not found")
+            if agent.project_id != project.id and await _membership_handle_taken(
+                project, agent.name, session=session
+            ):
+                # A bound external agent becomes addressable by name in the
+                # group namespace; it must not shadow an active human handle.
+                raise HTTPException(
+                    status_code=409,
+                    detail="Agent name collides with an active member mention_handle",
+                )
             existing_row = await session.execute(
                 select(TeamProjectAgentBinding).where(
                     cast(Any, TeamProjectAgentBinding.team_project_id) == team_project.id,
