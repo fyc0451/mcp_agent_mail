@@ -24,7 +24,7 @@ from fastapi.exception_handlers import http_exception_handler
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import select, text, update
+from sqlalchemy import func, select, text, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError, NoResultFound
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -2728,9 +2728,12 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             return JSONResponse({"bindings": bindings})
 
     # M3e: self-service claim of an unowned Agent by a team member who controls
-    # it (proven by the agent's registration_token). Sets owner + creates or
+    # it (proven by the agent's registration_token). The selector is what a
+    # local registry can actually know: source_project_slug + agent_name
+    # (never a local path, never a remote numeric id). Sets owner + creates or
     # revives the binding atomically. The token is compared in constant time
-    # and never echoed to responses, exceptions, or logs.
+    # and never echoed to responses, exceptions, or logs; unknown selectors and
+    # bad tokens get the same opaque refusal.
     @fastapi_app.post(
         "/hub/api/projects/{project_slug}/agent-claims",
         response_class=JSONResponse,
@@ -2738,9 +2741,12 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
     async def hub_claim_agent(project_slug: str, request: Request) -> JSONResponse:
         await ensure_schema()
         body = await _hub_json_body(request)
-        agent_id = body.get("agent_id")
-        if isinstance(agent_id, bool) or not isinstance(agent_id, int):
-            raise HTTPException(status_code=400, detail="agent_id must be an integer")
+        source_slug = body.get("source_project_slug")
+        if not isinstance(source_slug, str) or not _SLUG_VALIDATOR_RE.fullmatch(source_slug.strip()):
+            raise HTTPException(status_code=400, detail="source_project_slug must be a valid slug")
+        agent_name = body.get("agent_name")
+        if not isinstance(agent_name, str) or not agent_name.strip() or len(agent_name.strip()) > 128:
+            raise HTTPException(status_code=400, detail="agent_name is required")
         presented = body.get("registration_token")
         if not isinstance(presented, str) or not presented.strip() or len(presented) > 255:
             raise HTTPException(status_code=400, detail="registration_token is required")
@@ -2756,9 +2762,33 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             # is granted or required here.
             await _hub_active_membership(project, human, session=session)
 
-            agent = await session.get(Agent, agent_id)
-            if agent is None:
-                raise HTTPException(status_code=404, detail="Agent not found")
+            # Resolve the candidate by globally unique source slug + per-project
+            # unique (case-insensitive) agent name. Unknown source slug, unknown
+            # name, archived source project, and a wrong token all yield the same
+            # opaque refusal so the directory cannot be probed.
+            source_row = await session.execute(
+                select(Project).where(
+                    cast(Any, Project.slug) == source_slug.strip(),
+                    cast(Any, Project.archived_at).is_(None),
+                )
+            )
+            source_project = source_row.scalars().first()
+            agent = None
+            if source_project is not None:
+                agent_row = await session.execute(
+                    select(Agent).where(
+                        cast(Any, Agent.project_id) == source_project.id,
+                        func.lower(Agent.name) == agent_name.strip().lower(),
+                    )
+                )
+                agent = agent_row.scalars().first()
+            stored = agent.registration_token if agent is not None else None
+            if (
+                agent is None
+                or not stored
+                or not hmac.compare_digest(stored, presented_token)
+            ):
+                raise HTTPException(status_code=403, detail="Invalid agent credentials")
             if agent.retired_at is not None:
                 raise HTTPException(status_code=409, detail="Cannot claim a retired agent")
             # Team routing agents are managed, not claimable.
@@ -2775,9 +2805,6 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             # Owner may only be unset or the caller; never take another human's agent.
             if agent.owner_id is not None and agent.owner_id != human.id:
                 raise HTTPException(status_code=409, detail="Agent is already owned by another human")
-            stored = agent.registration_token or ""
-            if not stored or not hmac.compare_digest(stored, presented_token):
-                raise HTTPException(status_code=403, detail="Invalid agent credentials")
             if agent.project_id != project.id and await _membership_handle_taken(
                 project, agent.name, session=session
             ):
@@ -2785,6 +2812,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     status_code=409,
                     detail="Agent name collides with an active member mention_handle",
                 )
+            agent_id = agent.id
 
             if agent.owner_id is None:
                 try:
