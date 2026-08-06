@@ -561,6 +561,30 @@ class SessionLeadBinding(SQLModel, table=True):
     # Display label chosen by the client (e.g. "codex-main"); chat history and
     # the Human Inbox show this instead of the internal Agent name.
     lead_label: str = Field(default="", max_length=128)
+    # SHA-256 hex of the reply capability token; the plaintext is returned
+    # once at creation/rotation and never stored. NULL = no capability.
+    reply_token_hash: Optional[str] = Field(default=None, max_length=64)
     status: str = Field(default="active", max_length=16)  # active | unbound
     created_at: datetime = Field(default_factory=_utcnow_naive)
     updated_at: datetime = Field(default_factory=_utcnow_naive)
+
+
+class SessionLeadReplyKey(SQLModel, table=True):
+    """Idempotency placeholder for session-lead reply posts.
+
+    The row is inserted in the SAME transaction as the delivered channel
+    message (message_id filled before commit), so a concurrent duplicate key
+    either waits and reports already_delivered, or takes over delivery after
+    a rolled-back attempt — exactly-once with safe retries.
+    """
+
+    __tablename__ = "session_lead_reply_keys"
+    __table_args__ = (
+        UniqueConstraint("binding_id", "idem_key", name="uq_slrk_binding_key"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    binding_id: int = Field(foreign_key="session_lead_bindings.id", index=True)
+    idem_key: str = Field(max_length=128)
+    message_id: Optional[int] = Field(default=None, foreign_key="channel_messages.id")
+    created_ts: datetime = Field(default_factory=_utcnow_naive)

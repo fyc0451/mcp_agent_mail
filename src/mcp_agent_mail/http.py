@@ -43,6 +43,7 @@ from .app import (
     _membership_handle_taken,
     _sender_display_name,
     _set_agent_owner,
+    _team_project_for_routing,
     _tool_metrics_snapshot,
     _upsert_project_human_membership,
     _validate_default_agent,
@@ -64,6 +65,7 @@ from .models import (
     Project,
     ProjectHumanMembership,
     SessionLeadBinding,
+    SessionLeadReplyKey,
     TeamProject,
     TeamProjectAgentBinding,
 )
@@ -724,6 +726,15 @@ def _jwks_candidate_keys(key_set, header: dict, algorithms: list[str]) -> list:
     return candidates
 
 
+_CAPABILITY_REPLY_RE = re.compile(r"^/hub/api/projects/[A-Za-z0-9_-]+/session-lead/reply$")
+
+
+def _is_capability_reply(path: str, method: str) -> bool:
+    """The session-lead reply endpoint authenticates via its own capability
+    token, not the Hub bearer/JWT — exempt it from both auth middlewares."""
+    return method.upper() == "POST" and bool(_CAPABILITY_REPLY_RE.fullmatch(path))
+
+
 class BearerAuthMiddleware(BaseHTTPMiddleware):
     def __init__(
         self, app: FastAPI, token: str, allow_localhost: bool = False, jwt_enabled: bool = False
@@ -761,6 +772,8 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         if request.method == "OPTIONS":  # allow CORS preflight
             return await call_next(request)
         if request.url.path.startswith("/health/") or request.url.path == "/api/health":
+            return await call_next(request)
+        if _is_capability_reply(request.url.path, request.method):
             return await call_next(request)
         if _localhost_bypass_allowed(
             request,
@@ -1024,8 +1037,12 @@ class SecurityAndRateLimitMiddleware(BaseHTTPMiddleware):
 
         kind, tool_name = self._classify_request(request.url.path, request.method, body_bytes)
 
+        # Capability-auth reply endpoint carries its own token (#1093); skip
+        # JWT/RBAC here but keep rate limiting below.
+        capability_reply = _is_capability_reply(request.url.path, request.method)
+
         # JWT auth (if enabled)
-        if self._jwt_enabled:
+        if self._jwt_enabled and not capability_reply:
             auth_header = request.headers.get("Authorization", "")
             # #210: when JWT is enabled, a valid *static* bearer is still accepted
             # as the OR-alternative to a JWT (the outer BearerAuthMiddleware defers
@@ -2274,6 +2291,23 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     default_agent_id=default_agent_id,
                     session=session,
                 )
+                if member_status != "active":
+                    # 成员失活: 其受管 lead 同事务解绑且 reply capability 失效(#1096)
+                    team_project = await _team_project_for_routing(project.id, session=session)
+                    if team_project is not None and team_project.id is not None:
+                        await session.execute(
+                            update(SessionLeadBinding)
+                            .where(
+                                cast(Any, SessionLeadBinding.team_project_id) == team_project.id,
+                                cast(Any, SessionLeadBinding.human_id) == target.id,
+                                cast(Any, SessionLeadBinding.status) == "active",
+                            )
+                            .values(
+                                status="unbound",
+                                reply_token_hash=None,
+                                updated_at=datetime.now(timezone.utc).replace(tzinfo=None),
+                            )
+                        )
                 await session.commit()
             except ValueError as exc:
                 await session.rollback()
@@ -3157,6 +3191,203 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
     _CLIENT_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
     _SESSION_LEAD_PROGRAM = "team-session-lead"
 
+    def _new_reply_token() -> str:
+        import secrets as _secrets
+
+        return _secrets.token_urlsafe(32)
+
+    def _hash_reply_token(token: str) -> str:
+        return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+    def _hub_reply_credentials_invalid() -> HTTPException:
+        # 统一不透明: 不区分 未知 session / 已撤销 / 错 token
+        return HTTPException(status_code=403, detail="Invalid reply credentials")
+
+    @fastapi_app.post(
+        "/hub/api/projects/{project_slug}/session-lead/reply",
+        response_class=JSONResponse,
+    )
+    async def hub_session_lead_reply(project_slug: str, request: Request) -> JSONResponse:
+        """Capability-auth reply as the managed lead (no Human JWT required).
+
+        Auth = the binding-scoped reply token (hash stored only). The managed
+        lead posts to the support channel; Human-via-lead attribution and the
+        Human Inbox fallback stay intact. idempotency_key occupies its slot in
+        the SAME transaction as the message, so concurrent duplicates deliver
+        exactly once and failed attempts can be retried safely.
+        """
+        await ensure_schema()
+        body = await _hub_json_body(request)
+        raw_session_id = body.get("client_session_id")
+        client_session_id = raw_session_id.strip() if isinstance(raw_session_id, str) else ""
+        if not _CLIENT_SESSION_ID_RE.fullmatch(client_session_id):
+            raise HTTPException(status_code=400, detail="client_session_id must be a valid id")
+        reply_token = body.get("reply_token")
+        if (
+            not isinstance(reply_token, str)
+            or not reply_token.strip()
+            or len(reply_token.strip()) > 128
+        ):
+            raise HTTPException(status_code=400, detail="reply_token is required")
+        reply_token = reply_token.strip()
+        subject = body.get("subject")
+        body_md = body.get("body_md")
+        importance = body.get("importance", "normal")
+        if not isinstance(subject, str) or not subject.strip() or len(subject.strip()) > 512:
+            raise HTTPException(status_code=400, detail="subject is required and must be at most 512 characters")
+        if not isinstance(body_md, str) or not body_md.strip() or len(body_md) > 50_000:
+            raise HTTPException(status_code=400, detail="body_md is required and must be at most 50000 characters")
+        if importance not in {"low", "normal", "high", "urgent"}:
+            raise HTTPException(status_code=400, detail="Invalid importance")
+        raw_handles = body.get("mention_handles")
+        mention_handles: list[str] = []
+        if raw_handles is not None:
+            if not isinstance(raw_handles, list) or len(raw_handles) > 50:
+                raise HTTPException(status_code=400, detail="mention_handles must be an array")
+            for raw_handle in raw_handles:
+                if not isinstance(raw_handle, str):
+                    raise HTTPException(status_code=400, detail="mention_handles must contain strings")
+                handle = _hub_mention_handle(raw_handle)
+                if handle.lower() not in {item.lower() for item in mention_handles}:
+                    mention_handles.append(handle)
+        raw_key = body.get("idempotency_key")
+        idem_key = raw_key.strip() if isinstance(raw_key, str) else ""
+        if raw_key is not None and (not idem_key or len(idem_key) > 128):
+            raise HTTPException(status_code=400, detail="idempotency_key must be 1-128 characters")
+
+        async with get_session() as session:
+            team_project = await _hub_team_project(project_slug, session=session)
+            project = await session.get(Project, team_project.routing_project_id)
+            if project is None or project.archived_at is not None:
+                raise HTTPException(status_code=404, detail="Project not found")
+            binding_row = await session.execute(
+                select(SessionLeadBinding).where(
+                    cast(Any, SessionLeadBinding.team_project_id) == team_project.id,
+                    cast(Any, SessionLeadBinding.client_session_id) == client_session_id,
+                    cast(Any, SessionLeadBinding.status) == "active",
+                )
+            )
+            binding = binding_row.scalars().first()
+            if binding is None or not binding.reply_token_hash:
+                raise _hub_reply_credentials_invalid()
+            presented_hash = _hash_reply_token(reply_token)
+            if not hmac.compare_digest(binding.reply_token_hash, presented_hash):
+                raise _hub_reply_credentials_invalid()
+            sender = await session.get(Agent, binding.agent_id)
+            if sender is None or sender.retired_at is not None:
+                raise HTTPException(status_code=409, detail="Managed lead agent is unavailable")
+
+            if mention_handles:
+                member_rows = await session.execute(
+                    select(ProjectHumanMembership).where(
+                        cast(Any, ProjectHumanMembership.project_id) == project.id,
+                        cast(Any, ProjectHumanMembership.status) == "active",
+                    )
+                )
+                known = {
+                    item.mention_handle.lower()
+                    for item in member_rows.scalars().all()
+                }
+                missing = [h for h in mention_handles if h.lower() not in known]
+                if missing:
+                    raise HTTPException(
+                        status_code=404,
+                        detail=f"Active team member not found: {missing[0]}",
+                    )
+
+            # 幂等占位与消息写入同一事务(#1096 验收 1)
+            key_row = None
+            if idem_key:
+                key_insert = sqlite_insert(SessionLeadReplyKey).values(
+                    binding_id=binding.id,
+                    idem_key=idem_key,
+                )
+                result = await session.execute(
+                    key_insert.on_conflict_do_nothing(
+                        index_elements=["binding_id", "idem_key"]
+                    )
+                )
+                if not cast(Any, result).rowcount:
+                    existing_key = await session.execute(
+                        select(SessionLeadReplyKey).where(
+                            cast(Any, SessionLeadReplyKey.binding_id) == binding.id,
+                            cast(Any, SessionLeadReplyKey.idem_key) == idem_key,
+                        )
+                    )
+                    key_row = existing_key.scalars().one()
+                    return JSONResponse(
+                        {
+                            "status": "already_delivered",
+                            "message_id": key_row.message_id,
+                            "client_session_id": client_session_id,
+                        }
+                    )
+                key_row_row = await session.execute(
+                    select(SessionLeadReplyKey).where(
+                        cast(Any, SessionLeadReplyKey.binding_id) == binding.id,
+                        cast(Any, SessionLeadReplyKey.idem_key) == idem_key,
+                    )
+                )
+                key_row = key_row_row.scalars().first()
+
+            channel_insert = sqlite_insert(Channel).values(
+                project_id=project.id,
+                name="support",
+                created_ts=datetime.now(timezone.utc).replace(tzinfo=None),
+            )
+            await session.execute(
+                channel_insert.on_conflict_do_nothing(index_elements=["project_id", "name"])
+            )
+            channel_row = await session.execute(
+                select(Channel).where(
+                    cast(Any, Channel.project_id) == project.id,
+                    cast(Any, Channel.name) == "support",
+                )
+            )
+            channel = channel_row.scalars().one()
+            message = ChannelMessage(
+                channel_id=cast(int, channel.id),
+                sender_id=cast(int, sender.id),
+                subject=subject.strip(),
+                body_md=(
+                    (" ".join(f"@{handle}" for handle in mention_handles) + "\n\n")
+                    if mention_handles
+                    else ""
+                )
+                + body_md.strip(),
+                importance=importance,
+                attachments=[],
+            )
+            sender.last_active_ts = datetime.now(timezone.utc).replace(tzinfo=None)
+            session.add(sender)
+            session.add(message)
+            await session.flush()
+            assert message.id is not None
+            if key_row is not None:
+                key_row.message_id = message.id
+                session.add(key_row)
+            await session.commit()
+            await session.refresh(message)
+            sender_id = sender.id
+
+        deliveries = await _deliver_channel_mentions(
+            cast(Any, _HubHTTPDeliveryContext()),
+            project,
+            sender,
+            message,
+            mention_handles,
+        )
+        return JSONResponse(
+            {
+                "status": "delivered",
+                "message_id": message.id,
+                "client_session_id": client_session_id,
+                "sender_agent_id": sender_id,
+                "deliveries": deliveries,
+            },
+            status_code=201,
+        )
+
     def _hub_session_lead_payload(binding: SessionLeadBinding) -> dict[str, Any]:
         return {
             "id": binding.id,
@@ -3211,6 +3442,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 status_code=400,
                 detail="lead_label is required, must be at most 128 characters and contain no control characters",
             )
+        rotate_token = bool(body.get("rotate_reply_token"))
         async with get_session() as session:
             team_project = await _hub_team_project(project_slug, session=session)
             human = await _hub_human(request, session=session)
@@ -3227,6 +3459,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 asyncio.Lock(),
             )
             async with lead_lock:
+                # 单 active 切换: 旧 binding 的 reply capability 同事务失效
                 await session.execute(
                     update(SessionLeadBinding)
                     .where(
@@ -3237,6 +3470,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     )
                     .values(
                         status="unbound",
+                        reply_token_hash=None,
                         updated_at=datetime.now(timezone.utc).replace(tzinfo=None),
                     )
                 )
@@ -3250,6 +3484,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 )
                 binding = existing_row.scalars().first()
                 created = False
+                reply_token: str | None = None
                 if binding is not None:
                     agent = await session.get(Agent, binding.agent_id)
                     if agent is None:
@@ -3265,6 +3500,11 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     if binding.lead_label != lead_label:
                         # Label follows the latest PUT (display name, not a key).
                         binding.lead_label = lead_label
+                        binding.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                        session.add(binding)
+                    if rotate_token or not binding.reply_token_hash:
+                        reply_token = _new_reply_token()
+                        binding.reply_token_hash = _hash_reply_token(reply_token)
                         binding.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
                         session.add(binding)
                 else:
@@ -3299,12 +3539,14 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     agent = agent_row.scalars().first()
                     if agent is None or agent.owner_id != human.id:
                         raise HTTPException(status_code=409, detail="Managed lead agent is unavailable")
+                    reply_token = _new_reply_token()
                     binding_insert = sqlite_insert(SessionLeadBinding).values(
                         team_project_id=team_project.id,
                         human_id=human.id,
                         client_session_id=client_session_id,
                         agent_id=agent.id,
                         lead_label=lead_label,
+                        reply_token_hash=_hash_reply_token(reply_token),
                         status="active",
                     )
                     await session.execute(
@@ -3331,16 +3573,17 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 await session.commit()
             await session.refresh(binding)
             await session.refresh(agent)
-            return JSONResponse(
-                {
-                    "agent": _hub_agent_payload(agent),
-                    "client_session_id": client_session_id,
-                    "active": True,
-                    "binding": _hub_session_lead_payload(binding),
-                    "membership_default_agent_id": membership.default_agent_id,
-                },
-                status_code=201 if created else 200,
-            )
+            payload = {
+                "agent": _hub_agent_payload(agent),
+                "client_session_id": client_session_id,
+                "active": True,
+                "binding": _hub_session_lead_payload(binding),
+                "membership_default_agent_id": membership.default_agent_id,
+            }
+            if reply_token is not None:
+                # Plaintext only on creation/rotation — never stored, never logged.
+                payload["reply_token"] = reply_token
+            return JSONResponse(payload, status_code=201 if created else 200)
 
     @fastapi_app.get(
         "/hub/api/projects/{project_slug}/session-lead",
@@ -3411,6 +3654,10 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             if was_active:
                 binding.status = "unbound"
                 binding.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                session.add(binding)
+            if binding.reply_token_hash is not None:
+                # 解绑即失效,同一事务
+                binding.reply_token_hash = None
                 session.add(binding)
             # Default cleared only while the record was still active AND the
             # caller's default points at this lead (contract #1062).
