@@ -401,3 +401,42 @@ async def test_claim_name_collides_with_active_handle(hub):
         _aid, slug = await _mk_agent("/workspaces/w1", "Bob")
         conflict = await _claim(client, bob, slug, "Bob", "tok-secret")
         assert conflict.status_code == 409
+
+
+@pytest.mark.anyio
+async def test_concurrent_claims_by_different_humans_cas(hub):
+    """#996: two humans holding the same token race a claim; the owner CAS must
+    let at most one win, and the loser must not get an active binding."""
+    settings, app = hub
+    root = _headers(settings, "oidc|root", admin=True)
+    bob = _headers(settings, "oidc|bob")
+    carol = _headers(settings, "oidc|carol")
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        await _setup_team(client, root)
+        bob_id = await _register_human(client, bob, "Bob")
+        carol_id = await _register_human(client, carol, "Carol")
+        await _join_active(client, root, bob, bob_id, "bob")
+        await _join_active(client, root, carol, carol_id, "carol")
+        agent_id, slug = await _mk_agent("/workspaces/w1", "BlueLake")
+
+        first, second = await asyncio.gather(
+            _claim(client, bob, slug, "BlueLake", "tok-secret"),
+            _claim(client, carol, slug, "BlueLake", "tok-secret"),
+        )
+        pair = sorted((first.status_code, second.status_code))
+        assert pair in ([200, 409], [201, 409]), (
+            first.status_code, first.text, second.status_code, second.text
+        )
+        winner = first if first.status_code in (200, 201) else second
+        winner_owner = winner.json()["agent"]["owner_id"]
+        assert winner_owner in (bob_id, carol_id)
+
+        async with get_session() as session:
+            agent = await session.get(Agent, agent_id)
+            assert agent is not None and agent.owner_id == winner_owner
+            # 同一 TeamProject 内最多一条 active binding, 且属于胜者的认领
+            rows = (await session.execute(select(TeamProjectAgentBinding))).scalars().all()
+            assert len(rows) == 1
+            assert rows[0].status == "active"
+            assert rows[0].bound_by_human_id == winner_owner

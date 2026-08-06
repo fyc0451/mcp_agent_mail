@@ -2734,6 +2734,8 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
     # revives the binding atomically. The token is compared in constant time
     # and never echoed to responses, exceptions, or logs; unknown selectors and
     # bad tokens get the same opaque refusal.
+    _claim_locks: dict[int, asyncio.Lock] = {}
+
     @fastapi_app.post(
         "/hub/api/projects/{project_slug}/agent-claims",
         response_class=JSONResponse,
@@ -2789,89 +2791,117 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 or not hmac.compare_digest(stored, presented_token)
             ):
                 raise HTTPException(status_code=403, detail="Invalid agent credentials")
-            if agent.retired_at is not None:
-                raise HTTPException(status_code=409, detail="Cannot claim a retired agent")
-            # Team routing agents are managed, not claimable.
-            routing_row = await session.execute(
-                select(TeamProject).where(
-                    cast(Any, TeamProject.routing_project_id) == agent.project_id,
-                    cast(Any, TeamProject.archived_at).is_(None),
-                )
-            )
-            if routing_row.scalars().first() is not None:
-                raise HTTPException(
-                    status_code=409, detail="Team routing agents cannot be claimed"
-                )
-            # Owner may only be unset or the caller; never take another human's agent.
-            if agent.owner_id is not None and agent.owner_id != human.id:
-                raise HTTPException(status_code=409, detail="Agent is already owned by another human")
-            if agent.project_id != project.id and await _membership_handle_taken(
-                project, agent.name, session=session
-            ):
-                raise HTTPException(
-                    status_code=409,
-                    detail="Agent name collides with an active member mention_handle",
-                )
             agent_id = agent.id
 
-            if agent.owner_id is None:
-                try:
-                    agent = await _set_agent_owner(agent_id, human.id, session=session)
-                except ValueError as exc:
-                    raise HTTPException(status_code=409, detail=str(exc)) from exc
-
-            # Create or revive the binding (same upsert semantics as bind).
-            existing_row = await session.execute(
-                select(TeamProjectAgentBinding).where(
-                    cast(Any, TeamProjectAgentBinding.team_project_id) == team_project.id,
-                    cast(Any, TeamProjectAgentBinding.agent_id) == agent_id,
+            # Serialize the mutation critical section per agent (#996): within
+            # one hub process, two concurrent claims for the same agent run
+            # sequentially, so no two connections ever write the same row at
+            # the same time (avoids cross-greenlet connection contention). A
+            # fresh inner session starts its snapshot AFTER acquiring the
+            # lock, so it always sees the previous claim's committed state.
+            claim_lock = _claim_locks.setdefault(agent_id, asyncio.Lock())
+            async with claim_lock, get_session() as claim_session:
+                agent = await claim_session.get(Agent, agent_id)
+                if agent is None:
+                    raise HTTPException(status_code=403, detail="Invalid agent credentials")
+                if agent.retired_at is not None:
+                    raise HTTPException(status_code=409, detail="Cannot claim a retired agent")
+                # Team routing agents are managed, not claimable.
+                routing_row = await claim_session.execute(
+                    select(TeamProject).where(
+                        cast(Any, TeamProject.routing_project_id) == agent.project_id,
+                        cast(Any, TeamProject.archived_at).is_(None),
+                    )
                 )
-            )
-            binding = existing_row.scalars().first()
-            if binding is not None:
-                if binding.status != "active":
-                    binding.status = "active"
-                    binding.bound_by_human_id = human.id
-                    binding.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
-                    session.add(binding)
-                await session.commit()
-                await session.refresh(binding)
-                await session.refresh(agent)
+                if routing_row.scalars().first() is not None:
+                    raise HTTPException(
+                        status_code=409, detail="Team routing agents cannot be claimed"
+                    )
+                # Owner may only be unset or the caller; never another human's.
+                if agent.owner_id is not None and agent.owner_id != human.id:
+                    raise HTTPException(status_code=409, detail="Agent is already owned by another human")
+                if agent.project_id != project.id and await _membership_handle_taken(
+                    project, agent.name, session=claim_session
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Agent name collides with an active member mention_handle",
+                    )
+
+                if agent.owner_id is None:
+                    # CAS safety net (cross-process): only claims the agent
+                    # while its owner is still unset, atomically.
+                    cas = await claim_session.execute(
+                        update(Agent)
+                        .where(
+                            cast(Any, Agent.id) == agent_id,
+                            cast(Any, Agent.owner_id).is_(None),
+                        )
+                        .values(owner_id=human.id)
+                    )
+                    if not cast(Any, cas).rowcount:
+                        await claim_session.rollback()
+                        owner_now = await claim_session.scalar(
+                            select(Agent.owner_id).where(cast(Any, Agent.id) == agent_id)
+                        )
+                        if owner_now != human.id:
+                            raise HTTPException(
+                                status_code=409, detail="Agent is already owned by another human"
+                            )
+                    agent = await claim_session.get(Agent, agent_id)
+
+                # Create or revive the binding (same upsert semantics as bind).
+                existing_row = await claim_session.execute(
+                    select(TeamProjectAgentBinding).where(
+                        cast(Any, TeamProjectAgentBinding.team_project_id) == team_project.id,
+                        cast(Any, TeamProjectAgentBinding.agent_id) == agent_id,
+                    )
+                )
+                binding = existing_row.scalars().first()
+                if binding is not None:
+                    if binding.status != "active":
+                        binding.status = "active"
+                        binding.bound_by_human_id = human.id
+                        binding.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                        claim_session.add(binding)
+                    await claim_session.commit()
+                    await claim_session.refresh(binding)
+                    await claim_session.refresh(agent)
+                    return JSONResponse(
+                        {
+                            "binding": _hub_binding_payload(binding),
+                            "agent": _hub_agent_payload(agent),
+                        },
+                        status_code=200,
+                    )
+                insert_stmt = sqlite_insert(TeamProjectAgentBinding).values(
+                    team_project_id=team_project.id,
+                    agent_id=agent_id,
+                    status="active",
+                    bound_by_human_id=human.id,
+                )
+                result = await claim_session.execute(
+                    insert_stmt.on_conflict_do_nothing(
+                        index_elements=["team_project_id", "agent_id"]
+                    )
+                )
+                created = bool(cast(Any, result).rowcount)
+                await claim_session.commit()
+                existing_row = await claim_session.execute(
+                    select(TeamProjectAgentBinding).where(
+                        cast(Any, TeamProjectAgentBinding.team_project_id) == team_project.id,
+                        cast(Any, TeamProjectAgentBinding.agent_id) == agent_id,
+                    )
+                )
+                binding = existing_row.scalars().one()
+                await claim_session.refresh(agent)
                 return JSONResponse(
                     {
                         "binding": _hub_binding_payload(binding),
                         "agent": _hub_agent_payload(agent),
                     },
-                    status_code=200,
+                    status_code=201 if created else 200,
                 )
-            insert_stmt = sqlite_insert(TeamProjectAgentBinding).values(
-                team_project_id=team_project.id,
-                agent_id=agent_id,
-                status="active",
-                bound_by_human_id=human.id,
-            )
-            result = await session.execute(
-                insert_stmt.on_conflict_do_nothing(
-                    index_elements=["team_project_id", "agent_id"]
-                )
-            )
-            created = bool(cast(Any, result).rowcount)
-            await session.commit()
-            existing_row = await session.execute(
-                select(TeamProjectAgentBinding).where(
-                    cast(Any, TeamProjectAgentBinding.team_project_id) == team_project.id,
-                    cast(Any, TeamProjectAgentBinding.agent_id) == agent_id,
-                )
-            )
-            binding = existing_row.scalars().one()
-            await session.refresh(agent)
-            return JSONResponse(
-                {
-                    "binding": _hub_binding_payload(binding),
-                    "agent": _hub_agent_payload(agent),
-                },
-                status_code=201 if created else 200,
-            )
 
     def _oauth_metadata_disabled_response() -> JSONResponse:
         return JSONResponse({"mcp_oauth": False}, status_code=404)
