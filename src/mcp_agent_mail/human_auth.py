@@ -1,0 +1,340 @@
+"""Small standalone JWT issuer for beta Human identities.
+
+The service is intentionally separate from Agent Cockpit: Cockpit may proxy a
+login request, but only this process can read the signing key or password DB.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import contextlib
+import hashlib
+import hmac
+import json
+import os
+import re
+import secrets
+import sqlite3
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlsplit
+
+from authlib.jose import JsonWebKey, JsonWebToken
+from fastapi import FastAPI, HTTPException, Request
+from pydantic import BaseModel, Field
+
+_USERNAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_PASSWORD_MIN_BYTES = 12
+_PASSWORD_MAX_BYTES = 256
+_SCRYPT_N = 2**14
+_SCRYPT_R = 8
+_SCRYPT_P = 1
+
+
+@dataclass(frozen=True)
+class HumanAuthConfig:
+    data_dir: Path
+    issuer: str
+    audience: str
+    token_ttl_seconds: int = 8 * 60 * 60
+
+
+class LoginRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=64)
+    password: str = Field(min_length=1, max_length=256)
+
+
+def _b64(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
+
+
+def _unb64(value: str) -> bytes:
+    return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+
+
+def _password_hash(password: str, *, salt: bytes | None = None) -> str:
+    encoded = password.encode("utf-8")
+    if not _PASSWORD_MIN_BYTES <= len(encoded) <= _PASSWORD_MAX_BYTES:
+        raise ValueError("Password must be between 12 and 256 UTF-8 bytes")
+    salt = salt or secrets.token_bytes(16)
+    digest = hashlib.scrypt(
+        encoded,
+        salt=salt,
+        n=_SCRYPT_N,
+        r=_SCRYPT_R,
+        p=_SCRYPT_P,
+        dklen=32,
+    )
+    return f"scrypt${_SCRYPT_N}${_SCRYPT_R}${_SCRYPT_P}${_b64(salt)}${_b64(digest)}"
+
+
+def _password_matches(password: str, encoded_hash: str) -> bool:
+    try:
+        name, n, r, p, salt, expected = encoded_hash.split("$", 5)
+        if name != "scrypt":
+            return False
+        candidate = hashlib.scrypt(
+            password.encode("utf-8"),
+            salt=_unb64(salt),
+            n=int(n),
+            r=int(r),
+            p=int(p),
+            dklen=len(_unb64(expected)),
+        )
+        return hmac.compare_digest(candidate, _unb64(expected))
+    except (TypeError, ValueError, MemoryError):
+        return False
+
+
+def _write_private_file(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        os.write(fd, data)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+class HumanAuthStore:
+    def __init__(self, config: HumanAuthConfig):
+        self.config = config
+        self.config.data_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.config.data_dir.chmod(0o700)
+        self.db_path = self.config.data_dir / "users.sqlite3"
+        self.key_path = self.config.data_dir / "signing-key.pem"
+        self._ensure_schema()
+        self._key = self._load_or_create_key()
+        public_pem = self._key.as_pem(is_private=False)
+        self.kid = hashlib.sha256(public_pem).hexdigest()[:16]
+        public_jwk = self._key.as_dict(is_private=False)
+        public_jwk.update({"kid": self.kid, "use": "sig", "alg": "RS256"})
+        self.jwks = {"keys": [public_jwk]}
+        # A real hash keeps unknown-user failures on the same expensive path.
+        self._dummy_hash = _password_hash(secrets.token_urlsafe(24))
+
+    def _connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(self.db_path, timeout=5)
+        connection.row_factory = sqlite3.Row
+        return connection
+
+    def _ensure_schema(self) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS users (
+                    subject TEXT PRIMARY KEY,
+                    username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                    display_name TEXT NOT NULL,
+                    password_hash TEXT NOT NULL,
+                    roles_json TEXT NOT NULL,
+                    active INTEGER NOT NULL DEFAULT 1
+                )
+                """
+            )
+        self.db_path.chmod(0o600)
+
+    def _load_or_create_key(self):
+        if not self.key_path.exists():
+            key = JsonWebKey.generate_key("RSA", 2048, is_private=True)
+            with contextlib.suppress(FileExistsError):
+                _write_private_file(self.key_path, key.as_pem(is_private=True))
+        self.key_path.chmod(0o600)
+        return JsonWebKey.import_key(self.key_path.read_bytes(), {"kty": "RSA"})
+
+    def bootstrap_admin(
+        self,
+        *,
+        username: str,
+        display_name: str,
+        credentials_path: Path,
+    ) -> bool:
+        username = username.strip().lower()
+        display_name = display_name.strip()
+        if not _USERNAME_RE.fullmatch(username):
+            raise ValueError("Invalid bootstrap username")
+        if not display_name or len(display_name) > 128:
+            raise ValueError("Invalid bootstrap display name")
+        with self._connect() as connection:
+            existing = connection.execute(
+                "SELECT subject FROM users WHERE username = ?", (username,)
+            ).fetchone()
+            if existing is not None:
+                return False
+            if connection.execute("SELECT 1 FROM users LIMIT 1").fetchone() is not None:
+                raise ValueError("Refusing to bootstrap an admin into a non-empty user database")
+            password = secrets.token_urlsafe(24)
+            connection.execute(
+                """
+                INSERT INTO users(subject, username, display_name, password_hash, roles_json)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    f"human:{username}",
+                    username,
+                    display_name,
+                    _password_hash(password),
+                    json.dumps(["writer", "admin"]),
+                ),
+            )
+            _write_private_file(
+                credentials_path,
+                (json.dumps({"username": username, "password": password}, ensure_ascii=False) + "\n").encode(),
+            )
+        return True
+
+    def authenticate(self, username: str, password: str) -> sqlite3.Row | None:
+        username = username.strip().lower()
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT subject, username, display_name, password_hash, roles_json
+                FROM users WHERE username = ? AND active = 1
+                """,
+                (username,),
+            ).fetchone()
+        stored_hash = row["password_hash"] if row is not None else self._dummy_hash
+        if not _password_matches(password, stored_hash):
+            return None
+        return row
+
+    def issue_token(self, user: sqlite3.Row) -> tuple[str, int]:
+        now = int(time.time())
+        expires = now + self.config.token_ttl_seconds
+        claims = {
+            "iss": self.config.issuer,
+            "aud": self.config.audience,
+            "sub": user["subject"],
+            "iat": now,
+            "nbf": now,
+            "exp": expires,
+            "jti": secrets.token_urlsafe(18),
+            "preferred_username": user["username"],
+            "name": user["display_name"],
+            "role": json.loads(user["roles_json"]),
+        }
+        token = JsonWebToken(["RS256"]).encode(
+            {"alg": "RS256", "typ": "JWT", "kid": self.kid},
+            claims,
+            self._key,
+        )
+        return token.decode("ascii"), self.config.token_ttl_seconds
+
+
+class _LoginLimiter:
+    def __init__(self) -> None:
+        self.failures: dict[str, list[float]] = {}
+
+    def blocked(self, key: str, now: float) -> bool:
+        recent = [value for value in self.failures.get(key, []) if now - value < 300]
+        self.failures[key] = recent
+        return len(recent) >= 5
+
+    def failed(self, key: str, now: float) -> None:
+        self.failures.setdefault(key, []).append(now)
+        if len(self.failures) > 2048:
+            self.failures.pop(next(iter(self.failures)))
+
+    def succeeded(self, key: str) -> None:
+        self.failures.pop(key, None)
+
+
+def create_app(config: HumanAuthConfig) -> FastAPI:
+    store = HumanAuthStore(config)
+    limiter = _LoginLimiter()
+    app = FastAPI(title="Agent Hub Human Auth", docs_url=None, redoc_url=None)
+    app.state.store = store
+
+    @app.get("/health")
+    async def health() -> dict[str, str]:
+        return {"status": "ok"}
+
+    @app.get("/.well-known/openid-configuration")
+    async def discovery() -> dict[str, Any]:
+        return {
+            "issuer": config.issuer,
+            "jwks_uri": f"{config.issuer}/.well-known/jwks.json",
+            "token_endpoint": f"{config.issuer}/token",
+            "id_token_signing_alg_values_supported": ["RS256"],
+        }
+
+    @app.get("/.well-known/jwks.json")
+    async def jwks() -> dict[str, Any]:
+        return store.jwks
+
+    @app.post("/token")
+    async def token(request: Request, body: LoginRequest) -> dict[str, Any]:
+        username = body.username.strip().lower()
+        client_host = request.client.host if request.client else "unknown"
+        limit_key = f"{client_host}:{username}"
+        now = time.monotonic()
+        if limiter.blocked(limit_key, now):
+            raise HTTPException(status_code=429, detail="Too many login attempts")
+        user = store.authenticate(username, body.password)
+        if user is None:
+            limiter.failed(limit_key, now)
+            raise HTTPException(status_code=401, detail="Invalid username or password")
+        limiter.succeeded(limit_key)
+        access_token, expires_in = store.issue_token(user)
+        return {
+            "access_token": access_token,
+            "token_type": "Bearer",
+            "expires_in": expires_in,
+            "profile": {
+                "username": user["username"],
+                "display_name": user["display_name"],
+            },
+        }
+
+    return app
+
+
+def _validated_issuer(value: str) -> str:
+    parsed = urlsplit(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
+        raise ValueError("Issuer must be an absolute HTTP(S) URL without credentials")
+    return value.rstrip("/")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Run the standalone beta Human JWT issuer")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8766)
+    parser.add_argument("--data-dir", type=Path, required=True)
+    parser.add_argument("--issuer", required=True)
+    parser.add_argument("--audience", default="mcp-agent-mail-human")
+    parser.add_argument("--bootstrap-username")
+    parser.add_argument("--bootstrap-display-name")
+    parser.add_argument("--bootstrap-credentials-file", type=Path)
+    args = parser.parse_args()
+    if args.host not in {"127.0.0.1", "::1", "localhost"}:
+        parser.error("beta issuer must bind to loopback; expose it through an authenticated HTTPS proxy")
+    config = HumanAuthConfig(
+        data_dir=args.data_dir,
+        issuer=_validated_issuer(args.issuer),
+        audience=args.audience,
+    )
+    app = create_app(config)
+    bootstrap_values = (
+        args.bootstrap_username,
+        args.bootstrap_display_name,
+        args.bootstrap_credentials_file,
+    )
+    if any(bootstrap_values) and not all(bootstrap_values):
+        parser.error("all bootstrap arguments are required together")
+    if all(bootstrap_values):
+        app.state.store.bootstrap_admin(
+            username=args.bootstrap_username,
+            display_name=args.bootstrap_display_name,
+            credentials_path=args.bootstrap_credentials_file,
+        )
+    import uvicorn
+
+    uvicorn.run(app, host=args.host, port=args.port)
+
+
+if __name__ == "__main__":  # pragma: no cover
+    main()

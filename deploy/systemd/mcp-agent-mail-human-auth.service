@@ -1,0 +1,22 @@
+[Unit]
+Description=MCP Agent Mail beta Human JWT issuer
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/mcp-agent-mail
+ExecStart=/opt/mcp-agent-mail/.venv/bin/python -m mcp_agent_mail.human_auth --host 127.0.0.1 --port 8766 --data-dir /var/lib/mcp-agent-mail-human-auth --issuer http://127.0.0.1:8766 --audience mcp-agent-mail-human --bootstrap-username fyc --bootstrap-display-name 付彦超 --bootstrap-credentials-file /var/lib/mcp-agent-mail-human-auth/initial-admin.json
+Restart=always
+RestartSec=5
+User=appuser
+Group=appuser
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/mcp-agent-mail-human-auth
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

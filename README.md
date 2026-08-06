@@ -2120,6 +2120,31 @@ Common variables you may set:
 | `RETENTION_IGNORE_PROJECT_PATTERNS` | `demo,test*,testproj*,testproject,backendproj*,frontendproj*` | CSV of project patterns to ignore in retention/quota reports |
 | `AGENT_NAME_ENFORCEMENT_MODE` | `coerce` | Agent naming policy: `strict` (reject invalid adjective+noun names), `coerce` (auto-generate if invalid), `always_auto` (always auto-generate) |
 
+### Standalone beta Human issuer
+
+`mcp_agent_mail.human_auth` is a small RS256 issuer for deployments that do not
+yet have an external IdP. It runs as a separate process, binds to loopback only,
+and keeps its signing key, user DB, and generated bootstrap credentials outside
+the source tree with mode `0600`. Agent Cockpit may proxy `/token`, but it never
+receives the signing key.
+
+Use `deploy/systemd/mcp-agent-mail-human-auth.service` as a deployment template,
+then configure the Hub with:
+
+```dotenv
+HTTP_JWT_ENABLED=true
+HTTP_JWT_ALGORITHMS=RS256
+HTTP_JWT_JWKS_URL=http://127.0.0.1:8766/.well-known/jwks.json
+HTTP_JWT_AUDIENCE=mcp-agent-mail-human
+HTTP_JWT_ISSUER=http://127.0.0.1:8766
+HTTP_JWT_ROLE_CLAIM=role
+```
+
+Do not commit or copy the generated `initial-admin.json`, user database, or
+private signing key into chat, logs, or source control. For remote deployments,
+keep the issuer on loopback and expose the login flow only through an
+authenticated HTTPS reverse proxy.
+
 ## Development quick start
 
 Prerequisite: complete the setup above (Python 3.14 + uv venv + uv sync).
