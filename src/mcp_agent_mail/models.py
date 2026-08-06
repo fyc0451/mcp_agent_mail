@@ -29,6 +29,29 @@ class Project(SQLModel, table=True):
     created_at: datetime = Field(default_factory=_utcnow_naive)
     archived_at: Optional[datetime] = Field(default=None)
 
+
+class TeamProject(SQLModel, table=True):
+    """User-visible logical group backed by an opaque Hub routing project.
+
+    ``routing_project_id`` points at the existing Agent Mail message space, but
+    that Project uses a server-generated opaque key and never a client path.
+    Technical Agent Mail projects are therefore invisible to the Team API.
+    """
+
+    __tablename__ = "team_projects"
+    __table_args__ = (
+        UniqueConstraint("slug", name="uq_team_project_slug"),
+        UniqueConstraint("routing_project_id", name="uq_team_project_routing"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    slug: str = Field(index=True, max_length=128)
+    name: str = Field(max_length=255)
+    routing_project_id: int = Field(foreign_key="projects.id", index=True)
+    created_at: datetime = Field(default_factory=_utcnow_naive)
+    archived_at: Optional[datetime] = Field(default=None)
+
+
 class Product(SQLModel, table=True):
     """Logical grouping across multiple repositories for product-wide inbox/search and threads."""
 

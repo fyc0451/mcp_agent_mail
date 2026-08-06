@@ -33,6 +33,7 @@ from mcp_agent_mail.models import (
     MessageRecipient,
     Project,
     ProjectHumanMembership,
+    TeamProject,
 )
 
 
@@ -417,6 +418,20 @@ async def test_human_inbox_http_list_and_mark_read(isolated_env, monkeypatch):
     async with Client(server) as client:
         sender = await _register(client, "/m3a/msg-h", "BlueLake")
         await _mk_membership("/m3a/msg-h", "oidc|helen", "helen")
+        async with get_session() as session:
+            routing_project = (
+                await session.execute(
+                    select(Project).where(Project.human_key == "/m3a/msg-h")
+                )
+            ).scalars().one()
+            session.add(
+                TeamProject(
+                    slug="message-team",
+                    name="Message Team",
+                    routing_project_id=routing_project.id,
+                )
+            )
+            await session.commit()
         await _post(client, sender, "@helen 第一条")
         await _post(client, sender, "@helen 第二条")
 
@@ -442,6 +457,7 @@ async def test_human_inbox_http_list_and_mark_read(isolated_env, monkeypatch):
         items = listed.json()["items"]
         assert len(items) == 2
         assert {item["subject"] for item in items} == {"coordination"}
+        assert {item["project_slug"] for item in items} == {"message-team"}
         assert all(item["sender_name"] == "BlueLake" for item in items)
         assert all(item["read_ts"] is None for item in items)
 

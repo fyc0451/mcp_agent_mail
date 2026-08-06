@@ -2145,6 +2145,20 @@ private signing key into chat, logs, or source control. For remote deployments,
 keep the issuer on loopback and expose the login flow only through an
 authenticated HTTPS reverse proxy.
 
+### Logical Team project groups
+
+The Human API treats `TeamProject` as the only user-visible project/group.
+Existing Agent Mail `Project` rows may contain client workspace keys and are
+technical routing records; they are never listed or adopted as Team groups.
+A newly deployed Team Hub therefore starts with an empty group list even when
+technical mail projects already exist.
+
+Creating `POST /hub/api/projects` requires a display `name`, a stable logical
+`slug`, and the creator's `mention_handle`. The Hub generates a private opaque
+routing project for messages and Agents. No client filesystem path is accepted,
+returned, or required, so the Hub can run on a separate machine from every
+Cockpit and workspace.
+
 ## Development quick start
 
 Prerequisite: complete the setup above (Python 3.14 + uv venv + uv sync).

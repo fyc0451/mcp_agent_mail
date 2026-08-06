@@ -22,12 +22,13 @@ from typing import Any
 import pytest
 from authlib.jose import jwt
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import func, select
 
 from mcp_agent_mail import config as _config
 from mcp_agent_mail.app import build_mcp_server
 from mcp_agent_mail.db import get_session
 from mcp_agent_mail.http import build_http_app
-from mcp_agent_mail.models import Agent
+from mcp_agent_mail.models import Agent, Project, TeamProject
 
 
 def _rpc(method: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -797,6 +798,46 @@ class TestHubHumanIdentityApi:
             assert fetched.json() == updated.json()
 
     @pytest.mark.asyncio
+    async def test_concurrent_group_creation_keeps_one_routing_project(
+        self, isolated_env, monkeypatch
+    ):
+        settings = _configure_hub_jwt(monkeypatch)
+        app = build_http_app(settings, build_mcp_server())
+        headers = _hub_headers(settings, "oidc|alice")
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            registered = await client.put(
+                "/hub/api/humans/me",
+                headers=headers,
+                json={"display_name": "Alice"},
+            )
+            assert registered.status_code == 200
+
+            first, second = await asyncio.gather(
+                client.post(
+                    "/hub/api/projects",
+                    headers=headers,
+                    json={"name": "M3a Team", "slug": "m3a", "mention_handle": "alice"},
+                ),
+                client.post(
+                    "/hub/api/projects",
+                    headers=headers,
+                    json={"name": "Duplicate", "slug": "m3a", "mention_handle": "alice"},
+                ),
+            )
+            assert sorted((first.status_code, second.status_code)) == [201, 409]
+
+            async with get_session() as session:
+                team_count = await session.scalar(select(func.count()).select_from(TeamProject))
+                routing_count = await session.scalar(
+                    select(func.count())
+                    .select_from(Project)
+                    .where(Project.human_key.like("team:%"))
+                )
+            assert team_count == routing_count == 1
+
+    @pytest.mark.asyncio
     async def test_project_join_approval_and_agent_authorization(
         self, isolated_env, monkeypatch
     ):
@@ -819,14 +860,32 @@ class TestHubHumanIdentityApi:
             )
             assert alice.status_code == bob.status_code == 200
 
+            # Existing Agent Mail projects are technical routing records, not
+            # user-visible Team groups. A fresh Team account starts empty.
+            async with get_session() as session:
+                session.add(Project(slug="local-worktree", human_key="/home/alice/worktree"))
+                await session.commit()
+            initially_empty = await client.get("/hub/api/projects", headers=alice_headers)
+            assert initially_empty.status_code == 200
+            assert initially_empty.json() == {"projects": []}
+            path_coupled_create = await client.post(
+                "/hub/api/projects",
+                headers=alice_headers,
+                json={"human_key": "/home/alice/worktree", "mention_handle": "alice"},
+            )
+            assert path_coupled_create.status_code == 400
+
             created = await client.post(
                 "/hub/api/projects",
                 headers=alice_headers,
-                json={"human_key": "/teams/m3a", "mention_handle": "alice"},
+                json={"name": "M3a Team", "slug": "m3a", "mention_handle": "alice"},
             )
             assert created.status_code == 201
             project = created.json()
             slug = project["slug"]
+            routing_project_id = project["membership"]["project_id"]
+            assert project["name"] == "M3a Team"
+            assert "human_key" not in project
             assert project["membership"]["role"] == "admin"
             assert project["membership"]["status"] == "active"
 
@@ -840,7 +899,7 @@ class TestHubHumanIdentityApi:
             duplicate = await client.post(
                 "/hub/api/projects",
                 headers=bob_headers,
-                json={"human_key": "/teams/m3a", "mention_handle": "bob"},
+                json={"name": "Duplicate", "slug": "m3a", "mention_handle": "bob"},
             )
             assert duplicate.status_code == 409
 
@@ -901,7 +960,7 @@ class TestHubHumanIdentityApi:
 
             async with get_session() as session:
                 agent = Agent(
-                    project_id=project["id"],
+                    project_id=routing_project_id,
                     name="GreenLake",
                     program="test",
                     model="test",
@@ -983,28 +1042,28 @@ class TestHubHumanIdentityApi:
             member_archive = await client.post(
                 "/mail/api/archive-project",
                 headers=bob_headers,
-                json={"project_id": project["id"]},
+                json={"project_id": routing_project_id},
             )
             assert member_archive.status_code == 403
 
             admin_archive = await client.post(
                 "/mail/api/archive-project",
                 headers=alice_headers,
-                json={"project_id": project["id"]},
+                json={"project_id": routing_project_id},
             )
             assert admin_archive.status_code == 200
 
             member_unarchive = await client.post(
                 "/mail/api/unarchive-project",
                 headers=bob_headers,
-                json={"project_id": project["id"]},
+                json={"project_id": routing_project_id},
             )
             assert member_unarchive.status_code == 403
 
             admin_unarchive = await client.post(
                 "/mail/api/unarchive-project",
                 headers=alice_headers,
-                json={"project_id": project["id"]},
+                json={"project_id": routing_project_id},
             )
             assert admin_unarchive.status_code == 200
 
@@ -1032,7 +1091,7 @@ class TestHubHumanIdentityApi:
             created = await client.post(
                 "/hub/api/projects",
                 headers=alice_headers,
-                json={"human_key": "/teams/roster", "mention_handle": "alice"},
+                json={"name": "Roster", "slug": "roster", "mention_handle": "alice"},
             )
             assert created.status_code == 201
             slug = created.json()["slug"]

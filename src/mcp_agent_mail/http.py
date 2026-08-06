@@ -11,6 +11,7 @@ import importlib
 import json
 import logging
 import re
+import uuid
 from collections.abc import MutableMapping
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -31,12 +32,10 @@ from starlette.types import Receive, Scope, Send
 
 from .app import (
     _agent_referenced_as_default,
-    _compute_project_slug,
     _ensure_human,
     _expire_stale_file_reservations,
     _format_cross_project_agent_address,
     _human_by_subject,
-    _normalize_project_human_key,
     _sender_display_name,
     _set_agent_owner,
     _tool_metrics_snapshot,
@@ -49,7 +48,15 @@ from .app import (
 )
 from .config import Settings, get_settings
 from .db import ensure_schema, get_session
-from .models import Agent, Human, HumanInboxItem, Message, Project, ProjectHumanMembership
+from .models import (
+    Agent,
+    Human,
+    HumanInboxItem,
+    Message,
+    Project,
+    ProjectHumanMembership,
+    TeamProject,
+)
 from .storage import (
     ProjectArchive,
     archive_write_lock,
@@ -1657,14 +1664,24 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             raise HTTPException(status_code=404, detail="Human identity is not registered")
         return human
 
-    async def _hub_project(slug: str, *, session: AsyncSession) -> Project:
+    async def _hub_team_project(slug: str, *, session: AsyncSession) -> TeamProject:
         if not _SLUG_VALIDATOR_RE.fullmatch(slug):
             raise HTTPException(status_code=400, detail="Invalid project slug")
         result = await session.execute(
-            select(Project).where(cast(Any, Project.slug) == slug)
+            select(TeamProject).where(
+                cast(Any, TeamProject.slug) == slug,
+                cast(Any, TeamProject.archived_at).is_(None),
+            )
         )
-        project = result.scalars().first()
-        if project is None:
+        team_project = result.scalars().first()
+        if team_project is None:
+            raise HTTPException(status_code=404, detail="Project not found")
+        return team_project
+
+    async def _hub_project(slug: str, *, session: AsyncSession) -> Project:
+        team_project = await _hub_team_project(slug, session=session)
+        project = await session.get(Project, team_project.routing_project_id)
+        if project is None or project.archived_at is not None:
             raise HTTPException(status_code=404, detail="Project not found")
         return project
 
@@ -1797,7 +1814,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
 
     @fastapi_app.get("/hub/api/projects", response_class=JSONResponse)
     async def hub_list_projects(request: Request) -> JSONResponse:
-        """List discoverable Hub projects without exposing local human_key paths."""
+        """List only user-created logical groups, never technical mail projects."""
         await ensure_schema()
         async with get_session() as session:
             human = await _hub_human(request, session=session)
@@ -1806,16 +1823,21 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             rows = await session.execute(
                 text(
                     """
-                    SELECT p.id, p.slug, mine.role, mine.status, mine.mention_handle,
+                    SELECT tp.id, tp.slug, tp.name,
+                           mine.role, mine.status, mine.mention_handle,
                            COUNT(active_members.id) AS active_member_count
-                    FROM projects p
+                    FROM team_projects tp
+                    JOIN projects routing ON routing.id = tp.routing_project_id
                     LEFT JOIN project_human_memberships mine
-                      ON mine.project_id = p.id AND mine.human_id = :human_id
+                      ON mine.project_id = tp.routing_project_id
+                     AND mine.human_id = :human_id
                     LEFT JOIN project_human_memberships active_members
-                      ON active_members.project_id = p.id AND active_members.status = 'active'
-                    WHERE p.archived_at IS NULL
-                    GROUP BY p.id, p.slug, mine.role, mine.status, mine.mention_handle
-                    ORDER BY p.created_at DESC
+                      ON active_members.project_id = tp.routing_project_id
+                     AND active_members.status = 'active'
+                    WHERE tp.archived_at IS NULL AND routing.archived_at IS NULL
+                    GROUP BY tp.id, tp.slug, tp.name,
+                             mine.role, mine.status, mine.mention_handle
+                    ORDER BY tp.created_at DESC
                     """
                 ),
                 {"human_id": human.id},
@@ -1824,6 +1846,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 {
                     "id": row.id,
                     "slug": row.slug,
+                    "name": row.name,
                     "active_member_count": row.active_member_count,
                     "membership": (
                         {
@@ -1843,20 +1866,36 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
     async def hub_create_project(request: Request) -> JSONResponse:
         await ensure_schema()
         body = await _hub_json_body(request)
-        raw_human_key = body.get("human_key")
-        if not isinstance(raw_human_key, str) or not raw_human_key.strip():
-            raise HTTPException(status_code=400, detail="human_key is required")
-        human_key = _normalize_project_human_key(raw_human_key.strip())
-        if len(human_key) > 255:
-            raise HTTPException(status_code=400, detail="human_key is too long")
+        name = body.get("name")
+        if not isinstance(name, str) or not name.strip() or len(name.strip()) > 255:
+            raise HTTPException(status_code=400, detail="name is required and must be at most 255 characters")
+        raw_slug = body.get("slug")
+        slug = raw_slug.strip().lower() if isinstance(raw_slug, str) else ""
+        if not slug or len(slug) > 128 or not _SLUG_VALIDATOR_RE.fullmatch(slug):
+            raise HTTPException(
+                status_code=400,
+                detail="slug must be 1-128 letters, numbers, '_' or '-'",
+            )
         mention_handle = _hub_mention_handle(body.get("mention_handle"))
-        slug = _compute_project_slug(human_key)
 
         async with get_session() as session:
             human = await _hub_human(request, session=session)
-            project = Project(slug=slug, human_key=human_key)
+            routing_id = uuid.uuid4().hex
+            project = Project(
+                slug=f"hub-group-{routing_id}",
+                human_key=f"team:{routing_id}",
+            )
             session.add(project)
             try:
+                await session.flush()
+                if project.id is None:
+                    raise HTTPException(status_code=500, detail="Failed to create routing project")
+                team_project = TeamProject(
+                    slug=slug,
+                    name=name.strip(),
+                    routing_project_id=project.id,
+                )
+                session.add(team_project)
                 await session.flush()
                 membership = await _upsert_project_human_membership(
                     project=project,
@@ -1872,12 +1911,13 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 await session.rollback()
                 raise HTTPException(status_code=409, detail="Project already exists") from exc
             await session.refresh(project)
+            await session.refresh(team_project)
             await session.refresh(membership)
             return JSONResponse(
                 {
-                    "id": project.id,
-                    "slug": project.slug,
-                    "human_key": project.human_key,
+                    "id": team_project.id,
+                    "slug": team_project.slug,
+                    "name": team_project.name,
                     "membership": _hub_membership_payload(membership),
                 },
                 status_code=201,
@@ -2198,10 +2238,13 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             if unread_only:
                 conditions.append(cast(Any, HumanInboxItem.read_ts).is_(None))
             rows = await session.execute(
-                select(HumanInboxItem, Message, Agent, Project)
+                select(HumanInboxItem, Message, Agent, TeamProject)
                 .join(Message, cast(Any, Message.id) == HumanInboxItem.message_id)
                 .join(Agent, cast(Any, Agent.id) == Message.sender_id)
-                .join(Project, cast(Any, Project.id) == HumanInboxItem.project_id)
+                .join(
+                    TeamProject,
+                    cast(Any, TeamProject.routing_project_id) == HumanInboxItem.project_id,
+                )
                 .where(*conditions)
                 .order_by(cast(Any, HumanInboxItem.created_ts).desc())
                 .limit(limit)
@@ -2242,6 +2285,11 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             conditions = [
                 cast(Any, HumanInboxItem.human_id) == human.id,
                 cast(Any, HumanInboxItem.read_ts).is_(None),
+                cast(Any, HumanInboxItem.project_id).in_(
+                    select(TeamProject.routing_project_id).where(
+                        cast(Any, TeamProject.archived_at).is_(None)
+                    )
+                ),
             ]
             if ids is not None:
                 conditions.append(cast(Any, HumanInboxItem.id).in_(ids))
