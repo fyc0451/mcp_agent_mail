@@ -33,6 +33,7 @@ from starlette.types import Receive, Scope, Send
 
 from .app import (
     _agent_referenced_as_default,
+    _deliver_channel_mentions,
     _ensure_human,
     _expire_stale_file_reservations,
     _format_cross_project_agent_address,
@@ -51,6 +52,8 @@ from .config import Settings, get_settings
 from .db import ensure_schema, get_session
 from .models import (
     Agent,
+    Channel,
+    ChannelMessage,
     Human,
     HumanInboxItem,
     Message,
@@ -2234,6 +2237,143 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             await session.commit()
             await session.refresh(agent)
             return JSONResponse(_hub_agent_payload(agent))
+
+    class _HubHTTPDeliveryContext:
+        async def info(self, message: str) -> None:
+            structlog.get_logger("hub-support").info("delivery", message=message)
+
+    @fastapi_app.post(
+        "/hub/api/projects/{project_slug}/support-requests",
+        response_class=JSONResponse,
+        status_code=201,
+    )
+    async def hub_post_support_request(
+        project_slug: str,
+        request: Request,
+    ) -> JSONResponse:
+        """Post a real team support message through the caller's default Agent."""
+        await ensure_schema()
+        body = await _hub_json_body(request)
+        allowed = {"subject", "body_md", "importance", "mention_handles"}
+        if not set(body).issubset(allowed):
+            raise HTTPException(status_code=400, detail="Unsupported support request field")
+        subject = body.get("subject")
+        body_md = body.get("body_md")
+        importance = body.get("importance", "normal")
+        if not isinstance(subject, str) or not subject.strip() or len(subject.strip()) > 512:
+            raise HTTPException(status_code=400, detail="subject is required and must be at most 512 characters")
+        if not isinstance(body_md, str) or not body_md.strip() or len(body_md) > 50_000:
+            raise HTTPException(status_code=400, detail="body_md is required and must be at most 50000 characters")
+        if importance not in {"low", "normal", "high", "urgent"}:
+            raise HTTPException(status_code=400, detail="Invalid importance")
+        raw_handles = body.get("mention_handles")
+        requested_handles: list[str] | None = None
+        if raw_handles is not None:
+            if not isinstance(raw_handles, list) or not raw_handles or len(raw_handles) > 50:
+                raise HTTPException(status_code=400, detail="mention_handles must be a non-empty array")
+            requested_handles = []
+            for raw_handle in raw_handles:
+                if not isinstance(raw_handle, str):
+                    raise HTTPException(status_code=400, detail="mention_handles must contain strings")
+                handle = _hub_mention_handle(raw_handle)
+                if handle.lower() not in {item.lower() for item in requested_handles}:
+                    requested_handles.append(handle)
+
+        async with get_session() as session:
+            human = await _hub_human(request, session=session)
+            project = await _hub_project(project_slug, session=session)
+            membership = await _hub_active_membership(project, human, session=session)
+            if membership.default_agent_id is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Set a usable default Agent before contacting the team",
+                )
+            sender = await session.get(Agent, membership.default_agent_id)
+            if (
+                sender is None
+                or sender.project_id != project.id
+                or sender.owner_id != human.id
+                or sender.retired_at is not None
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="The configured default Agent is unavailable",
+                )
+            rows = await session.execute(
+                select(ProjectHumanMembership).where(
+                    cast(Any, ProjectHumanMembership.project_id) == project.id,
+                    cast(Any, ProjectHumanMembership.status) == "active",
+                    cast(Any, ProjectHumanMembership.human_id) != human.id,
+                )
+            )
+            candidates = rows.scalars().all()
+            by_handle = {item.mention_handle.lower(): item for item in candidates}
+            if requested_handles is None:
+                target_memberships = candidates
+            else:
+                missing = [handle for handle in requested_handles if handle.lower() not in by_handle]
+                if missing:
+                    raise HTTPException(
+                        status_code=404,
+                        detail=f"Active team member not found: {missing[0]}",
+                    )
+                target_memberships = [by_handle[handle.lower()] for handle in requested_handles]
+            if not target_memberships:
+                raise HTTPException(status_code=409, detail="No other active team members")
+            mention_handles = [item.mention_handle for item in target_memberships]
+
+            channel_insert = sqlite_insert(Channel).values(
+                project_id=project.id,
+                name="support",
+                created_ts=datetime.now(timezone.utc).replace(tzinfo=None),
+            )
+            await session.execute(
+                channel_insert.on_conflict_do_nothing(
+                    index_elements=["project_id", "name"],
+                )
+            )
+            channel_row = await session.execute(
+                select(Channel).where(
+                    cast(Any, Channel.project_id) == project.id,
+                    cast(Any, Channel.name) == "support",
+                )
+            )
+            channel = channel_row.scalars().one()
+            message = ChannelMessage(
+                channel_id=cast(int, channel.id),
+                sender_id=cast(int, sender.id),
+                subject=subject.strip(),
+                body_md=(
+                    " ".join(f"@{handle}" for handle in mention_handles)
+                    + "\n\n"
+                    + body_md.strip()
+                ),
+                importance=importance,
+                attachments=[],
+            )
+            sender.last_active_ts = datetime.now(timezone.utc).replace(tzinfo=None)
+            session.add(sender)
+            session.add(message)
+            await session.commit()
+            await session.refresh(message)
+
+        deliveries = await _deliver_channel_mentions(
+            cast(Any, _HubHTTPDeliveryContext()),
+            project,
+            sender,
+            message,
+            mention_handles,
+        )
+        return JSONResponse(
+            {
+                "channel": "support",
+                "message_id": message.id,
+                "sender_agent": sender.name,
+                "mention_handles": mention_handles,
+                "deliveries": deliveries,
+            },
+            status_code=201,
+        )
 
     # M3a human inbox (人工收件箱): read-only + mark-read over durable items
     # created by @human channel mentions without a usable default agent. Pure

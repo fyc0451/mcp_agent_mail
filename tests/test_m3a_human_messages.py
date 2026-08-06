@@ -500,3 +500,141 @@ async def test_human_inbox_http_list_and_mark_read(isolated_env, monkeypatch):
             "/hub/api/inbox/mark-read", headers=helen, json={"ids": ["1"]}
         )
         assert bad.status_code == 400
+
+
+@pytest.mark.anyio
+async def test_human_support_request_broadcasts_via_default_agent(
+    isolated_env, monkeypatch,
+):
+    server = build_mcp_server()
+    async with Client(server) as client:
+        sender = await _register(client, "/m3a/support", "BlueLake")
+        sender_id = await _agent_id("BlueLake")
+        await _mk_membership(
+            "/m3a/support", "oidc|alice", "alice", default_agent_id=sender_id,
+        )
+        bob_id = await _mk_membership("/m3a/support", "oidc|bob", "bob")
+        carol_id = await _mk_membership("/m3a/support", "oidc|carol", "carol")
+        await _mk_membership(
+            "/m3a/support", "oidc|dave", "dave", status="removed",
+        )
+        async with get_session() as session:
+            routing_project = (
+                await session.execute(
+                    select(Project).where(Project.human_key == "/m3a/support")
+                )
+            ).scalars().one()
+            session.add(
+                TeamProject(
+                    slug="support-team",
+                    name="Support Team",
+                    routing_project_id=routing_project.id,
+                )
+            )
+            await session.commit()
+
+    settings = _configure_hub_jwt(monkeypatch)
+    app = build_http_app(settings, build_mcp_server())
+    alice = _hub_headers(settings, "oidc|alice")
+    bob = _hub_headers(settings, "oidc|bob")
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as http:
+        posted = await http.post(
+            "/hub/api/projects/support-team/support-requests",
+            headers=alice,
+            json={
+                "subject": "终端求助 · demo/w1:p1",
+                "body_md": "当前构建失败, 请团队协助排查。",
+                "importance": "high",
+            },
+        )
+        assert posted.status_code == 201
+        payload = posted.json()
+        assert payload["channel"] == "support"
+        assert payload["sender_agent"] == sender["name"]
+        assert set(payload["mention_handles"]) == {"bob", "carol"}
+        assert {item["status"] for item in payload["deliveries"]} == {
+            "delivered_human_inbox"
+        }
+
+        inbox = await http.get("/hub/api/inbox", headers=bob)
+        assert inbox.status_code == 200
+        assert len(inbox.json()["items"]) == 1
+        assert inbox.json()["items"][0]["subject"] == "终端求助 · demo/w1:p1"
+
+    async with get_session() as session:
+        message = (await session.execute(select(ChannelMessage))).scalars().one()
+        assert message.importance == "high"
+        assert "@bob @carol" in message.body_md
+        items = (await session.execute(select(HumanInboxItem))).scalars().all()
+        assert {item.human_id for item in items} == {bob_id, carol_id}
+
+
+@pytest.mark.anyio
+async def test_human_support_request_can_target_member_and_requires_sender_agent(
+    isolated_env, monkeypatch,
+):
+    server = build_mcp_server()
+    async with Client(server) as client:
+        await _register(client, "/m3a/support-target", "BlueLake")
+        await _register(client, "/m3a/support-target", "RedStone")
+        sender_id = await _agent_id("BlueLake")
+        recipient_id = await _agent_id("RedStone")
+        await _mk_membership(
+            "/m3a/support-target", "oidc|alice", "alice", default_agent_id=sender_id,
+        )
+        await _mk_membership(
+            "/m3a/support-target", "oidc|bob", "bob", default_agent_id=recipient_id,
+        )
+        await _mk_membership("/m3a/support-target", "oidc|carol", "carol")
+        async with get_session() as session:
+            routing_project = (
+                await session.execute(
+                    select(Project).where(Project.human_key == "/m3a/support-target")
+                )
+            ).scalars().one()
+            session.add(
+                TeamProject(
+                    slug="support-target",
+                    name="Target Team",
+                    routing_project_id=routing_project.id,
+                )
+            )
+            await session.commit()
+
+    settings = _configure_hub_jwt(monkeypatch)
+    app = build_http_app(settings, build_mcp_server())
+    alice = _hub_headers(settings, "oidc|alice")
+    carol = _hub_headers(settings, "oidc|carol")
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as http:
+        targeted = await http.post(
+            "/hub/api/projects/support-target/support-requests",
+            headers=alice,
+            json={
+                "subject": "只找 Bob",
+                "body_md": "请 Bob 支持。",
+                "mention_handles": ["BoB"],
+            },
+        )
+        assert targeted.status_code == 201
+        assert targeted.json()["mention_handles"] == ["bob"]
+        assert targeted.json()["deliveries"][0]["status"] == "delivered"
+
+        no_sender = await http.post(
+            "/hub/api/projects/support-target/support-requests",
+            headers=carol,
+            json={"subject": "无默认 Agent", "body_md": "不能冒用其他 Agent。"},
+        )
+        assert no_sender.status_code == 409
+        assert "default Agent" in no_sender.json()["detail"]
+
+    async with get_session() as session:
+        recipient = (
+            await session.execute(
+                select(MessageRecipient).where(
+                    cast(Any, MessageRecipient.agent_id) == recipient_id,
+                )
+            )
+        ).scalars().one()
+        assert recipient.kind == "mention"

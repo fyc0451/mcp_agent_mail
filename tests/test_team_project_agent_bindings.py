@@ -109,10 +109,11 @@ def hub(isolated_env, monkeypatch):
 async def test_group_admin_binds_and_rebind_is_idempotent(hub):
     settings, app = hub
     alice = _headers(settings, "oidc|alice")
+    alice_admin = _headers(settings, "oidc|alice", admin=True)
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         await _register_human(client, alice, "Alice")
-        await _create_team(client, alice, "core", "alice")
+        await _create_team(client, alice_admin, "core", "alice")
         agent_id = await _mk_workspace_agent("BlueLake")
 
         bound = await client.post(
@@ -139,12 +140,13 @@ async def test_group_admin_binds_and_rebind_is_idempotent(hub):
 async def test_global_admin_binds_without_membership(hub):
     settings, app = hub
     alice = _headers(settings, "oidc|alice")
+    alice_admin = _headers(settings, "oidc|alice", admin=True)
     root = _headers(settings, "oidc|root", admin=True)
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         await _register_human(client, alice, "Alice")
         await _register_human(client, root, "Root")
-        await _create_team(client, alice, "core", "alice")
+        await _create_team(client, alice_admin, "core", "alice")
         agent_id = await _mk_workspace_agent("RedStone")
 
         bound = await client.post(
@@ -158,6 +160,7 @@ async def test_global_admin_binds_without_membership(hub):
 async def test_non_admin_cannot_bind(hub):
     settings, app = hub
     alice = _headers(settings, "oidc|alice")
+    alice_admin = _headers(settings, "oidc|alice", admin=True)
     bob = _headers(settings, "oidc|bob")
     carol = _headers(settings, "oidc|carol")
     transport = ASGITransport(app=app)
@@ -165,7 +168,7 @@ async def test_non_admin_cannot_bind(hub):
         await _register_human(client, alice, "Alice")
         bob_id = await _register_human(client, bob, "Bob")
         carol_id = await _register_human(client, carol, "Carol")
-        await _create_team(client, alice, "core", "alice")
+        await _create_team(client, alice_admin, "core", "alice")
         await _join_and_approve(client, alice, bob, "core", "bob", bob_id)
         agent_id = await _mk_workspace_agent("GreenCastle")
 
@@ -186,13 +189,15 @@ async def test_non_admin_cannot_bind(hub):
 async def test_cross_group_admin_cannot_bind_elsewhere(hub):
     settings, app = hub
     alice = _headers(settings, "oidc|alice")
+    alice_admin = _headers(settings, "oidc|alice", admin=True)
     bob = _headers(settings, "oidc|bob")
+    bob_admin = _headers(settings, "oidc|bob", admin=True)
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         await _register_human(client, alice, "Alice")
         await _register_human(client, bob, "Bob")
-        await _create_team(client, alice, "core", "alice")
-        await _create_team(client, bob, "other", "bob")
+        await _create_team(client, alice_admin, "core", "alice")
+        await _create_team(client, bob_admin, "other", "bob")
         agent_id = await _mk_workspace_agent("WhitePeak")
 
         # bob is admin of 'other' but has no membership in 'core'
@@ -206,10 +211,11 @@ async def test_cross_group_admin_cannot_bind_elsewhere(hub):
 async def test_bind_validates_agent(hub):
     settings, app = hub
     alice = _headers(settings, "oidc|alice")
+    alice_admin = _headers(settings, "oidc|alice", admin=True)
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         await _register_human(client, alice, "Alice")
-        await _create_team(client, alice, "core", "alice")
+        await _create_team(client, alice_admin, "core", "alice")
 
         missing = await client.post(
             "/hub/api/projects/core/agent-bindings", headers=alice, json={"agent_id": 999999}
@@ -238,12 +244,13 @@ async def test_bind_validates_agent(hub):
 async def test_unbind_keeps_history_and_rebind_revives(hub):
     settings, app = hub
     alice = _headers(settings, "oidc|alice")
+    alice_admin = _headers(settings, "oidc|alice", admin=True)
     bob = _headers(settings, "oidc|bob")
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         await _register_human(client, alice, "Alice")
         bob_id = await _register_human(client, bob, "Bob")
-        await _create_team(client, alice, "core", "alice")
+        await _create_team(client, alice_admin, "core", "alice")
         await _join_and_approve(client, alice, bob, "core", "bob", bob_id)
         agent_id = await _mk_workspace_agent("BlueLake")
 
@@ -299,10 +306,11 @@ async def test_unbind_keeps_history_and_rebind_revives(hub):
 async def test_concurrent_double_bind_yields_single_row(hub):
     settings, app = hub
     alice = _headers(settings, "oidc|alice")
+    alice_admin = _headers(settings, "oidc|alice", admin=True)
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         await _register_human(client, alice, "Alice")
-        await _create_team(client, alice, "core", "alice")
+        await _create_team(client, alice_admin, "core", "alice")
         agent_id = await _mk_workspace_agent("BlueLake")
 
         first, second = await asyncio.gather(
@@ -324,10 +332,11 @@ async def test_concurrent_double_bind_yields_single_row(hub):
 async def test_binding_requires_jwt(hub):
     settings, app = hub
     alice = _headers(settings, "oidc|alice")
+    alice_admin = _headers(settings, "oidc|alice", admin=True)
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         await _register_human(client, alice, "Alice")
-        await _create_team(client, alice, "core", "alice")
+        await _create_team(client, alice_admin, "core", "alice")
         agent_id = await _mk_workspace_agent("BlueLake")
 
         unauthenticated = await client.post(
