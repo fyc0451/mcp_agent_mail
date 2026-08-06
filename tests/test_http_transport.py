@@ -68,6 +68,7 @@ async def test_http_jwks_validation_and_resource_rate_limit(isolated_env, monkey
     monkeypatch.setenv("HTTP_RATE_LIMIT_TOOLS_PER_MINUTE", "10")
     # Provide a JWKS URL (dummy) and monkeypatch HTTP call
     monkeypatch.setenv("HTTP_JWT_JWKS_URL", "https://jwks.local/keys")
+    monkeypatch.setenv("HTTP_JWT_AUDIENCE", "mcp-agent-mail-human")
     with contextlib.suppress(Exception):
         _config.clear_settings_cache()
     settings = _config.get_settings()
@@ -89,7 +90,7 @@ async def test_http_jwks_validation_and_resource_rate_limit(isolated_env, monkey
     token = (
         jwt.encode(
             {"alg": "RS256", "kid": "abc"},
-            {"sub": "u1", settings.http.jwt_role_claim: "reader"},
+            {"sub": "u1", "aud": "mcp-agent-mail-human", settings.http.jwt_role_claim: "reader"},
             private_jwk,
         ).decode("utf-8")
     )
@@ -107,6 +108,19 @@ async def test_http_jwks_validation_and_resource_rate_limit(isolated_env, monkey
         # Reader can call read-only tool
         r = await client.post(settings.http.path, headers=headers, json=_rpc("tools/call", {"name": "health_check", "arguments": {}}))
         assert r.status_code == 200
+        wrong_audience_token = (
+            jwt.encode(
+                {"alg": "RS256", "kid": "abc"},
+                {"sub": "u1", "aud": "other-service", settings.http.jwt_role_claim: "reader"},
+                private_jwk,
+            ).decode("utf-8")
+        )
+        wrong_audience = await client.post(
+            settings.http.path,
+            headers={"Authorization": f"Bearer {wrong_audience_token}"},
+            json=_rpc("tools/call", {"name": "health_check", "arguments": {}}),
+        )
+        assert wrong_audience.status_code == 401
         # Resource rate limit 1 rpm -> second call 429
         r1 = await client.post(settings.http.path, headers=headers, json=_rpc("resources/read", {"uri": "resource://tooling/projects"}))
         assert r1.status_code in (200, 429)

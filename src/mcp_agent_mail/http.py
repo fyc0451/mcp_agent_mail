@@ -832,11 +832,19 @@ class SecurityAndRateLimitMiddleware(BaseHTTPMiddleware):
             for candidate in keys_to_try:
                 with contextlib.suppress(Exception):
                     claims = jwt.decode(token, candidate)
+                    claims.validate()
                     if audience:
-                        claims.validate_aud(audience)
+                        token_audience = claims.get("aud")
+                        if isinstance(token_audience, str):
+                            audience_matches = token_audience == audience
+                        elif isinstance(token_audience, (list, tuple)):
+                            audience_matches = audience in token_audience
+                        else:
+                            audience_matches = False
+                        if not audience_matches:
+                            continue
                     if issuer and str(claims.get("iss") or "") != issuer:
                         continue
-                    claims.validate()
                     return dict(claims)
         return None
 
