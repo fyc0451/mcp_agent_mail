@@ -299,6 +299,22 @@ class HumanAuthStore:
             )
         return {"invite_code": code, "expires_at": expires_at}
 
+    def _valid_team_code(self, invite_code: str) -> bool:
+        """可重复使用的团队码(可选,存放在 data_dir/team-code)。
+
+        团队码不过期、不限次数,按次读取文件,轮换无需重启;
+        注册仍落 pending,需管理员激活后才能登录,泄露不会直接放行。
+        """
+        try:
+            expected = (
+                self.config.data_dir / "team-code"
+            ).read_text(encoding="utf-8").strip()
+        except OSError:
+            return False
+        return bool(expected) and hmac.compare_digest(
+            invite_code.strip(), expected
+        )
+
     def register(
         self,
         *,
@@ -324,7 +340,7 @@ class HumanAuthStore:
                 """,
                 (code_hash, now),
             ).fetchone()
-            if invitation is None:
+            if invitation is None and not self._valid_team_code(invite_code):
                 raise ValueError("Invalid or expired invitation")
             existing = connection.execute(
                 "SELECT 1 FROM users WHERE username = ?", (username,)

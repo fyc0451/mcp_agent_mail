@@ -289,3 +289,38 @@ def test_concurrent_registration_consumes_invitation_once(tmp_path):
     assert sorted((first.status_code, second.status_code)) == [201, 400]
     pending = [user for user in app.state.store.list_users() if user["status"] == "pending"]
     assert len(pending) == 1
+
+
+def test_team_code_is_reusable_and_never_consumed(tmp_path):
+    app, client, _credentials = _bootstrapped_client(tmp_path)
+    (tmp_path / "state" / "team-code").write_text("team-secret-2026", encoding="utf-8")
+
+    for username in ("carol", "dave"):
+        registered = client.post("/register", json={
+            "username": username,
+            "display_name": username.title(),
+            "password": f"{username}-password-123",
+            "invite_code": "team-secret-2026",
+        })
+        assert registered.status_code == 201
+        assert registered.json()["account"]["status"] == "pending"
+
+    # 错误码仍被拒绝
+    bad = client.post("/register", json={
+        "username": "mallory",
+        "display_name": "Mallory",
+        "password": "mallory-password-123",
+        "invite_code": "wrong-code",
+    })
+    assert bad.status_code == 400
+
+
+def test_team_code_absent_file_falls_back_to_invitations_only(tmp_path):
+    _app, client, _credentials = _bootstrapped_client(tmp_path)
+    registered = client.post("/register", json={
+        "username": "erin",
+        "display_name": "Erin",
+        "password": "erin-password-123",
+        "invite_code": "team-secret-2026",
+    })
+    assert registered.status_code == 400
