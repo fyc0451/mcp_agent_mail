@@ -459,6 +459,7 @@ async def test_human_inbox_http_list_and_mark_read(isolated_env, monkeypatch):
         assert {item["subject"] for item in items} == {"coordination"}
         assert {item["project_slug"] for item in items} == {"message-team"}
         assert all(item["sender_name"] == "BlueLake" for item in items)
+        assert all(item["sender_handle"] is None for item in items)
         assert all(item["read_ts"] is None for item in items)
 
         unread = await http.get("/hub/api/inbox?unread_only=true", headers=helen)

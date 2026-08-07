@@ -25,7 +25,7 @@ from fastapi.exception_handlers import http_exception_handler
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import select, text, update
+from sqlalchemy import and_, select, text, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError, NoResultFound
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -2716,6 +2716,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     Agent,
                     TeamProject,
                     Human,
+                    ProjectHumanMembership,
                     SessionLeadBinding,
                 )
                 .join(Message, cast(Any, Message.id) == HumanInboxItem.message_id)
@@ -2725,6 +2726,16 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     cast(Any, TeamProject.routing_project_id) == HumanInboxItem.project_id,
                 )
                 .outerjoin(Human, cast(Any, Human.id) == Agent.owner_id)
+                .outerjoin(
+                    ProjectHumanMembership,
+                    and_(
+                        cast(Any, ProjectHumanMembership.project_id)
+                        == HumanInboxItem.project_id,
+                        cast(Any, ProjectHumanMembership.human_id)
+                        == Agent.owner_id,
+                        cast(Any, ProjectHumanMembership.status) == "active",
+                    ),
+                )
                 .outerjoin(
                     SessionLeadBinding,
                     cast(Any, SessionLeadBinding.agent_id) == Agent.id,
@@ -2769,10 +2780,26 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                             else (None if sender.program == _SESSION_LEAD_PROGRAM else sender.name)
                         )
                     ),
+                    # Project-local handle is the only safe reply address. The
+                    # display name is not unique and must never be guessed as
+                    # a mention handle by Cockpit.
+                    "sender_handle": (
+                        sender_membership.mention_handle
+                        if sender_membership is not None
+                        else None
+                    ),
                     "read_ts": str(item.read_ts) if item.read_ts else None,
                     "created_ts": str(item.created_ts),
                 }
-                for item, message, sender, project, sender_human, lead_binding in rows.all()
+                for (
+                    item,
+                    message,
+                    sender,
+                    project,
+                    sender_human,
+                    sender_membership,
+                    lead_binding,
+                ) in rows.all()
             ]
             return JSONResponse({"items": items})
 

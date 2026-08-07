@@ -618,6 +618,7 @@ async def test_inbox_shows_human_and_lead_label_not_internal_name(hub):
         assert own["sender_name"] == "Alice"
         assert own["sender_kind"] == "session_lead"
         assert own["sender_agent"] == "codex-main"
+        assert own["sender_handle"] == "alice"
         assert lead_name not in str(own)
 
 
