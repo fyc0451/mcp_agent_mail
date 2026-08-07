@@ -324,3 +324,102 @@ def test_team_code_absent_file_falls_back_to_invitations_only(tmp_path):
         "invite_code": "team-secret-2026",
     })
     assert registered.status_code == 400
+
+
+def test_team_code_unicode_and_invalid_utf8_file(tmp_path):
+    _app, client, _credentials = _bootstrapped_client(tmp_path)
+    state = tmp_path / "state"
+    (state / "team-code").write_text("团队码-2026", encoding="utf-8")
+
+    ok = client.post("/register", json={
+        "username": "frank",
+        "display_name": "Frank",
+        "password": "frank-password-123",
+        "invite_code": "团队码-2026",
+    })
+    assert ok.status_code == 201
+
+    wrong = client.post("/register", json={
+        "username": "grace",
+        "display_name": "Grace",
+        "password": "grace-password-123",
+        "invite_code": "团队码-2027",
+    })
+    assert wrong.status_code == 400
+
+    # 非法 UTF-8 的团队码文件视为无效配置:通用 400,不得 500
+    (state / "team-code").write_bytes(b"\xff\xfe\x00bad")
+    invalid = client.post("/register", json={
+        "username": "heidi",
+        "display_name": "Heidi",
+        "password": "heidi-password-123",
+        "invite_code": "团队码-2026",
+    })
+    assert invalid.status_code == 400
+
+
+def test_team_code_matching_consumed_invitation_does_not_rewrite_audit(tmp_path):
+    app, client, credentials = _bootstrapped_client(tmp_path)
+    admin_secret = json.loads(credentials.read_text())
+    admin_token = client.post("/token", json=admin_secret).json()["access_token"]
+    invitation = client.post(
+        "/admin/invitations",
+        headers={"Authorization": f"Bearer {admin_token}"},
+        json={"expires_in": 3600},
+    )
+    invite_code = invitation.json()["invite_code"]
+
+    first = client.post("/register", json={
+        "username": "ivan",
+        "display_name": "Ivan",
+        "password": "ivan-password-123",
+        "invite_code": invite_code,
+    })
+    assert first.status_code == 201
+    with app.state.store._connect() as connection:
+        row = connection.execute(
+            "SELECT used_by, used_at FROM invitations"
+        ).fetchone()
+    assert row["used_by"] == "human:ivan"
+    original_used_at = row["used_at"]
+
+    # 团队码复用同一个值:可再注册,但不得改写已消费邀请码的审计字段
+    (tmp_path / "state" / "team-code").write_text(invite_code, encoding="utf-8")
+    second = client.post("/register", json={
+        "username": "judy",
+        "display_name": "Judy",
+        "password": "judy-password-123",
+        "invite_code": invite_code,
+    })
+    assert second.status_code == 201
+    with app.state.store._connect() as connection:
+        row = connection.execute(
+            "SELECT used_by, used_at FROM invitations"
+        ).fetchone()
+    assert row["used_by"] == "human:ivan"
+    assert row["used_at"] == original_used_at
+
+
+def test_register_failures_are_rate_limited_and_success_clears(tmp_path):
+    _app, client, _credentials = _bootstrapped_client(tmp_path)
+    (tmp_path / "state" / "team-code").write_text("team-secret-2026", encoding="utf-8")
+
+    def attempt(username, code):
+        return client.post("/register", json={
+            "username": username,
+            "display_name": username.title(),
+            "password": f"{username}-password-123",
+            "invite_code": code,
+        })
+
+    for i in range(4):
+        assert attempt(f"bad{i}", "wrong").status_code == 400
+    # 一次成功清零失败计数
+    assert attempt("kate", "team-secret-2026").status_code == 201
+    for i in range(4, 8):
+        assert attempt(f"bad{i}", "wrong").status_code == 400
+    # 连续第 5 次失败后被限流
+    assert attempt("bad8", "wrong").status_code == 400  # 第 5 次失败本身仍执行
+    assert attempt("bad9", "wrong").status_code == 429
+    # 限流期间即使团队码正确也拒绝
+    assert attempt("liam", "team-secret-2026").status_code == 429
