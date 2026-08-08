@@ -620,7 +620,9 @@ def _instrument_tool(
 
             if log_enabled:
                 try:
-                    clean_kwargs = {k: v for k, v in bound.arguments.items() if k != "ctx"}
+                    clean_kwargs = _redact_sensitive_params({
+                        k: v for k, v in bound.arguments.items() if k != "ctx"
+                    })
                     log_ctx = rich_logger.ToolCallContext(
                         tool_name=tool_name,
                         args=[],
@@ -859,7 +861,7 @@ def _instrument_tool(
                 if log_ctx is not None:
                     try:
                         log_ctx.end_time = time.perf_counter()
-                        log_ctx.result = result
+                        log_ctx.result = _redact_log_value(result)
                         log_ctx.error = error
                         log_ctx.success = error is None
                         if query_stats:
@@ -4119,6 +4121,33 @@ async def _ensure_agent_registration_token(
 
 
 _CAPABILITY_CHARS_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+# 敏感参数名：进 Rich 工具日志前统一脱敏，防止 capability/token 落日志
+_SENSITIVE_PARAM_RE = re.compile(r"(token|secret|capability|password|credential)", re.IGNORECASE)
+_REDACTED = "<redacted>"
+
+
+def _redact_sensitive_params(params: dict[str, Any]) -> dict[str, Any]:
+    """替换敏感参数值为占位符；仅用于日志展示，不改动实际参数。"""
+    return {
+        key: _REDACTED if _SENSITIVE_PARAM_RE.search(key) else value
+        for key, value in params.items()
+    }
+
+
+def _redact_log_value(value: Any) -> Any:
+    """递归脱敏日志值中的敏感键（结果面板同样不得出现 capability/token）。"""
+    if isinstance(value, dict):
+        return {
+            key: (
+                _REDACTED
+                if _SENSITIVE_PARAM_RE.search(str(key))
+                else _redact_log_value(item)
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_log_value(item) for item in value]
+    return value
 
 
 def _validate_rotated_capability(value: Any) -> str:
@@ -7713,7 +7742,8 @@ def build_mcp_server() -> FastMCP:
         actor = await _resolve_session_agent_for_project(ctx, project)
         actor_id = actor.id if actor is not None else agent.id
 
-        async with get_session() as session:
+        # BEGIN IMMEDIATE：串行化 read-check-write，杜绝并发轮换互相覆盖
+        async with get_immediate_session() as session:
             db_agent = await session.get(Agent, agent.id)
             if db_agent is None:
                 raise NoResultFound(f"Agent id '{agent.id}' no longer exists.")
