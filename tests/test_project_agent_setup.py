@@ -1159,3 +1159,34 @@ async def test_rotate_capability_concurrent_agents_same_new_value_single_success
                 _sm_select(AgentModel).where(AgentModel.registration_token == shared_new)
             )).scalars().all()
         assert len(rows) == 1, f"new 值出现 {len(rows)} 次，期望 1 次"
+
+
+@pytest.mark.asyncio
+async def test_rotate_capability_error_panel_redacts_sentinel(isolated_env, capsys, monkeypatch):
+    """异常文本含 capability 值：Rich error panel 不得泄漏（默认 logging=true）。"""
+    project_key = "/test/setup/rotate-error-redact"
+    server = build_mcp_server()
+    async with Client(server) as client:
+        await client.call_tool("ensure_project", {"human_key": project_key})
+        agent = await _register_with_token(client, project_key)
+        name, old = agent["name"], agent["registration_token"]
+        new_token = "z" * 43
+
+        from mcp_agent_mail import app as app_module
+
+        async def boom(*_args, **_kwargs):
+            raise RuntimeError(f"commit failed old={old} new={new_token}")
+
+        monkeypatch.setattr(app_module, "get_immediate_session", boom)
+        with pytest.raises(Exception):
+            await client.call_tool("rotate_agent_capability", {
+                "project_key": project_key,
+                "agent_name": name,
+                "old_registration_token": old,
+                "new_registration_token": new_token,
+            })
+
+        captured = capsys.readouterr()
+        combined = captured.out + captured.err
+        assert old not in combined
+        assert new_token not in combined

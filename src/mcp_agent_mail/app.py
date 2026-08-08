@@ -862,7 +862,16 @@ def _instrument_tool(
                     try:
                         log_ctx.end_time = time.perf_counter()
                         log_ctx.result = _redact_log_value(result)
-                        log_ctx.error = error
+                        if error is not None:
+                            sensitive_values = [
+                                value
+                                for key, value in bound.arguments.items()
+                                if _SENSITIVE_PARAM_RE.search(key)
+                                and isinstance(value, str)
+                            ]
+                            log_ctx.error = _LogSafeError(error, sensitive_values)
+                        else:
+                            log_ctx.error = None
                         log_ctx.success = error is None
                         if query_stats:
                             log_ctx.query_stats = query_stats
@@ -4148,6 +4157,28 @@ def _redact_log_value(value: Any) -> Any:
     if isinstance(value, list):
         return [_redact_log_value(item) for item in value]
     return value
+
+
+class _LogSafeError:
+    """日志专用 error 表示：文本/data 脱敏；客户端实际异常语义不变。"""
+
+    def __init__(self, error: Exception, sensitive_values: Sequence[str]):
+        self._error = error
+        self._sensitive = [value for value in sensitive_values if value]
+        self.log_error_type = type(error).__name__
+
+    @property
+    def error_code(self) -> Any:
+        return getattr(self._error, "error_code", None)
+
+    def safe_data(self) -> Any:
+        return _redact_log_value(getattr(self._error, "data", None))
+
+    def safe_str(self) -> str:
+        text = str(self._error)
+        for value in self._sensitive:
+            text = text.replace(value, _REDACTED)
+        return text
 
 
 def _validate_rotated_capability(value: Any) -> str:
