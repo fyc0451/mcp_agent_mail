@@ -20,6 +20,7 @@ Reference: mcp_agent_mail-mm2
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 from pathlib import Path
 
@@ -1172,10 +1173,14 @@ async def test_rotate_capability_error_panel_redacts_sentinel(isolated_env, caps
         name, old = agent["name"], agent["registration_token"]
         new_token = "z" * 43
 
+        from contextlib import asynccontextmanager
+
         from mcp_agent_mail import app as app_module
 
+        @asynccontextmanager
         async def boom(*_args, **_kwargs):
             raise RuntimeError(f"commit failed old={old} new={new_token}")
+            yield  # pragma: no cover
 
         monkeypatch.setattr(app_module, "get_immediate_session", boom)
         with pytest.raises(Exception):
@@ -1190,3 +1195,33 @@ async def test_rotate_capability_error_panel_redacts_sentinel(isolated_env, caps
         combined = captured.out + captured.err
         assert old not in combined
         assert new_token not in combined
+
+
+def test_log_safe_error_redacts_nested_data_and_panel():
+    """异常 data 嵌套 values/raw/message 字符串：safe_data 与渲染面板均无值。"""
+    from mcp_agent_mail.app import ToolExecutionError, _LogSafeError
+    from mcp_agent_mail.rich_logger import ToolCallContext, render_tool_call_panel
+
+    old = "old" + "x" * 40
+    new = "new" + "y" * 40
+    exc = ToolExecutionError(
+        "INVALID_ARGUMENT",
+        f"commit failed old={old} new={new}",
+        recoverable=True,
+        data={
+            "payload": {"values": [f"old={old}", f"nested={new}"]},
+            "raw": f"raw {new}",
+            "message": f"msg {old}",
+            "agent_name": "demo-main",
+        },
+    )
+    safe = _LogSafeError(exc, [old, new])
+    assert old not in safe.safe_str() and new not in safe.safe_str()
+    blob = json.dumps(safe.safe_data(), ensure_ascii=False)
+    assert old not in blob and new not in blob
+
+    ctx = ToolCallContext(tool_name="rotate_agent_capability", args=[], kwargs={})
+    ctx.error = safe
+    ctx.success = False
+    panel_text = render_tool_call_panel(ctx)
+    assert old not in panel_text and new not in panel_text

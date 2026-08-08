@@ -497,13 +497,15 @@ class ToolExecutionError(Exception):
         }
 
 
-def _record_tool_error(tool_name: str, exc: Exception) -> None:
+def _record_tool_error(
+    tool_name: str, exc: Exception, sensitive_values: Sequence[str] = ()
+) -> None:
     logger.warning(
         "tool_error",
         extra={
             "tool": tool_name,
             "error": type(exc).__name__,
-            "error_message": str(exc),
+            "error_message": _redact_log_value(str(exc), sensitive_values),
         },
     )
 
@@ -581,6 +583,12 @@ def _instrument_tool(
             bound = _bind_arguments(signature, args, kwargs)
             ctx = bound.arguments.get("ctx")
             format_value = bound.arguments.get("format")
+            # 敏感参数值：所有日志/错误记录统一按此文本脱敏
+            sensitive_values = [
+                value
+                for key, value in bound.arguments.items()
+                if _SENSITIVE_PARAM_RE.search(key) and isinstance(value, str)
+            ]
             # Pre-validate the output `format` BEFORE running the wrapped tool
             # (issue #177). Previously an invalid format was only caught while
             # encoding the result, so the tool's side effects (e.g. sending a
@@ -598,7 +606,7 @@ def _instrument_tool(
                     # This validation runs before the try/finally, so emit the
                     # structured error log here rather than silently skipping the
                     # instrumentation every other tool-error path goes through (#177).
-                    _record_tool_error(tool_name, _fmt_exc)
+                    _record_tool_error(tool_name, _fmt_exc, sensitive_values)
                     raise _fmt_exc
             if isinstance(ctx, Context) and meta["capabilities"]:
                 required_caps = set(cast(list[str], meta["capabilities"]))
@@ -666,13 +674,13 @@ def _instrument_tool(
                     )
             except ToolExecutionError as exc:
                 metrics["errors"] += 1
-                _record_tool_error(tool_name, exc)
+                _record_tool_error(tool_name, exc, sensitive_values)
                 error = exc
                 raise
             except NoResultFound as exc:
                 # Handle agent/project not found errors with helpful messages
                 metrics["errors"] += 1
-                _record_tool_error(tool_name, exc)
+                _record_tool_error(tool_name, exc, sensitive_values)
                 wrapped_exc = ToolExecutionError(
                     "NOT_FOUND",
                     str(exc),  # Use the original helpful error message
@@ -684,7 +692,7 @@ def _instrument_tool(
             except ValueError as exc:
                 # Invalid argument value
                 metrics["errors"] += 1
-                _record_tool_error(tool_name, exc)
+                _record_tool_error(tool_name, exc, sensitive_values)
                 wrapped_exc = ToolExecutionError(
                     "INVALID_ARGUMENT",
                     f"Invalid argument value: {exc}. Check that all parameters have valid values.",
@@ -696,7 +704,7 @@ def _instrument_tool(
             except TypeError as exc:
                 # Wrong argument type
                 metrics["errors"] += 1
-                _record_tool_error(tool_name, exc)
+                _record_tool_error(tool_name, exc, sensitive_values)
                 error_msg = str(exc)
                 # Try to extract helpful info from TypeError
                 hint = ""
@@ -717,7 +725,7 @@ def _instrument_tool(
             except KeyError as exc:
                 # Missing key/field
                 metrics["errors"] += 1
-                _record_tool_error(tool_name, exc)
+                _record_tool_error(tool_name, exc, sensitive_values)
                 wrapped_exc = ToolExecutionError(
                     "MISSING_FIELD",
                     f"Missing required field: {exc}. Ensure all required parameters are provided.",
@@ -729,7 +737,7 @@ def _instrument_tool(
             except SATimeoutError as exc:
                 # SQLAlchemy pool timeout (QueuePool exhausted)
                 metrics["errors"] += 1
-                _record_tool_error(tool_name, exc)
+                _record_tool_error(tool_name, exc, sensitive_values)
                 db_settings = settings.database
                 wrapped_exc = ToolExecutionError(
                     "DATABASE_POOL_EXHAUSTED",
@@ -748,7 +756,7 @@ def _instrument_tool(
             except TimeoutError as exc:
                 # Timeout (database lock, network, etc.)
                 metrics["errors"] += 1
-                _record_tool_error(tool_name, exc)
+                _record_tool_error(tool_name, exc, sensitive_values)
                 wrapped_exc = ToolExecutionError(
                     "TIMEOUT",
                     f"Operation timed out: {exc}. The server may be under heavy load. Try again in a moment.",
@@ -761,7 +769,7 @@ def _instrument_tool(
                 # Git index.lock contention (concurrent git operations)
                 # This is an expected error in multi-agent environments
                 metrics["errors"] += 1
-                _record_tool_error(tool_name, exc)
+                _record_tool_error(tool_name, exc, sensitive_values)
                 wrapped_exc = ToolExecutionError(
                     "GIT_INDEX_LOCK",
                     f"Git repository is temporarily locked by another operation. "
@@ -780,7 +788,7 @@ def _instrument_tool(
                 # Handle file descriptor exhaustion (EMFILE) with cache cleanup
                 import errno
                 metrics["errors"] += 1
-                _record_tool_error(tool_name, exc)
+                _record_tool_error(tool_name, exc, sensitive_values)
                 if exc.errno == errno.EMFILE:
                     # Clear repo cache to free file handles and allow recovery
                     cleared = clear_repo_cache()
@@ -793,18 +801,22 @@ def _instrument_tool(
                 else:
                     wrapped_exc = ToolExecutionError(
                         "OS_ERROR",
-                        f"OS error: {exc}",
+                        f"OS error: {_redact_log_value(str(exc), sensitive_values)}",
                         recoverable=False,
-                        data={"tool": tool_name, "errno": exc.errno, "error_detail": str(exc)},
+                        data={
+                            "tool": tool_name,
+                            "errno": exc.errno,
+                            "error_detail": _redact_log_value(str(exc), sensitive_values),
+                        },
                     )
                 error = wrapped_exc
                 raise wrapped_exc from exc
             except Exception as exc:
                 # Catch-all for unexpected errors - provide helpful categorization
                 metrics["errors"] += 1
-                _record_tool_error(tool_name, exc)
+                _record_tool_error(tool_name, exc, sensitive_values)
                 error_type = type(exc).__name__
-                error_msg = str(exc)
+                error_msg = _redact_log_value(str(exc), sensitive_values)
 
                 # Try to categorize common error patterns
                 if "database" in error_msg.lower() or "sqlite" in error_msg.lower():
@@ -832,10 +844,16 @@ def _instrument_tool(
                     error_category,
                     friendly_msg,
                     recoverable=recoverable,
-                    data={"tool": tool_name, "original_error": error_type, "error_detail": error_msg},
+                    data={
+                        "tool": tool_name,
+                        "original_error": error_type,
+                        "error_detail": error_msg,
+                    },
                 )
                 error = wrapped_exc
-                raise wrapped_exc from exc
+                # from None：原始异常链可能在 rich traceback 中携带敏感消息，
+                # 原始细节已脱敏写入 error_detail 与 _record_tool_error
+                raise wrapped_exc from None
             finally:
                 _record_recent(tool_name, project_value, agent_value)
 
@@ -861,14 +879,8 @@ def _instrument_tool(
                 if log_ctx is not None:
                     try:
                         log_ctx.end_time = time.perf_counter()
-                        log_ctx.result = _redact_log_value(result)
+                        log_ctx.result = _redact_log_value(result, sensitive_values)
                         if error is not None:
-                            sensitive_values = [
-                                value
-                                for key, value in bound.arguments.items()
-                                if _SENSITIVE_PARAM_RE.search(key)
-                                and isinstance(value, str)
-                            ]
                             log_ctx.error = _LogSafeError(error, sensitive_values)
                         else:
                             log_ctx.error = None
@@ -4143,19 +4155,23 @@ def _redact_sensitive_params(params: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _redact_log_value(value: Any) -> Any:
-    """递归脱敏日志值中的敏感键（结果面板同样不得出现 capability/token）。"""
+def _redact_log_value(value: Any, sensitive_values: Sequence[str] = ()) -> Any:
+    """递归脱敏日志值：敏感键替换为占位符，任意字符串中的敏感值文本一并替换。"""
     if isinstance(value, dict):
         return {
             key: (
                 _REDACTED
                 if _SENSITIVE_PARAM_RE.search(str(key))
-                else _redact_log_value(item)
+                else _redact_log_value(item, sensitive_values)
             )
             for key, item in value.items()
         }
     if isinstance(value, list):
-        return [_redact_log_value(item) for item in value]
+        return [_redact_log_value(item, sensitive_values) for item in value]
+    if isinstance(value, str):
+        for sensitive in sensitive_values:
+            if sensitive:
+                value = value.replace(sensitive, _REDACTED)
     return value
 
 
@@ -4172,13 +4188,10 @@ class _LogSafeError:
         return getattr(self._error, "error_code", None)
 
     def safe_data(self) -> Any:
-        return _redact_log_value(getattr(self._error, "data", None))
+        return _redact_log_value(getattr(self._error, "data", None), self._sensitive)
 
     def safe_str(self) -> str:
-        text = str(self._error)
-        for value in self._sensitive:
-            text = text.replace(value, _REDACTED)
-        return text
+        return _redact_log_value(str(self._error), self._sensitive)
 
 
 def _validate_rotated_capability(value: Any) -> str:
