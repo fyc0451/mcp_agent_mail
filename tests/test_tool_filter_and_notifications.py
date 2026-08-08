@@ -288,3 +288,39 @@ class TestNotifications:
         # Different agent should still work
         result3 = await emit_notification_signal(settings, "proj", "OtherAgent", {"id": 3})
         assert result3 is True
+
+
+class TestRotateCapabilityVisibility:
+    """rotate_agent_capability 的集群归属与 profile 可见性。"""
+
+    def test_rotate_capability_registered_in_identity_cluster(self, isolated_env):
+        from mcp_agent_mail.app import TOOL_CLUSTER_MAP
+
+        assert TOOL_CLUSTER_MAP["rotate_agent_capability"] == "identity"
+
+    def test_rotate_capability_exposed_in_full_and_core(self, isolated_env, monkeypatch):
+        from mcp_agent_mail.app import _should_expose_tool
+        from mcp_agent_mail.config import clear_settings_cache, get_settings
+
+        clear_settings_cache()
+        settings = get_settings()
+
+        # full profile（过滤关闭）：全部工具可见
+        assert _should_expose_tool("rotate_agent_capability", "identity", settings) is True
+
+        # core profile：identity cluster 整体可见
+        monkeypatch.setenv("TOOLS_FILTER_ENABLED", "true")
+        monkeypatch.setenv("TOOLS_FILTER_PROFILE", "core")
+        clear_settings_cache()
+
+        assert _should_expose_tool("rotate_agent_capability", "identity", get_settings()) is True
+
+    def test_rotate_capability_hidden_in_minimal_profile(self, isolated_env, monkeypatch):
+        from mcp_agent_mail.app import _should_expose_tool
+        from mcp_agent_mail.config import clear_settings_cache, get_settings
+
+        monkeypatch.setenv("TOOLS_FILTER_ENABLED", "true")
+        monkeypatch.setenv("TOOLS_FILTER_PROFILE", "minimal")
+        clear_settings_cache()
+
+        assert _should_expose_tool("rotate_agent_capability", "identity", get_settings()) is False

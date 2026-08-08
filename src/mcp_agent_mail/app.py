@@ -267,6 +267,7 @@ _HUB_AUDIT_OUTCOMES = frozenset(
         "already_retired",
         "restored",
         "already_active",
+        "capability_rotated",
     }
 )
 _HUB_AUDIT_REASONS = frozenset(
@@ -4117,6 +4118,32 @@ async def _ensure_agent_registration_token(
         return db_agent, str(token)
 
 
+_CAPABILITY_CHARS_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _validate_rotated_capability(value: Any) -> str:
+    """强校验轮换目标值：urlsafe-base64 字符集、32-64 长度（服务端自制 43）。"""
+    if not isinstance(value, str) or not value:
+        raise ToolExecutionError(
+            "INVALID_ARGUMENT",
+            "New registration capability must be a non-empty string.",
+            recoverable=True,
+        )
+    if len(value) < 32 or len(value) > 64:
+        raise ToolExecutionError(
+            "INVALID_ARGUMENT",
+            "New registration capability must be 32-64 urlsafe-base64 characters.",
+            recoverable=True,
+        )
+    if not _CAPABILITY_CHARS_RE.fullmatch(value):
+        raise ToolExecutionError(
+            "INVALID_ARGUMENT",
+            "New registration capability contains invalid characters.",
+            recoverable=True,
+        )
+    return value
+
+
 # ── M3a: human identity + project membership ──────────────────
 #
 # Service layer enforces the cross-row invariants a plain unique constraint
@@ -7633,6 +7660,120 @@ def build_mcp_server() -> FastMCP:
             "status": "retired",
             "agent_name": agent_name,
             "project_key": project_key,
+        }
+
+    @mcp.tool(
+        name="rotate_agent_capability",
+        description=(
+            "Rotate an agent's registration capability in place. The caller must present the CURRENT "
+            "capability (proof of custody); on success only the capability value changes and the agent "
+            "id/name/message history/unread/read/ack/retired state are preserved. The old value is "
+            "invalidated immediately and the new value authenticates whois/fetch. Never returns or logs "
+            "capability values."
+        ),
+    )
+    @_instrument_tool(
+        "rotate_agent_capability",
+        cluster=CLUSTER_IDENTITY,
+        capabilities={"identity"},
+        agent_arg="agent_name",
+        project_arg="project_key",
+    )
+    async def rotate_agent_capability(
+        ctx: Context,
+        project_key: str,
+        agent_name: str,
+        old_registration_token: str,
+        new_registration_token: str,
+    ) -> dict[str, Any]:
+        """Rotate an agent's registration capability in place (single-row update)."""
+        project = await _get_project_by_identifier(project_key)
+        if not project:
+            raise ValueError(f"Project '{project_key}' not found")
+
+        new_registration_token = _validate_rotated_capability(new_registration_token)
+        if old_registration_token == new_registration_token:
+            raise ToolExecutionError(
+                "INVALID_ARGUMENT",
+                "New registration capability must differ from the current one.",
+                recoverable=True,
+                data={"agent_name": agent_name, "project_key": project.human_key},
+            )
+
+        agent = await _authenticate_agent(
+            ctx,
+            project,
+            agent_name,
+            old_registration_token,
+            token_param="registration_token",
+            action="rotate_agent_capability",
+        )
+        if agent.id is None:
+            raise ValueError("Agent must have an id before rotating its capability.")
+        actor = await _resolve_session_agent_for_project(ctx, project)
+        actor_id = actor.id if actor is not None else agent.id
+
+        async with get_session() as session:
+            db_agent = await session.get(Agent, agent.id)
+            if db_agent is None:
+                raise NoResultFound(f"Agent id '{agent.id}' no longer exists.")
+            # 事务内重验旧值：鉴权与更新之间 token 不得被并发轮换（TOCTOU）
+            stored = (db_agent.registration_token or "").strip()
+            if not stored or not hmac.compare_digest(old_registration_token, stored):
+                raise ToolExecutionError(
+                    "AUTHENTICATION_REQUIRED",
+                    f"Current registration capability no longer matches agent '{db_agent.name}'.",
+                    recoverable=True,
+                    data={"agent_name": db_agent.name, "project_key": project.human_key},
+                )
+            other_tokens = await session.execute(
+                select(Agent).where(
+                    cast(Any, Agent.project_id) == db_agent.project_id,
+                    Agent.id != db_agent.id,
+                    cast(Any, Agent.registration_token).isnot(None),
+                )
+            )
+            for other in other_tokens.scalars().all():
+                if hmac.compare_digest(new_registration_token, other.registration_token or ""):
+                    raise ToolExecutionError(
+                        "INVALID_ARGUMENT",
+                        "New registration capability collides with another agent in this project.",
+                        recoverable=True,
+                        data={"agent_name": db_agent.name, "project_key": project.human_key},
+                    )
+            db_agent.registration_token = new_registration_token
+            session.add(db_agent)
+            await session.commit()
+            await session.refresh(db_agent)
+
+        if project.id is not None:
+            try:
+                audit_event = _new_hub_audit_event(
+                    project_id=project.id,
+                    actor_agent_id=actor_id,
+                    event_type="agent_lifecycle",
+                    source_type="agent",
+                    source_id=agent.id,
+                    outcome="capability_rotated",
+                    target_project_id=project.id,
+                    target_agent_id=agent.id,
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to build rotate-capability audit event agent_id=%s",
+                    agent.id,
+                    exc_info=True,
+                )
+            else:
+                await _record_hub_audit_events([audit_event])
+
+        await ctx.info(
+            f"Rotated registration capability for agent '{agent.name}' in project '{project.human_key}'."
+        )
+        return {
+            "status": "rotated",
+            "agent_name": agent.name,
+            "project_key": project.human_key,
         }
 
     @mcp.tool(
