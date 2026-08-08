@@ -1118,3 +1118,44 @@ async def test_rotate_capability_concurrent_same_old_token_single_success(isolat
                     "registration_token": loser,
                 })
             assert "registration_token" in str(exc_info.value).lower() or "invalid" in str(exc_info.value).lower()
+
+
+@pytest.mark.asyncio
+async def test_rotate_capability_concurrent_agents_same_new_value_single_success(isolated_env):
+    """两个 agent 并发轮换到同一 new capability：恰一个成功，最终无重复。"""
+    import asyncio
+
+    project_key = "/test/setup/rotate-concurrent-shared-new"
+    server = build_mcp_server()
+    async with Client(server) as client:
+        await client.call_tool("ensure_project", {"human_key": project_key})
+        agent_a = await _register_with_token(client, project_key)
+        agent_b = await _register_with_token(client, project_key)
+        shared_new = "s" * 43
+
+        results = await asyncio.gather(
+            client.call_tool("rotate_agent_capability", {
+                "project_key": project_key,
+                "agent_name": agent_a["name"],
+                "old_registration_token": agent_a["registration_token"],
+                "new_registration_token": shared_new,
+            }),
+            client.call_tool("rotate_agent_capability", {
+                "project_key": project_key,
+                "agent_name": agent_b["name"],
+                "old_registration_token": agent_b["registration_token"],
+                "new_registration_token": shared_new,
+            }),
+            return_exceptions=True,
+        )
+        successes = [r for r in results if not isinstance(r, Exception)]
+        assert len(successes) == 1, f"期望恰好一个成功，实际: {results!r}"
+
+        # 最终 DB 中该 new 值只能出现一次
+        from sqlmodel import select as _sm_select
+        from mcp_agent_mail.models import Agent as AgentModel
+        async with get_session() as session:
+            rows = (await session.execute(
+                _sm_select(AgentModel).where(AgentModel.registration_token == shared_new)
+            )).scalars().all()
+        assert len(rows) == 1, f"new 值出现 {len(rows)} 次，期望 1 次"
