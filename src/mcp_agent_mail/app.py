@@ -5572,6 +5572,7 @@ async def sweep_stale_agents(
     contact-wall stops piling up. It is conservative:
 
     - Skips agents that are already retired.
+    - Skips managed leads that still have an active session binding.
     - Skips agents whose `last_active_ts` is within the threshold.
     - Optionally scopes to a single project_id.
     - Optionally excludes one agent (used by the on-demand tool so callers
@@ -5597,6 +5598,15 @@ async def sweep_stale_agents(
             cast(Any, Agent.retired_at).is_(None),
             cast(Any, Agent.last_active_ts) < cutoff_naive,
         )
+        active_session_lead = (
+            select(SessionLeadBinding.id)
+            .where(
+                cast(Any, SessionLeadBinding.agent_id) == Agent.id,
+                cast(Any, SessionLeadBinding.status) == "active",
+            )
+            .correlate(Agent)
+        )
+        stmt = stmt.where(~exists(active_session_lead))
         if project_id is not None:
             stmt = stmt.where(cast(Any, Agent.project_id) == project_id)
         if exclude_agent_id is not None:

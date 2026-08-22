@@ -3306,8 +3306,17 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             if not hmac.compare_digest(binding.reply_token_hash, presented_hash):
                 raise _hub_reply_credentials_invalid()
             sender = await session.get(Agent, binding.agent_id)
-            if sender is None or sender.retired_at is not None:
+            if sender is None:
                 raise HTTPException(status_code=409, detail="Managed lead agent is unavailable")
+            if sender.retired_at is not None:
+                # An active binding with a valid capability is authoritative.
+                # Heal leads retired by older stale-agent sweep logic so an
+                # already-issued capability starts working again after deploy.
+                sender.retired_at = None
+                sender.last_active_ts = datetime.now(timezone.utc).replace(tzinfo=None)
+                session.add(sender)
+                await session.commit()
+                await session.refresh(sender)
 
             if mention_handles:
                 member_rows = await session.execute(

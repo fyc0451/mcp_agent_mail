@@ -13,6 +13,7 @@ Acceptance:
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from authlib.jose import jwt
@@ -20,13 +21,14 @@ from httpx import ASGITransport, AsyncClient
 from sqlmodel import select
 
 from mcp_agent_mail import config as _config
-from mcp_agent_mail.app import build_mcp_server
+from mcp_agent_mail.app import build_mcp_server, sweep_stale_agents
 from mcp_agent_mail.db import get_session
 from mcp_agent_mail.http import build_http_app
 from mcp_agent_mail.models import (
     Agent,
     ChannelMessage,
     HumanInboxItem,
+    SessionLeadBinding,
 )
 
 
@@ -227,6 +229,43 @@ async def test_reply_delivers_support_with_attribution_and_fallback(hub):
             assert len(items) == 1
             assert items[0].kind == "session_lead"
             assert items[0].source_channel_message_id == message.id
+
+
+@pytest.mark.anyio
+async def test_active_session_lead_survives_sweep_and_recovers_old_retirement(hub):
+    settings, app = hub
+    root = _headers(settings, "oidc|root", admin=True)
+    alice = _headers(settings, "oidc|alice")
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        await _setup_team(client, root)
+        alice_id = await _register_human(client, alice, "Alice")
+        await _join_active(client, root, alice, alice_id, "alice")
+        token = (await _mk_lead(client, alice, "wsl-1")).json()["reply_token"]
+
+        old = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=2)
+        async with get_session() as session:
+            binding = (await session.execute(select(SessionLeadBinding))).scalars().one()
+            lead = await session.get(Agent, binding.agent_id)
+            assert lead is not None
+            lead.last_active_ts = old
+            session.add(lead)
+            await session.commit()
+
+        assert await sweep_stale_agents(threshold_seconds=86_400) == []
+        async with get_session() as session:
+            lead = await session.get(Agent, binding.agent_id)
+            assert lead is not None and lead.retired_at is None
+            # Reproduce a database already damaged by the pre-fix sweeper.
+            lead.retired_at = old
+            session.add(lead)
+            await session.commit()
+
+        reply = await _reply(client, "wsl-1", token, subject="恢复通信")
+        assert reply.status_code == 201, reply.text
+        async with get_session() as session:
+            healed = await session.get(Agent, binding.agent_id)
+            assert healed is not None and healed.retired_at is None
 
 
 @pytest.mark.anyio
