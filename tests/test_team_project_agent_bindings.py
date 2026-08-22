@@ -209,6 +209,71 @@ async def test_global_admin_binds_without_membership(hub):
 
 
 @pytest.mark.anyio
+async def test_project_admin_provisions_invited_human_as_active_member_idempotently(hub):
+    settings, app = hub
+    admin = _headers(settings, "human:fyc", admin=True)
+    member = _headers(settings, "human:alice")
+    invited_member = _headers(settings, "human:bob")
+    outsider = _headers(settings, "human:mallory")
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        await _register_human(client, admin, "付彦超")
+        await _create_team(client, admin, "core", "fyc")
+
+        payload = {
+            "subject": "human:alice",
+            "display_name": "Alice",
+            "mention_handle": "alice",
+        }
+        created = await client.post(
+            "/hub/api/projects/core/members", headers=admin, json=payload,
+        )
+        assert created.status_code == 201
+        assert created.json()["status"] == "active"
+        assert created.json()["mention_handle"] == "alice"
+
+        repeated = await client.post(
+            "/hub/api/projects/core/members", headers=admin, json=payload,
+        )
+        assert repeated.status_code == 200
+        assert repeated.json()["id"] == created.json()["id"]
+
+        await _register_human(client, invited_member, "Bob")
+        invited = await client.post(
+            "/hub/api/projects/core/join-requests",
+            headers=invited_member,
+            json={"mention_handle": "bob"},
+        )
+        assert invited.status_code == 201
+        approved = await client.post(
+            "/hub/api/projects/core/members",
+            headers=admin,
+            json={
+                "subject": "human:bob",
+                "display_name": "Bob",
+                "mention_handle": "bob",
+            },
+        )
+        assert approved.status_code == 200
+        assert approved.json()["id"] == invited.json()["id"]
+        assert approved.json()["status"] == "active"
+
+        visible = await client.get("/hub/api/projects", headers=member)
+        assert visible.status_code == 200
+        core = next(item for item in visible.json()["projects"] if item["slug"] == "core")
+        assert core["membership"]["status"] == "active"
+
+        denied = await client.post(
+            "/hub/api/projects/core/members", headers=outsider, json={
+                "subject": "human:bob",
+                "display_name": "Bob",
+                "mention_handle": "bob",
+            },
+        )
+        assert denied.status_code in {403, 404}
+
+
+@pytest.mark.anyio
 async def test_non_admin_cannot_bind(hub):
     settings, app = hub
     alice = _headers(settings, "oidc|alice")

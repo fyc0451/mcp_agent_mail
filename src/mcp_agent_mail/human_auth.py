@@ -29,6 +29,7 @@ from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
 _USERNAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_PROJECT_SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 _PASSWORD_MIN_BYTES = 12
 _PASSWORD_MAX_BYTES = 256
 _SCRYPT_N = 2**14
@@ -64,6 +65,7 @@ class RegistrationRequest(BaseModel):
 
 class InvitationRequest(BaseModel):
     expires_in: int = Field(default=24 * 60 * 60, ge=300, le=7 * 24 * 60 * 60)
+    project_slug: str | None = Field(default=None, min_length=1, max_length=128)
 
 
 class UserStatusRequest(BaseModel):
@@ -185,6 +187,10 @@ class HumanAuthStore:
                     "UPDATE users SET created_at = ? WHERE created_at = 0",
                     (int(time.time()),),
                 )
+            if "requested_project_slug" not in columns:
+                connection.execute(
+                    "ALTER TABLE users ADD COLUMN requested_project_slug TEXT"
+                )
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS invitations (
@@ -197,6 +203,14 @@ class HumanAuthStore:
                 )
                 """
             )
+            invitation_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(invitations)").fetchall()
+            }
+            if "project_slug" not in invitation_columns:
+                connection.execute(
+                    "ALTER TABLE invitations ADD COLUMN project_slug TEXT"
+                )
         self.db_path.chmod(0o600)
 
     def _load_or_create_key(self):
@@ -284,7 +298,13 @@ class HumanAuthStore:
                 (subject,),
             ).fetchone()
 
-    def create_invitation(self, *, created_by: str, expires_in: int) -> dict[str, Any]:
+    def create_invitation(
+        self, *, created_by: str, expires_in: int, project_slug: str | None = None
+    ) -> dict[str, Any]:
+        if project_slug is not None:
+            project_slug = project_slug.strip().lower()
+            if not _PROJECT_SLUG_RE.fullmatch(project_slug):
+                raise ValueError("Invalid project slug")
         now = int(time.time())
         code = secrets.token_urlsafe(24)
         code_hash = hashlib.sha256(code.encode("utf-8")).hexdigest()
@@ -292,12 +312,17 @@ class HumanAuthStore:
         with self._connect() as connection:
             connection.execute(
                 """
-                INSERT INTO invitations(code_hash, created_by, created_at, expires_at)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO invitations(
+                    code_hash, created_by, created_at, expires_at, project_slug
+                ) VALUES (?, ?, ?, ?, ?)
                 """,
-                (code_hash, created_by, now, expires_at),
+                (code_hash, created_by, now, expires_at, project_slug),
             )
-        return {"invite_code": code, "expires_at": expires_at}
+        return {
+            "invite_code": code,
+            "expires_at": expires_at,
+            "project_slug": project_slug,
+        }
 
     def register(
         self,
@@ -319,7 +344,7 @@ class HumanAuthStore:
             connection.execute("BEGIN IMMEDIATE")
             invitation = connection.execute(
                 """
-                SELECT code_hash FROM invitations
+                SELECT code_hash, project_slug FROM invitations
                 WHERE code_hash = ? AND used_at IS NULL AND expires_at >= ?
                 """,
                 (code_hash, now),
@@ -336,8 +361,8 @@ class HumanAuthStore:
                 """
                 INSERT INTO users(
                     subject, username, display_name, password_hash, roles_json,
-                    active, status, created_at
-                ) VALUES (?, ?, ?, ?, ?, 0, 'pending', ?)
+                    active, status, created_at, requested_project_slug
+                ) VALUES (?, ?, ?, ?, ?, 0, 'pending', ?, ?)
                 """,
                 (
                     subject,
@@ -346,28 +371,37 @@ class HumanAuthStore:
                     _password_hash(password),
                     json.dumps(["writer"]),
                     now,
+                    invitation["project_slug"],
                 ),
             )
             connection.execute(
                 "UPDATE invitations SET used_by = ?, used_at = ? WHERE code_hash = ?",
                 (subject, now, code_hash),
             )
-        return {"username": username, "display_name": display_name, "status": "pending"}
+        return {
+            "username": username,
+            "display_name": display_name,
+            "status": "pending",
+            "requested_project_slug": invitation["project_slug"],
+        }
 
     def list_users(self) -> list[dict[str, Any]]:
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT username, display_name, roles_json, status, created_at
+                SELECT subject, username, display_name, roles_json, status,
+                       created_at, requested_project_slug
                 FROM users ORDER BY created_at, username
                 """
             ).fetchall()
         return [
             {
+                "subject": row["subject"],
                 "username": row["username"],
                 "display_name": row["display_name"],
                 "roles": json.loads(row["roles_json"]),
                 "status": row["status"],
+                "requested_project_slug": row["requested_project_slug"],
                 "created_at": row["created_at"],
             }
             for row in rows
@@ -382,7 +416,8 @@ class HumanAuthStore:
         with self._connect() as connection:
             target = connection.execute(
                 """
-                SELECT subject, username, display_name, roles_json, status, created_at
+                SELECT subject, username, display_name, roles_json, status,
+                       created_at, requested_project_slug
                 FROM users WHERE username = ?
                 """,
                 (username,),
@@ -398,10 +433,12 @@ class HumanAuthStore:
                 (status, 1 if status == "active" else 0, target["subject"]),
             )
         return {
+            "subject": target["subject"],
             "username": target["username"],
             "display_name": target["display_name"],
             "roles": json.loads(target["roles_json"]),
             "status": status,
+            "requested_project_slug": target["requested_project_slug"],
             "created_at": target["created_at"],
         }
 
@@ -539,9 +576,14 @@ def create_app(config: HumanAuthConfig) -> FastAPI:
         request: Request, body: InvitationRequest
     ) -> dict[str, Any]:
         admin_user = authenticated_user(request, admin=True)
-        return store.create_invitation(
-            created_by=admin_user["subject"], expires_in=body.expires_in
-        )
+        try:
+            return store.create_invitation(
+                created_by=admin_user["subject"],
+                expires_in=body.expires_in,
+                project_slug=body.project_slug,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.get("/admin/users")
     async def list_users(request: Request) -> dict[str, Any]:

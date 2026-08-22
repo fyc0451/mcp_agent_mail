@@ -111,10 +111,11 @@ def test_invitation_registration_approval_and_disable(tmp_path):
     invitation = client.post(
         "/admin/invitations",
         headers=admin_headers,
-        json={"expires_in": 3600},
+        json={"expires_in": 3600, "project_slug": "core-team"},
     )
     assert invitation.status_code == 201
     invite_code = invitation.json()["invite_code"]
+    assert invitation.json()["project_slug"] == "core-team"
     assert invite_code not in client.get("/admin/users", headers=admin_headers).text
     with app.state.store._connect() as connection:
         stored_invitation = connection.execute(
@@ -134,6 +135,7 @@ def test_invitation_registration_approval_and_disable(tmp_path):
         "username": "alice",
         "display_name": "Alice",
         "status": "pending",
+        "requested_project_slug": "core-team",
     }
     assert client.post("/register", json={**registration, "username": "bob"}).status_code == 400
     assert client.post(
@@ -146,6 +148,8 @@ def test_invitation_registration_approval_and_disable(tmp_path):
     alice = next(user for user in users.json()["users"] if user["username"] == "alice")
     assert alice["status"] == "pending"
     assert alice["roles"] == ["writer"]
+    assert alice["subject"] == "human:alice"
+    assert alice["requested_project_slug"] == "core-team"
 
     approved = client.patch(
         "/admin/users/alice",
@@ -206,6 +210,11 @@ def test_invitation_admin_guards_and_invalid_code(tmp_path):
         headers=admin_headers,
         json={"expires_in": 60},
     ).status_code == 422
+    assert client.post(
+        "/admin/invitations",
+        headers=admin_headers,
+        json={"expires_in": 3600, "project_slug": "bad/project"},
+    ).status_code == 400
     assert client.patch(
         "/admin/users/fyc",
         headers=admin_headers,
@@ -251,10 +260,12 @@ def test_existing_user_database_is_migrated_without_recreating_accounts(tmp_path
     users = app.state.store.list_users()
     assert users == [
         {
+            "subject": "human:fyc",
             "username": "fyc",
             "display_name": "付彦超",
             "roles": ["writer", "admin"],
             "status": "active",
+            "requested_project_slug": None,
             "created_at": users[0]["created_at"],
         }
     ]
