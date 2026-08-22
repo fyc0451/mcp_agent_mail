@@ -2241,6 +2241,68 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 members.append(payload)
             return JSONResponse({"members": members})
 
+    @fastapi_app.post(
+        "/hub/api/projects/{project_slug}/members",
+        response_class=JSONResponse,
+        status_code=201,
+    )
+    async def hub_provision_member(project_slug: str, request: Request) -> JSONResponse:
+        """Project admin accepts an issuer-approved invitation target.
+
+        Provisioning is idempotent so Cockpit can safely retry before it
+        activates the Human Auth account.
+        """
+        await ensure_schema()
+        body = await _hub_json_body(request)
+        if set(body) != {"subject", "display_name", "mention_handle"}:
+            raise HTTPException(
+                status_code=400,
+                detail="subject, display_name and mention_handle are required",
+            )
+        subject = body.get("subject")
+        display_name = body.get("display_name")
+        if not isinstance(subject, str) or not subject.strip() or len(subject.strip()) > 255:
+            raise HTTPException(status_code=400, detail="Invalid Human subject")
+        if (
+            not isinstance(display_name, str)
+            or not display_name.strip()
+            or len(display_name.strip()) > 255
+        ):
+            raise HTTPException(status_code=400, detail="Invalid Human display name")
+        mention_handle = _hub_mention_handle(body.get("mention_handle"))
+        async with get_session() as session:
+            actor = await _hub_human(request, session=session)
+            project = await _hub_project(project_slug, session=session)
+            await _hub_active_membership(project, actor, session=session, admin=True)
+            existing_human = await _human_by_subject(subject.strip(), session=session)
+            existing = None
+            if existing_human is not None and existing_human.id is not None and project.id is not None:
+                existing = await _hub_membership(
+                    project.id, existing_human.id, session=session,
+                )
+            try:
+                membership = await _upsert_project_human_membership(
+                    project=project,
+                    subject=subject.strip(),
+                    display_name=display_name.strip(),
+                    mention_handle=mention_handle,
+                    role="admin" if existing is not None and existing.role == "admin" else "member",
+                    status="active",
+                    session=session,
+                )
+                await session.commit()
+            except ValueError as exc:
+                await session.rollback()
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            except IntegrityError as exc:
+                await session.rollback()
+                raise HTTPException(status_code=409, detail="Membership conflict") from exc
+            await session.refresh(membership)
+            return JSONResponse(
+                _hub_membership_payload(membership),
+                status_code=200 if existing is not None else 201,
+            )
+
     @fastapi_app.patch(
         "/hub/api/projects/{project_slug}/members/{human_id}",
         response_class=JSONResponse,
