@@ -3612,12 +3612,14 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             "decided_at": str(draft.decided_at) if draft.decided_at else None,
         }
 
-    def _reply_request_payload(item: HumanInboxItem) -> dict[str, Any]:
+    def _reply_request_payload(
+        item: HumanInboxItem, *, reply_mode: str = "confirm"
+    ) -> dict[str, Any]:
         if item.reply_decision == "ignored":
             request_status = "ignored"
         elif item.completed_at is not None:
             request_status = "replied"
-        elif item.reply_decision in {"approved", "auto"}:
+        elif item.reply_decision in {"approved", "auto"} or reply_mode == "auto":
             now = datetime.now(timezone.utc).replace(tzinfo=None)
             request_status = (
                 "processing"
@@ -3632,7 +3634,11 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             "inbox_item_id": item.id,
             "message_id": item.source_channel_message_id,
             "status": request_status,
-            "decision": item.reply_decision,
+            "decision": (
+                item.reply_decision
+                if item.reply_decision is not None
+                else ("auto" if reply_mode == "auto" else None)
+            ),
             "decided_at": (
                 str(item.reply_decided_at) if item.reply_decided_at else None
             ),
@@ -3687,7 +3693,21 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             project = await session.get(Project, team_project.routing_project_id)
             if project is None or project.archived_at is not None:
                 raise HTTPException(status_code=404, detail="Project not found")
-            await _hub_active_membership(project, human, session=session)
+            membership = await _hub_active_membership(project, human, session=session)
+            binding = (
+                await session.execute(
+                    select(SessionLeadBinding).where(
+                        cast(Any, SessionLeadBinding.team_project_id)
+                        == team_project.id,
+                        cast(Any, SessionLeadBinding.human_id) == human.id,
+                        cast(Any, SessionLeadBinding.status) == "active",
+                    )
+                )
+            ).scalars().first()
+            if binding is None or membership.default_agent_id != binding.agent_id:
+                raise HTTPException(
+                    status_code=409, detail="Session lead is unavailable"
+                )
             rows = await session.execute(
                 select(HumanInboxItem)
                 .where(
@@ -3701,7 +3721,9 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             return JSONResponse(
                 {
                     "requests": [
-                        _reply_request_payload(item)
+                        _reply_request_payload(
+                            item, reply_mode=binding.reply_mode
+                        )
                         for item in rows.scalars().all()
                     ]
                 }
@@ -3722,10 +3744,6 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             _, binding, item = await _human_reply_request_context(
                 project_slug, inbox_item_id, request, session=session
             )
-            if binding.reply_mode != "confirm":
-                raise HTTPException(
-                    status_code=409, detail="Automatic reply mode is enabled"
-                )
             if item.reply_decision == "ignored":
                 raise HTTPException(status_code=409, detail="Reply request was ignored")
             if item.completed_at is not None:
@@ -3733,7 +3751,9 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             replay = item.reply_decision in {"approved", "auto"}
             if not replay:
                 now = datetime.now(timezone.utc).replace(tzinfo=None)
-                item.reply_decision = "approved"
+                item.reply_decision = (
+                    "auto" if binding.reply_mode == "auto" else "approved"
+                )
                 item.reply_decided_at = now
                 item.claim_binding_id = None
                 item.claim_token_hash = None
@@ -3744,7 +3764,9 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             return JSONResponse(
                 {
                     "status": "already_approved" if replay else "approved",
-                    "request": _reply_request_payload(item),
+                    "request": _reply_request_payload(
+                        item, reply_mode=binding.reply_mode
+                    ),
                 },
                 status_code=200 if replay else 201,
             )
@@ -3764,15 +3786,13 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             _, binding, item = await _human_reply_request_context(
                 project_slug, inbox_item_id, request, session=session
             )
-            if binding.reply_mode != "confirm":
-                raise HTTPException(
-                    status_code=409, detail="Automatic reply mode is enabled"
-                )
             if item.reply_decision == "ignored":
                 return JSONResponse(
                     {
                         "status": "already_ignored",
-                        "request": _reply_request_payload(item),
+                        "request": _reply_request_payload(
+                            item, reply_mode=binding.reply_mode
+                        ),
                     }
                 )
             if item.completed_at is not None:
@@ -3798,7 +3818,9 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             return JSONResponse(
                 {
                     "status": "ignored",
-                    "request": _reply_request_payload(item),
+                    "request": _reply_request_payload(
+                        item, reply_mode=binding.reply_mode
+                    ),
                 },
                 status_code=201,
             )

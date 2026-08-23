@@ -661,15 +661,29 @@ async def test_reply_mode_switch_rotates_capability_and_auto_sends(hub):
     settings, app = hub
     root = _headers(settings, "oidc|root", admin=True)
     alice = _headers(settings, "oidc|alice")
+    bob = _headers(settings, "oidc|bob")
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         await _setup_team(client, root)
         alice_id = await _register_human(client, alice, "Alice")
+        bob_id = await _register_human(client, bob, "Bob")
         await _join_active(client, root, alice, alice_id, "alice")
+        await _join_active(client, root, bob, bob_id, "bob")
+        await _mk_lead(client, bob, "bob-1")
         confirm = await _mk_lead(
             client, alice, "alice-1", reply_mode="confirm"
         )
         old_token = confirm.json()["reply_token"]
+        incoming = await client.post(
+            "/hub/api/projects/core/support-requests",
+            headers=bob,
+            json={
+                "subject": "切换竞态",
+                "body_md": "切到 auto 后不得显示 confirm 错误",
+                "mention_handles": ["alice"],
+            },
+        )
+        assert incoming.status_code == 201
 
         switched = await client.put(
             "/hub/api/projects/core/session-lead",
@@ -685,6 +699,38 @@ async def test_reply_mode_switch_rotates_capability_and_auto_sends(hub):
         new_token = switched.json()["reply_token"]
         assert new_token != old_token
         assert (await _reply(client, "alice-1", old_token)).status_code == 403
+        requests = await client.get(
+            "/hub/api/projects/core/reply-requests", headers=alice
+        )
+        request_row = next(
+            item
+            for item in requests.json()["requests"]
+            if item["message_id"] == incoming.json()["message_id"]
+        )
+        assert request_row["status"] == "queued"
+        assert request_row["decision"] == "auto"
+        stale_click = await client.post(
+            f"/hub/api/projects/core/reply-requests/{request_row['inbox_item_id']}/approve",
+            headers=alice,
+        )
+        assert stale_click.status_code == 201
+        assert stale_click.json()["request"]["decision"] == "auto"
+        claim = await client.post(
+            "/hub/api/projects/core/session-lead/inbox/claim",
+            json={"client_session_id": "alice-1", "reply_token": new_token},
+        )
+        assert claim.status_code == 201
+        replied = await _reply(
+            client,
+            "alice-1",
+            new_token,
+            subject="竞态已处理",
+            mentions=["bob"],
+            idem="auto-inbox-1",
+            inbox_item_id=claim.json()["message"]["inbox_item_id"],
+            claim_token=claim.json()["claim_token"],
+        )
+        assert replied.status_code == 201, replied.text
         direct = await _reply(
             client,
             "alice-1",
