@@ -72,6 +72,10 @@ class UserStatusRequest(BaseModel):
     status: str = Field(min_length=1, max_length=16)
 
 
+class PasswordChangeRequest(BaseModel):
+    new_password: str = Field(min_length=1, max_length=256)
+
+
 def _b64(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
 
@@ -278,6 +282,19 @@ class HumanAuthStore:
         if not _password_matches(password, stored_hash):
             return None
         return row
+
+    def change_password(self, *, subject: str, new_password: str) -> None:
+        password_hash = _password_hash(new_password)
+        with self._connect() as connection:
+            result = connection.execute(
+                """
+                UPDATE users SET password_hash = ?
+                WHERE subject = ? AND active = 1 AND status = 'active'
+                """,
+                (password_hash, subject),
+            )
+            if result.rowcount != 1:
+                raise LookupError("User not found")
 
     @staticmethod
     def profile(user: sqlite3.Row) -> dict[str, Any]:
@@ -555,6 +572,21 @@ def create_app(config: HumanAuthConfig) -> FastAPI:
     @app.get("/me")
     async def me(request: Request) -> dict[str, Any]:
         return {"profile": store.profile(authenticated_user(request))}
+
+    @app.patch("/me/password")
+    async def change_password(
+        request: Request, body: PasswordChangeRequest
+    ) -> dict[str, bool]:
+        user = authenticated_user(request)
+        try:
+            store.change_password(
+                subject=user["subject"], new_password=body.new_password
+            )
+        except LookupError as exc:
+            raise HTTPException(status_code=401, detail="Authentication required") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"ok": True}
 
     @app.post("/register", status_code=201)
     async def register(body: RegistrationRequest) -> dict[str, Any]:
