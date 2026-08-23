@@ -114,6 +114,9 @@ def _reply(client: AsyncClient, session_id: str, token: str, **kw):
         payload["mention_handles"] = kw["mentions"]
     if kw.get("idem"):
         payload["idempotency_key"] = kw["idem"]
+    if kw.get("inbox_item_id"):
+        payload["inbox_item_id"] = kw["inbox_item_id"]
+        payload["claim_token"] = kw["claim_token"]
     return client.post("/hub/api/projects/core/session-lead/reply", json=payload)
 
 
@@ -435,7 +438,7 @@ async def test_rotate_reply_token_requires_bool(hub):
 
 
 @pytest.mark.anyio
-async def test_confirm_claim_draft_approve_reject_and_complete(hub):
+async def test_confirm_authorizes_before_claim_reply_and_complete(hub):
     settings, app = hub
     root = _headers(settings, "oidc|root", admin=True)
     alice = _headers(settings, "oidc|alice")
@@ -464,6 +467,41 @@ async def test_confirm_claim_draft_approve_reject_and_complete(hub):
         )
         assert incoming.status_code == 201, incoming.text
 
+        blocked_claim = await client.post(
+            "/hub/api/projects/core/session-lead/inbox/claim",
+            json={"client_session_id": "alice-1", "reply_token": alice_token},
+        )
+        assert blocked_claim.status_code == 200
+        assert blocked_claim.json() == {"status": "empty", "message": None}
+
+        requests = await client.get(
+            "/hub/api/projects/core/reply-requests", headers=alice
+        )
+        assert requests.status_code == 200
+        request_row = requests.json()["requests"][0]
+        assert request_row["message_id"] == incoming.json()["message_id"]
+        assert request_row["status"] == "awaiting_confirmation"
+        inbox_item_id = request_row["inbox_item_id"]
+
+        forbidden = await client.post(
+            f"/hub/api/projects/core/reply-requests/{inbox_item_id}/approve",
+            headers=bob,
+        )
+        assert forbidden.status_code == 404
+
+        approved = await client.post(
+            f"/hub/api/projects/core/reply-requests/{inbox_item_id}/approve",
+            headers=alice,
+        )
+        assert approved.status_code == 201, approved.text
+        assert approved.json()["request"]["status"] == "queued"
+        approved_again = await client.post(
+            f"/hub/api/projects/core/reply-requests/{inbox_item_id}/approve",
+            headers=alice,
+        )
+        assert approved_again.status_code == 200
+        assert approved_again.json()["status"] == "already_approved"
+
         claim = await client.post(
             "/hub/api/projects/core/session-lead/inbox/claim",
             json={"client_session_id": "alice-1", "reply_token": alice_token},
@@ -473,8 +511,23 @@ async def test_confirm_claim_draft_approve_reject_and_complete(hub):
         assert claimed["reply_mode"] == "confirm"
         assert claimed["message"]["subject"] == "需要处理"
         assert claimed["message"]["sender_handle"] == "bob"
-        inbox_item_id = claimed["message"]["inbox_item_id"]
+        assert claimed["message"]["inbox_item_id"] == inbox_item_id
         claim_token = claimed["claim_token"]
+
+        retired_draft = await client.post(
+            "/hub/api/projects/core/session-lead/reply-drafts",
+            json={
+                "client_session_id": "alice-1",
+                "reply_token": alice_token,
+                "inbox_item_id": inbox_item_id,
+                "claim_token": claim_token,
+                "subject": "旧草稿",
+                "body_md": "不得再生成后审批",
+                "mention_handles": ["bob"],
+                "idempotency_key": "retired-draft",
+            },
+        )
+        assert retired_draft.status_code == 410
 
         blocked = await _reply(
             client,
@@ -486,48 +539,31 @@ async def test_confirm_claim_draft_approve_reject_and_complete(hub):
         assert blocked.status_code == 409
         assert blocked.json()["detail"] == "Human confirmation is required"
 
-        draft_payload = {
-            "client_session_id": "alice-1",
-            "reply_token": alice_token,
-            "inbox_item_id": inbox_item_id,
-            "claim_token": claim_token,
-            "subject": "确认后回复",
-            "body_md": "已处理",
-            "mention_handles": ["bob"],
-            "idempotency_key": "draft-1",
-        }
-        draft = await client.post(
-            "/hub/api/projects/core/session-lead/reply-drafts",
-            json=draft_payload,
+        sent = await _reply(
+            client,
+            "alice-1",
+            alice_token,
+            subject="确认后回复",
+            body="已处理",
+            mentions=["bob"],
+            idem="reply-1",
+            inbox_item_id=inbox_item_id,
+            claim_token=claim_token,
         )
-        assert draft.status_code == 201, draft.text
-        draft_id = draft.json()["draft"]["id"]
-        replay = await client.post(
-            "/hub/api/projects/core/session-lead/reply-drafts",
-            json=draft_payload,
+        assert sent.status_code == 201, sent.text
+        replay = await _reply(
+            client,
+            "alice-1",
+            alice_token,
+            subject="确认后回复",
+            body="已处理",
+            mentions=["bob"],
+            idem="reply-1",
+            inbox_item_id=inbox_item_id,
+            claim_token=claim_token,
         )
         assert replay.status_code == 200
-        assert replay.json()["status"] == "already_exists"
-        assert replay.json()["draft"]["id"] == draft_id
-
-        listed = await client.get(
-            "/hub/api/projects/core/reply-drafts", headers=alice
-        )
-        assert listed.status_code == 200
-        assert [item["id"] for item in listed.json()["drafts"]] == [draft_id]
-
-        approved = await client.post(
-            f"/hub/api/projects/core/reply-drafts/{draft_id}/approve",
-            headers=alice,
-        )
-        assert approved.status_code == 201, approved.text
-        assert approved.json()["status"] == "approved"
-        approved_again = await client.post(
-            f"/hub/api/projects/core/reply-drafts/{draft_id}/approve",
-            headers=alice,
-        )
-        assert approved_again.status_code == 200
-        assert approved_again.json()["status"] == "already_approved"
+        assert replay.json()["status"] == "already_delivered"
 
         denied_complete = await client.post(
             f"/hub/api/projects/core/session-lead/inbox/{inbox_item_id}/complete",
@@ -569,36 +605,37 @@ async def test_confirm_claim_draft_approve_reject_and_complete(hub):
             },
         )
         assert second_incoming.status_code == 201
+        second_requests = await client.get(
+            "/hub/api/projects/core/reply-requests", headers=alice
+        )
+        second_request = next(
+            item
+            for item in second_requests.json()["requests"]
+            if item["message_id"] == second_incoming.json()["message_id"]
+        )
+        rejected = await client.post(
+            f"/hub/api/projects/core/reply-requests/{second_request['inbox_item_id']}/reject",
+            headers=alice,
+        )
+        assert rejected.status_code == 201
+        assert rejected.json()["status"] == "ignored"
+        rejected_again = await client.post(
+            f"/hub/api/projects/core/reply-requests/{second_request['inbox_item_id']}/reject",
+            headers=alice,
+        )
+        assert rejected_again.status_code == 200
+        assert rejected_again.json()["status"] == "already_ignored"
+        cannot_approve = await client.post(
+            f"/hub/api/projects/core/reply-requests/{second_request['inbox_item_id']}/approve",
+            headers=alice,
+        )
+        assert cannot_approve.status_code == 409
         second_claim = await client.post(
             "/hub/api/projects/core/session-lead/inbox/claim",
             json={"client_session_id": "alice-1", "reply_token": alice_token},
         )
-        second = second_claim.json()
-        second_draft = await client.post(
-            "/hub/api/projects/core/session-lead/reply-drafts",
-            json={
-                "client_session_id": "alice-1",
-                "reply_token": alice_token,
-                "inbox_item_id": second["message"]["inbox_item_id"],
-                "claim_token": second["claim_token"],
-                "subject": "拒绝草稿",
-                "body_md": "不会发送",
-                "mention_handles": ["bob"],
-                "idempotency_key": "draft-2",
-            },
-        )
-        second_draft_id = second_draft.json()["draft"]["id"]
-        rejected = await client.post(
-            f"/hub/api/projects/core/reply-drafts/{second_draft_id}/reject",
-            headers=alice,
-        )
-        assert rejected.status_code == 200
-        assert rejected.json()["status"] == "rejected"
-        cannot_approve = await client.post(
-            f"/hub/api/projects/core/reply-drafts/{second_draft_id}/approve",
-            headers=alice,
-        )
-        assert cannot_approve.status_code == 409
+        assert second_claim.status_code == 200
+        assert second_claim.json()["status"] == "empty"
 
         async with get_session() as session:
             sent = (
@@ -608,15 +645,15 @@ async def test_confirm_claim_draft_approve_reject_and_complete(hub):
                     )
                 )
             ).scalars().all()
-            rejected_messages = (
+            ignored_messages = (
                 await session.execute(
                     select(ChannelMessage).where(
-                        ChannelMessage.subject == "拒绝草稿"
+                        ChannelMessage.subject == "拒绝回复"
                     )
                 )
             ).scalars().all()
             assert len(sent) == 1
-            assert rejected_messages == []
+            assert ignored_messages == []
 
 
 @pytest.mark.anyio

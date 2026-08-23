@@ -951,6 +951,9 @@ def _setup_fts(connection: Any) -> None:
         "ALTER TABLE human_inbox_items ADD COLUMN claim_token_hash VARCHAR(64) DEFAULT NULL",
         "ALTER TABLE human_inbox_items ADD COLUMN claim_expires_at DATETIME DEFAULT NULL",
         "ALTER TABLE human_inbox_items ADD COLUMN completed_at DATETIME DEFAULT NULL",
+        # M4.1: confirm mode authorizes work before the Lead reads/generates.
+        "ALTER TABLE human_inbox_items ADD COLUMN reply_decision VARCHAR(16) DEFAULT NULL",
+        "ALTER TABLE human_inbox_items ADD COLUMN reply_decided_at DATETIME DEFAULT NULL",
     ]:
         with suppress(Exception):  # Column already exists — safe to ignore
             connection.exec_driver_sql(migration_sql)
@@ -971,6 +974,8 @@ def _setup_fts(connection: Any) -> None:
         "ON human_inbox_items (claim_expires_at)",
         "CREATE INDEX IF NOT EXISTS ix_hii_completed_at "
         "ON human_inbox_items (completed_at)",
+        "CREATE INDEX IF NOT EXISTS ix_hii_reply_decision "
+        "ON human_inbox_items (reply_decision)",
     ]:
         connection.exec_driver_sql(index_sql)
 
@@ -1014,6 +1019,95 @@ def _setup_fts(connection: Any) -> None:
     connection.exec_driver_sql(
         "UPDATE session_lead_bindings SET reply_mode = 'confirm' "
         "WHERE reply_mode IS NULL OR reply_mode NOT IN ('confirm', 'auto')"
+    )
+    # Any in-flight claim created by the retired worker state machine has
+    # already disclosed the body. Drop the claim so only a v4 worker can
+    # resume it. Auto claims stay authorized; confirm claims return to the
+    # Human decision queue below.
+    connection.exec_driver_sql(
+        """
+        UPDATE human_inbox_items
+        SET reply_decision = 'auto',
+            reply_decided_at = CURRENT_TIMESTAMP
+        WHERE kind = 'session_lead'
+          AND completed_at IS NULL
+          AND reply_decision IS NULL
+          AND claim_binding_id IN (
+              SELECT id FROM session_lead_bindings WHERE reply_mode = 'auto'
+          )
+        """
+    )
+    connection.exec_driver_sql(
+        """
+        UPDATE human_inbox_items
+        SET claim_binding_id = NULL,
+            claim_token_hash = NULL,
+            claim_expires_at = NULL
+        WHERE kind = 'session_lead'
+          AND completed_at IS NULL
+        """
+    )
+    # M4.1 changes confirm from post-generation draft approval to
+    # pre-generation per-message authorization. Preserve final historical
+    # decisions, but discard unsent generated drafts and reopen their source
+    # inbox items so the Human can decide before any new Lead work starts.
+    connection.exec_driver_sql(
+        """
+        UPDATE human_inbox_items
+        SET reply_decision = 'ignored',
+            reply_decided_at = (
+                SELECT decided_at FROM session_lead_reply_drafts
+                WHERE inbox_item_id = human_inbox_items.id
+                  AND status = 'rejected'
+                LIMIT 1
+            )
+        WHERE reply_decision IS NULL
+          AND id IN (
+              SELECT inbox_item_id FROM session_lead_reply_drafts
+              WHERE status = 'rejected'
+          )
+        """
+    )
+    connection.exec_driver_sql(
+        """
+        UPDATE human_inbox_items
+        SET reply_decision = 'approved',
+            reply_decided_at = (
+                SELECT decided_at FROM session_lead_reply_drafts
+                WHERE inbox_item_id = human_inbox_items.id
+                  AND status = 'approved'
+                LIMIT 1
+            )
+        WHERE reply_decision IS NULL
+          AND id IN (
+              SELECT inbox_item_id FROM session_lead_reply_drafts
+              WHERE status = 'approved'
+          )
+        """
+    )
+    connection.exec_driver_sql(
+        """
+        UPDATE human_inbox_items
+        SET completed_at = NULL,
+            claim_binding_id = NULL,
+            claim_token_hash = NULL,
+            claim_expires_at = NULL,
+            reply_decision = NULL,
+            reply_decided_at = NULL
+        WHERE id IN (
+            SELECT inbox_item_id FROM session_lead_reply_drafts
+            WHERE status = 'pending'
+        )
+        """
+    )
+    connection.exec_driver_sql(
+        """
+        UPDATE session_lead_reply_drafts
+        SET status = 'rejected',
+            updated_at = CURRENT_TIMESTAMP,
+            decided_at = CURRENT_TIMESTAMP
+        WHERE status = 'pending'
+        """
     )
 
 

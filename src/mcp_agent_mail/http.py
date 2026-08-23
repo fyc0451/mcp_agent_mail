@@ -3103,8 +3103,8 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
     _claim_locks: dict[int, asyncio.Lock] = {}
     _session_lead_locks: dict[tuple[int, int], asyncio.Lock] = {}
     _session_lead_claim_locks: dict[int, asyncio.Lock] = {}
-    _session_lead_draft_create_locks: dict[int, asyncio.Lock] = {}
     _session_lead_draft_decision_locks: dict[int, asyncio.Lock] = {}
+    _session_lead_reply_request_locks: dict[int, asyncio.Lock] = {}
     # Exposed for race-controlled tests (pre-acquire an agent's lock).
     fastapi_app.state.hub_claim_locks = _claim_locks
 
@@ -3406,6 +3406,20 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         idem_key = raw_key.strip() if isinstance(raw_key, str) else ""
         if raw_key is not None and (not idem_key or len(idem_key) > 128):
             raise HTTPException(status_code=400, detail="idempotency_key must be 1-128 characters")
+        raw_inbox_item_id = body.get("inbox_item_id")
+        if raw_inbox_item_id is not None and (
+            isinstance(raw_inbox_item_id, bool)
+            or not isinstance(raw_inbox_item_id, int)
+        ):
+            raise HTTPException(status_code=400, detail="inbox_item_id must be an integer")
+        raw_claim_token = body.get("claim_token")
+        claim_token = (
+            raw_claim_token.strip() if isinstance(raw_claim_token, str) else ""
+        )
+        if raw_inbox_item_id is not None and (
+            not claim_token or len(claim_token) > 128
+        ):
+            raise HTTPException(status_code=400, detail="claim_token is required")
 
         replay_message: ChannelMessage | None = None
         replay_handles: list[str] = []
@@ -3418,10 +3432,36 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 reply_token,
                 session=session,
             )
-            if binding.reply_mode != "auto":
-                raise HTTPException(
-                    status_code=409, detail="Human confirmation is required"
-                )
+            if raw_inbox_item_id is None:
+                if binding.reply_mode != "auto":
+                    raise HTTPException(
+                        status_code=409, detail="Human confirmation is required"
+                    )
+            else:
+                item = await session.get(HumanInboxItem, raw_inbox_item_id)
+                now = datetime.now(timezone.utc).replace(tzinfo=None)
+                if (
+                    item is None
+                    or item.project_id != project.id
+                    or item.human_id != binding.human_id
+                    or item.kind != "session_lead"
+                    or item.claim_binding_id != binding.id
+                    or not item.claim_token_hash
+                    or not hmac.compare_digest(
+                        item.claim_token_hash, _hash_reply_token(claim_token)
+                    )
+                ):
+                    raise HTTPException(
+                        status_code=403, detail="Invalid claim credentials"
+                    )
+                if item.completed_at is not None:
+                    raise HTTPException(status_code=409, detail="Inbox item is completed")
+                if item.claim_expires_at is None or item.claim_expires_at <= now:
+                    raise HTTPException(status_code=409, detail="Inbox claim has expired")
+                if item.reply_decision not in {"approved", "auto"}:
+                    raise HTTPException(
+                        status_code=409, detail="Human confirmation is required"
+                    )
 
             if mention_handles:
                 member_rows = await session.execute(
@@ -3572,6 +3612,197 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             "decided_at": str(draft.decided_at) if draft.decided_at else None,
         }
 
+    def _reply_request_payload(item: HumanInboxItem) -> dict[str, Any]:
+        if item.reply_decision == "ignored":
+            request_status = "ignored"
+        elif item.completed_at is not None:
+            request_status = "replied"
+        elif item.reply_decision in {"approved", "auto"}:
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
+            request_status = (
+                "processing"
+                if item.claim_expires_at is not None
+                and item.claim_expires_at > now
+                and item.claim_token_hash is not None
+                else "queued"
+            )
+        else:
+            request_status = "awaiting_confirmation"
+        return {
+            "inbox_item_id": item.id,
+            "message_id": item.source_channel_message_id,
+            "status": request_status,
+            "decision": item.reply_decision,
+            "decided_at": (
+                str(item.reply_decided_at) if item.reply_decided_at else None
+            ),
+        }
+
+    async def _human_reply_request_context(
+        project_slug: str,
+        inbox_item_id: int,
+        request: Request,
+        *,
+        session: AsyncSession,
+    ) -> tuple[Project, SessionLeadBinding, HumanInboxItem]:
+        team_project = await _hub_team_project(project_slug, session=session)
+        human = await _hub_human(request, session=session)
+        project = await session.get(Project, team_project.routing_project_id)
+        if project is None or project.archived_at is not None:
+            raise HTTPException(status_code=404, detail="Project not found")
+        membership = await _hub_active_membership(project, human, session=session)
+        binding = (
+            await session.execute(
+                select(SessionLeadBinding).where(
+                    cast(Any, SessionLeadBinding.team_project_id) == team_project.id,
+                    cast(Any, SessionLeadBinding.human_id) == human.id,
+                    cast(Any, SessionLeadBinding.status) == "active",
+                )
+            )
+        ).scalars().first()
+        if binding is None or membership.default_agent_id != binding.agent_id:
+            raise HTTPException(status_code=409, detail="Session lead is unavailable")
+        item = await session.get(HumanInboxItem, inbox_item_id)
+        if (
+            item is None
+            or item.project_id != project.id
+            or item.human_id != human.id
+            or item.kind != "session_lead"
+        ):
+            raise HTTPException(status_code=404, detail="Reply request not found")
+        return project, binding, item
+
+    @fastapi_app.get(
+        "/hub/api/projects/{project_slug}/reply-requests",
+        response_class=JSONResponse,
+    )
+    async def hub_list_reply_requests(
+        project_slug: str, request: Request
+    ) -> JSONResponse:
+        """List message-level reply decisions without exposing message bodies."""
+        await ensure_schema()
+        async with get_session() as session:
+            team_project = await _hub_team_project(project_slug, session=session)
+            human = await _hub_human(request, session=session)
+            project = await session.get(Project, team_project.routing_project_id)
+            if project is None or project.archived_at is not None:
+                raise HTTPException(status_code=404, detail="Project not found")
+            await _hub_active_membership(project, human, session=session)
+            rows = await session.execute(
+                select(HumanInboxItem)
+                .where(
+                    cast(Any, HumanInboxItem.project_id) == project.id,
+                    cast(Any, HumanInboxItem.human_id) == human.id,
+                    cast(Any, HumanInboxItem.kind) == "session_lead",
+                )
+                .order_by(cast(Any, HumanInboxItem.created_ts).desc())
+                .limit(500)
+            )
+            return JSONResponse(
+                {
+                    "requests": [
+                        _reply_request_payload(item)
+                        for item in rows.scalars().all()
+                    ]
+                }
+            )
+
+    @fastapi_app.post(
+        "/hub/api/projects/{project_slug}/reply-requests/{inbox_item_id}/approve",
+        response_class=JSONResponse,
+    )
+    async def hub_approve_reply_request(
+        project_slug: str, inbox_item_id: int, request: Request
+    ) -> JSONResponse:
+        await ensure_schema()
+        item_lock = _session_lead_reply_request_locks.setdefault(
+            inbox_item_id, asyncio.Lock()
+        )
+        async with item_lock, get_session() as session:
+            _, binding, item = await _human_reply_request_context(
+                project_slug, inbox_item_id, request, session=session
+            )
+            if binding.reply_mode != "confirm":
+                raise HTTPException(
+                    status_code=409, detail="Automatic reply mode is enabled"
+                )
+            if item.reply_decision == "ignored":
+                raise HTTPException(status_code=409, detail="Reply request was ignored")
+            if item.completed_at is not None:
+                raise HTTPException(status_code=409, detail="Reply request is completed")
+            replay = item.reply_decision in {"approved", "auto"}
+            if not replay:
+                now = datetime.now(timezone.utc).replace(tzinfo=None)
+                item.reply_decision = "approved"
+                item.reply_decided_at = now
+                item.claim_binding_id = None
+                item.claim_token_hash = None
+                item.claim_expires_at = None
+                session.add(item)
+                await session.commit()
+                await session.refresh(item)
+            return JSONResponse(
+                {
+                    "status": "already_approved" if replay else "approved",
+                    "request": _reply_request_payload(item),
+                },
+                status_code=200 if replay else 201,
+            )
+
+    @fastapi_app.post(
+        "/hub/api/projects/{project_slug}/reply-requests/{inbox_item_id}/reject",
+        response_class=JSONResponse,
+    )
+    async def hub_reject_reply_request(
+        project_slug: str, inbox_item_id: int, request: Request
+    ) -> JSONResponse:
+        await ensure_schema()
+        item_lock = _session_lead_reply_request_locks.setdefault(
+            inbox_item_id, asyncio.Lock()
+        )
+        async with item_lock, get_session() as session:
+            _, binding, item = await _human_reply_request_context(
+                project_slug, inbox_item_id, request, session=session
+            )
+            if binding.reply_mode != "confirm":
+                raise HTTPException(
+                    status_code=409, detail="Automatic reply mode is enabled"
+                )
+            if item.reply_decision == "ignored":
+                return JSONResponse(
+                    {
+                        "status": "already_ignored",
+                        "request": _reply_request_payload(item),
+                    }
+                )
+            if item.completed_at is not None:
+                raise HTTPException(status_code=409, detail="Reply request is completed")
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
+            if (
+                item.claim_token_hash is not None
+                and item.claim_expires_at is not None
+                and item.claim_expires_at > now
+            ):
+                raise HTTPException(status_code=409, detail="Reply is already processing")
+            if item.reply_decision in {"approved", "auto"}:
+                raise HTTPException(status_code=409, detail="Reply request was approved")
+            item.reply_decision = "ignored"
+            item.reply_decided_at = now
+            item.completed_at = now
+            item.claim_binding_id = None
+            item.claim_token_hash = None
+            item.claim_expires_at = None
+            session.add(item)
+            await session.commit()
+            await session.refresh(item)
+            return JSONResponse(
+                {
+                    "status": "ignored",
+                    "request": _reply_request_payload(item),
+                },
+                status_code=201,
+            )
+
     async def _validate_reply_handles(
         project: Project,
         mention_handles: list[str],
@@ -3668,6 +3899,18 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             )
             async with claim_lock:
                 now = datetime.now(timezone.utc).replace(tzinfo=None)
+                reply_condition = (
+                    cast(Any, HumanInboxItem.reply_decision).in_(
+                        ["approved", "auto"]
+                    )
+                    if binding.reply_mode == "confirm"
+                    else or_(
+                        cast(Any, HumanInboxItem.reply_decision).is_(None),
+                        cast(Any, HumanInboxItem.reply_decision).in_(
+                            ["approved", "auto"]
+                        ),
+                    )
+                )
                 item = (
                     await session.execute(
                         select(HumanInboxItem)
@@ -3676,6 +3919,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                             cast(Any, HumanInboxItem.human_id) == binding.human_id,
                             cast(Any, HumanInboxItem.kind) == "session_lead",
                             cast(Any, HumanInboxItem.completed_at).is_(None),
+                            reply_condition,
                             or_(
                                 cast(Any, HumanInboxItem.claim_expires_at).is_(None),
                                 cast(Any, HumanInboxItem.claim_expires_at) <= now,
@@ -3687,6 +3931,9 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 ).scalars().first()
                 if item is None:
                     return JSONResponse({"status": "empty", "message": None})
+                if binding.reply_mode == "auto" and item.reply_decision is None:
+                    item.reply_decision = "auto"
+                    item.reply_decided_at = now
                 claim_token = _new_reply_token()
                 item.claim_binding_id = binding.id
                 item.claim_token_hash = _hash_reply_token(claim_token)
@@ -3790,6 +4037,10 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 return JSONResponse(
                     {"status": "already_completed", "inbox_item_id": item.id}
                 )
+            if item.reply_decision not in {"approved", "auto"}:
+                raise HTTPException(
+                    status_code=409, detail="Reply was not authorized"
+                )
             now = datetime.now(timezone.utc).replace(tzinfo=None)
             if item.claim_expires_at is None or item.claim_expires_at <= now:
                 raise HTTPException(status_code=409, detail="Inbox claim has expired")
@@ -3807,118 +4058,21 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
     async def hub_session_lead_create_reply_draft(
         project_slug: str, request: Request
     ) -> JSONResponse:
+        """Reject the retired generate-before-approval protocol."""
         await ensure_schema()
         body = await _hub_json_body(request)
         client_session_id, reply_token = _session_lead_credentials(body)
-        raw_inbox_item_id = body.get("inbox_item_id")
-        if isinstance(raw_inbox_item_id, bool) or not isinstance(
-            raw_inbox_item_id, int
-        ):
-            raise HTTPException(status_code=400, detail="inbox_item_id is required")
-        raw_claim_token = body.get("claim_token")
-        claim_token = (
-            raw_claim_token.strip() if isinstance(raw_claim_token, str) else ""
-        )
-        if not claim_token or len(claim_token) > 128:
-            raise HTTPException(status_code=400, detail="claim_token is required")
-        subject = body.get("subject")
-        body_md = body.get("body_md")
-        importance = body.get("importance", "normal")
-        if not isinstance(subject, str) or not subject.strip() or len(subject.strip()) > 512:
-            raise HTTPException(status_code=400, detail="subject is required")
-        if not isinstance(body_md, str) or not body_md.strip() or len(body_md) > 50_000:
-            raise HTTPException(status_code=400, detail="body_md is required")
-        if importance not in {"low", "normal", "high", "urgent"}:
-            raise HTTPException(status_code=400, detail="Invalid importance")
-        raw_handles = body.get("mention_handles")
-        if not isinstance(raw_handles, list) or not raw_handles or len(raw_handles) > 50:
-            raise HTTPException(
-                status_code=400, detail="mention_handles must be a non-empty array"
-            )
-        mention_handles: list[str] = []
-        for raw_handle in raw_handles:
-            if not isinstance(raw_handle, str):
-                raise HTTPException(
-                    status_code=400, detail="mention_handles must contain strings"
-                )
-            handle = _hub_mention_handle(raw_handle)
-            if handle.lower() not in {item.lower() for item in mention_handles}:
-                mention_handles.append(handle)
-        raw_key = body.get("idempotency_key")
-        idem_key = raw_key.strip() if isinstance(raw_key, str) else ""
-        if not idem_key or len(idem_key) > 128:
-            raise HTTPException(
-                status_code=400, detail="idempotency_key must be 1-128 characters"
-            )
         async with get_session() as session:
-            _, project, binding, _ = await _session_lead_capability_context(
+            await _session_lead_capability_context(
                 project_slug,
                 client_session_id,
                 reply_token,
                 session=session,
             )
-            if binding.reply_mode != "confirm":
-                raise HTTPException(
-                    status_code=409, detail="Automatic reply mode is enabled"
-                )
-            item = await session.get(HumanInboxItem, raw_inbox_item_id)
-            now = datetime.now(timezone.utc).replace(tzinfo=None)
-            if (
-                item is None
-                or item.project_id != project.id
-                or item.human_id != binding.human_id
-                or item.claim_binding_id != binding.id
-                or not item.claim_token_hash
-                or not hmac.compare_digest(
-                    item.claim_token_hash, _hash_reply_token(claim_token)
-                )
-            ):
-                raise HTTPException(status_code=403, detail="Invalid claim credentials")
-            if item.completed_at is not None:
-                raise HTTPException(status_code=409, detail="Inbox item is completed")
-            if item.claim_expires_at is None or item.claim_expires_at <= now:
-                raise HTTPException(status_code=409, detail="Inbox claim has expired")
-            await _validate_reply_handles(project, mention_handles, session=session)
-            assert binding.id is not None
-            draft_lock = _session_lead_draft_create_locks.setdefault(
-                raw_inbox_item_id, asyncio.Lock()
-            )
-            async with draft_lock:
-                existing = (
-                    await session.execute(
-                        select(SessionLeadReplyDraft).where(
-                            cast(Any, SessionLeadReplyDraft.binding_id) == binding.id,
-                            cast(Any, SessionLeadReplyDraft.inbox_item_id)
-                            == raw_inbox_item_id,
-                        )
-                    )
-                ).scalars().first()
-                if existing is not None:
-                    if existing.idem_key != idem_key:
-                        raise HTTPException(
-                            status_code=409,
-                            detail="A reply draft already exists for this inbox item",
-                        )
-                    return JSONResponse(
-                        {"status": "already_exists", "draft": _reply_draft_payload(existing)}
-                    )
-                draft = SessionLeadReplyDraft(
-                    binding_id=binding.id,
-                    inbox_item_id=raw_inbox_item_id,
-                    idem_key=idem_key,
-                    subject=subject.strip(),
-                    body_md=body_md.strip(),
-                    importance=importance,
-                    mention_handles=json.dumps(mention_handles),
-                )
-                session.add(draft)
-                await session.commit()
-                await session.refresh(draft)
-                return JSONResponse(
-                    {"status": "pending", "draft": _reply_draft_payload(draft)},
-                    status_code=201,
-                )
-
+        raise HTTPException(
+            status_code=410,
+            detail="Reply drafts are retired; authorize the message before generation",
+        )
     @fastapi_app.get(
         "/hub/api/projects/{project_slug}/reply-drafts",
         response_class=JSONResponse,

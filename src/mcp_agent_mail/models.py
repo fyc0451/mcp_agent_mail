@@ -528,6 +528,11 @@ class HumanInboxItem(SQLModel, table=True):
     claim_token_hash: Optional[str] = Field(default=None, max_length=64)
     claim_expires_at: Optional[datetime] = Field(default=None, index=True)
     completed_at: Optional[datetime] = Field(default=None, index=True)
+    # NULL = waiting for the Human in confirm mode. ``approved`` is an
+    # explicit per-message authorization, ``auto`` records that the message
+    # was claimed while auto mode was active, and ``ignored`` is terminal.
+    reply_decision: Optional[str] = Field(default=None, max_length=16, index=True)
+    reply_decided_at: Optional[datetime] = Field(default=None)
     created_ts: datetime = Field(default_factory=_utcnow_naive)
 
 
