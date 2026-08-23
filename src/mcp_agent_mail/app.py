@@ -267,6 +267,7 @@ _HUB_AUDIT_OUTCOMES = frozenset(
         "already_retired",
         "restored",
         "already_active",
+        "capability_rotated",
     }
 )
 _HUB_AUDIT_REASONS = frozenset(
@@ -496,13 +497,15 @@ class ToolExecutionError(Exception):
         }
 
 
-def _record_tool_error(tool_name: str, exc: Exception) -> None:
+def _record_tool_error(
+    tool_name: str, exc: Exception, sensitive_values: Sequence[str] = ()
+) -> None:
     logger.warning(
         "tool_error",
         extra={
             "tool": tool_name,
             "error": type(exc).__name__,
-            "error_message": str(exc),
+            "error_message": _redact_log_value(str(exc), sensitive_values),
         },
     )
 
@@ -580,6 +583,12 @@ def _instrument_tool(
             bound = _bind_arguments(signature, args, kwargs)
             ctx = bound.arguments.get("ctx")
             format_value = bound.arguments.get("format")
+            # 敏感参数值：所有日志/错误记录统一按此文本脱敏
+            sensitive_values = [
+                value
+                for key, value in bound.arguments.items()
+                if _SENSITIVE_PARAM_RE.search(key) and isinstance(value, str)
+            ]
             # Pre-validate the output `format` BEFORE running the wrapped tool
             # (issue #177). Previously an invalid format was only caught while
             # encoding the result, so the tool's side effects (e.g. sending a
@@ -597,7 +606,7 @@ def _instrument_tool(
                     # This validation runs before the try/finally, so emit the
                     # structured error log here rather than silently skipping the
                     # instrumentation every other tool-error path goes through (#177).
-                    _record_tool_error(tool_name, _fmt_exc)
+                    _record_tool_error(tool_name, _fmt_exc, sensitive_values)
                     raise _fmt_exc
             if isinstance(ctx, Context) and meta["capabilities"]:
                 required_caps = set(cast(list[str], meta["capabilities"]))
@@ -619,7 +628,9 @@ def _instrument_tool(
 
             if log_enabled:
                 try:
-                    clean_kwargs = {k: v for k, v in bound.arguments.items() if k != "ctx"}
+                    clean_kwargs = _redact_sensitive_params({
+                        k: v for k, v in bound.arguments.items() if k != "ctx"
+                    })
                     log_ctx = rich_logger.ToolCallContext(
                         tool_name=tool_name,
                         args=[],
@@ -663,13 +674,13 @@ def _instrument_tool(
                     )
             except ToolExecutionError as exc:
                 metrics["errors"] += 1
-                _record_tool_error(tool_name, exc)
+                _record_tool_error(tool_name, exc, sensitive_values)
                 error = exc
                 raise
             except NoResultFound as exc:
                 # Handle agent/project not found errors with helpful messages
                 metrics["errors"] += 1
-                _record_tool_error(tool_name, exc)
+                _record_tool_error(tool_name, exc, sensitive_values)
                 wrapped_exc = ToolExecutionError(
                     "NOT_FOUND",
                     str(exc),  # Use the original helpful error message
@@ -681,7 +692,7 @@ def _instrument_tool(
             except ValueError as exc:
                 # Invalid argument value
                 metrics["errors"] += 1
-                _record_tool_error(tool_name, exc)
+                _record_tool_error(tool_name, exc, sensitive_values)
                 wrapped_exc = ToolExecutionError(
                     "INVALID_ARGUMENT",
                     f"Invalid argument value: {exc}. Check that all parameters have valid values.",
@@ -693,7 +704,7 @@ def _instrument_tool(
             except TypeError as exc:
                 # Wrong argument type
                 metrics["errors"] += 1
-                _record_tool_error(tool_name, exc)
+                _record_tool_error(tool_name, exc, sensitive_values)
                 error_msg = str(exc)
                 # Try to extract helpful info from TypeError
                 hint = ""
@@ -714,7 +725,7 @@ def _instrument_tool(
             except KeyError as exc:
                 # Missing key/field
                 metrics["errors"] += 1
-                _record_tool_error(tool_name, exc)
+                _record_tool_error(tool_name, exc, sensitive_values)
                 wrapped_exc = ToolExecutionError(
                     "MISSING_FIELD",
                     f"Missing required field: {exc}. Ensure all required parameters are provided.",
@@ -726,7 +737,7 @@ def _instrument_tool(
             except SATimeoutError as exc:
                 # SQLAlchemy pool timeout (QueuePool exhausted)
                 metrics["errors"] += 1
-                _record_tool_error(tool_name, exc)
+                _record_tool_error(tool_name, exc, sensitive_values)
                 db_settings = settings.database
                 wrapped_exc = ToolExecutionError(
                     "DATABASE_POOL_EXHAUSTED",
@@ -745,7 +756,7 @@ def _instrument_tool(
             except TimeoutError as exc:
                 # Timeout (database lock, network, etc.)
                 metrics["errors"] += 1
-                _record_tool_error(tool_name, exc)
+                _record_tool_error(tool_name, exc, sensitive_values)
                 wrapped_exc = ToolExecutionError(
                     "TIMEOUT",
                     f"Operation timed out: {exc}. The server may be under heavy load. Try again in a moment.",
@@ -758,7 +769,7 @@ def _instrument_tool(
                 # Git index.lock contention (concurrent git operations)
                 # This is an expected error in multi-agent environments
                 metrics["errors"] += 1
-                _record_tool_error(tool_name, exc)
+                _record_tool_error(tool_name, exc, sensitive_values)
                 wrapped_exc = ToolExecutionError(
                     "GIT_INDEX_LOCK",
                     f"Git repository is temporarily locked by another operation. "
@@ -777,7 +788,7 @@ def _instrument_tool(
                 # Handle file descriptor exhaustion (EMFILE) with cache cleanup
                 import errno
                 metrics["errors"] += 1
-                _record_tool_error(tool_name, exc)
+                _record_tool_error(tool_name, exc, sensitive_values)
                 if exc.errno == errno.EMFILE:
                     # Clear repo cache to free file handles and allow recovery
                     cleared = clear_repo_cache()
@@ -790,18 +801,22 @@ def _instrument_tool(
                 else:
                     wrapped_exc = ToolExecutionError(
                         "OS_ERROR",
-                        f"OS error: {exc}",
+                        f"OS error: {_redact_log_value(str(exc), sensitive_values)}",
                         recoverable=False,
-                        data={"tool": tool_name, "errno": exc.errno, "error_detail": str(exc)},
+                        data={
+                            "tool": tool_name,
+                            "errno": exc.errno,
+                            "error_detail": _redact_log_value(str(exc), sensitive_values),
+                        },
                     )
                 error = wrapped_exc
                 raise wrapped_exc from exc
             except Exception as exc:
                 # Catch-all for unexpected errors - provide helpful categorization
                 metrics["errors"] += 1
-                _record_tool_error(tool_name, exc)
+                _record_tool_error(tool_name, exc, sensitive_values)
                 error_type = type(exc).__name__
-                error_msg = str(exc)
+                error_msg = _redact_log_value(str(exc), sensitive_values)
 
                 # Try to categorize common error patterns
                 if "database" in error_msg.lower() or "sqlite" in error_msg.lower():
@@ -829,10 +844,16 @@ def _instrument_tool(
                     error_category,
                     friendly_msg,
                     recoverable=recoverable,
-                    data={"tool": tool_name, "original_error": error_type, "error_detail": error_msg},
+                    data={
+                        "tool": tool_name,
+                        "original_error": error_type,
+                        "error_detail": error_msg,
+                    },
                 )
                 error = wrapped_exc
-                raise wrapped_exc from exc
+                # from None：原始异常链可能在 rich traceback 中携带敏感消息，
+                # 原始细节已脱敏写入 error_detail 与 _record_tool_error
+                raise wrapped_exc from None
             finally:
                 _record_recent(tool_name, project_value, agent_value)
 
@@ -858,8 +879,11 @@ def _instrument_tool(
                 if log_ctx is not None:
                     try:
                         log_ctx.end_time = time.perf_counter()
-                        log_ctx.result = result
-                        log_ctx.error = error
+                        log_ctx.result = _redact_log_value(result, sensitive_values)
+                        if error is not None:
+                            log_ctx.error = _LogSafeError(error, sensitive_values)
+                        else:
+                            log_ctx.error = None
                         log_ctx.success = error is None
                         if query_stats:
                             log_ctx.query_stats = query_stats
@@ -2484,7 +2508,7 @@ def _project_lookup_base_dir() -> Path:
 
 
 def _canonicalize_project_identifier(identifier: str) -> str:
-    """Normalize path-like project identifiers without collapsing symlink identities."""
+    """Normalize path-like identifiers and resolve symlinks that exist locally."""
     try:
         candidate = Path(identifier).expanduser()
     except Exception:
@@ -2495,6 +2519,8 @@ def _canonicalize_project_identifier(identifier: str) -> str:
     if not looks_like_path:
         return identifier
     absolute_candidate = candidate if candidate.is_absolute() else _project_lookup_base_dir() / candidate
+    if absolute_candidate.exists():
+        return str(absolute_candidate.resolve())
     return os.path.normpath(str(absolute_candidate))
 
 
@@ -4115,6 +4141,82 @@ async def _ensure_agent_registration_token(
             await session.commit()
             await session.refresh(db_agent)
         return db_agent, str(token)
+
+
+_CAPABILITY_CHARS_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+# 敏感参数名：进 Rich 工具日志前统一脱敏，防止 capability/token 落日志
+_SENSITIVE_PARAM_RE = re.compile(r"(token|secret|capability|password|credential)", re.IGNORECASE)
+_REDACTED = "<redacted>"
+
+
+def _redact_sensitive_params(params: dict[str, Any]) -> dict[str, Any]:
+    """替换敏感参数值为占位符；仅用于日志展示，不改动实际参数。"""
+    return {
+        key: _REDACTED if _SENSITIVE_PARAM_RE.search(key) else value
+        for key, value in params.items()
+    }
+
+
+def _redact_log_value(value: Any, sensitive_values: Sequence[str] = ()) -> Any:
+    """递归脱敏日志值：敏感键替换为占位符，任意字符串中的敏感值文本一并替换。"""
+    if isinstance(value, dict):
+        return {
+            key: (
+                _REDACTED
+                if _SENSITIVE_PARAM_RE.search(str(key))
+                else _redact_log_value(item, sensitive_values)
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_log_value(item, sensitive_values) for item in value]
+    if isinstance(value, str):
+        for sensitive in sensitive_values:
+            if sensitive:
+                value = value.replace(sensitive, _REDACTED)
+    return value
+
+
+class _LogSafeError:
+    """日志专用 error 表示：文本/data 脱敏；客户端实际异常语义不变。"""
+
+    def __init__(self, error: Exception, sensitive_values: Sequence[str]):
+        self._error = error
+        self._sensitive = [value for value in sensitive_values if value]
+        self.log_error_type = type(error).__name__
+
+    @property
+    def error_code(self) -> Any:
+        return getattr(self._error, "error_code", None)
+
+    def safe_data(self) -> Any:
+        return _redact_log_value(getattr(self._error, "data", None), self._sensitive)
+
+    def safe_str(self) -> str:
+        return _redact_log_value(str(self._error), self._sensitive)
+
+
+def _validate_rotated_capability(value: Any) -> str:
+    """强校验轮换目标值：urlsafe-base64 字符集、32-64 长度（服务端自制 43）。"""
+    if not isinstance(value, str) or not value:
+        raise ToolExecutionError(
+            "INVALID_ARGUMENT",
+            "New registration capability must be a non-empty string.",
+            recoverable=True,
+        )
+    if len(value) < 32 or len(value) > 64:
+        raise ToolExecutionError(
+            "INVALID_ARGUMENT",
+            "New registration capability must be 32-64 urlsafe-base64 characters.",
+            recoverable=True,
+        )
+    if not _CAPABILITY_CHARS_RE.fullmatch(value):
+        raise ToolExecutionError(
+            "INVALID_ARGUMENT",
+            "New registration capability contains invalid characters.",
+            recoverable=True,
+        )
+    return value
 
 
 # ── M3a: human identity + project membership ──────────────────
@@ -7371,12 +7473,14 @@ def build_mcp_server() -> FastMCP:
         """
         # Validate that human_key is an absolute path-like project key (cross-platform).
         # It need not exist on disk - it is an opaque project KEY, not a filesystem probe.
-        if not Path(human_key).is_absolute():
+        project_path = Path(human_key)
+        if not project_path.is_absolute():
             raise ValueError(
                 f"human_key must be an absolute path-like project key, got: '{human_key}'. "
                 "Use the agent's working directory path (e.g., '/data/projects/backend' on Unix "
                 "or 'C:\\projects\\backend' on Windows)."
             )
+        human_key = _canonicalize_project_identifier(human_key)
 
         await _ctx_info_safe(ctx, f"Ensuring project for key '{human_key}'.")
         project = await _ensure_project(human_key)
@@ -7643,6 +7747,121 @@ def build_mcp_server() -> FastMCP:
             "status": "retired",
             "agent_name": agent_name,
             "project_key": project_key,
+        }
+
+    @mcp.tool(
+        name="rotate_agent_capability",
+        description=(
+            "Rotate an agent's registration capability in place. The caller must present the CURRENT "
+            "capability (proof of custody); on success only the capability value changes and the agent "
+            "id/name/message history/unread/read/ack/retired state are preserved. The old value is "
+            "invalidated immediately and the new value authenticates whois/fetch. Never returns or logs "
+            "capability values."
+        ),
+    )
+    @_instrument_tool(
+        "rotate_agent_capability",
+        cluster=CLUSTER_IDENTITY,
+        capabilities={"identity"},
+        agent_arg="agent_name",
+        project_arg="project_key",
+    )
+    async def rotate_agent_capability(
+        ctx: Context,
+        project_key: str,
+        agent_name: str,
+        old_registration_token: str,
+        new_registration_token: str,
+    ) -> dict[str, Any]:
+        """Rotate an agent's registration capability in place (single-row update)."""
+        project = await _get_project_by_identifier(project_key)
+        if not project:
+            raise ValueError(f"Project '{project_key}' not found")
+
+        new_registration_token = _validate_rotated_capability(new_registration_token)
+        if old_registration_token == new_registration_token:
+            raise ToolExecutionError(
+                "INVALID_ARGUMENT",
+                "New registration capability must differ from the current one.",
+                recoverable=True,
+                data={"agent_name": agent_name, "project_key": project.human_key},
+            )
+
+        agent = await _authenticate_agent(
+            ctx,
+            project,
+            agent_name,
+            old_registration_token,
+            token_param="registration_token",
+            action="rotate_agent_capability",
+        )
+        if agent.id is None:
+            raise ValueError("Agent must have an id before rotating its capability.")
+        actor = await _resolve_session_agent_for_project(ctx, project)
+        actor_id = actor.id if actor is not None else agent.id
+
+        # BEGIN IMMEDIATE：串行化 read-check-write，杜绝并发轮换互相覆盖
+        async with get_immediate_session() as session:
+            db_agent = await session.get(Agent, agent.id)
+            if db_agent is None:
+                raise NoResultFound(f"Agent id '{agent.id}' no longer exists.")
+            # 事务内重验旧值：鉴权与更新之间 token 不得被并发轮换（TOCTOU）
+            stored = (db_agent.registration_token or "").strip()
+            if not stored or not hmac.compare_digest(old_registration_token, stored):
+                raise ToolExecutionError(
+                    "AUTHENTICATION_REQUIRED",
+                    f"Current registration capability no longer matches agent '{db_agent.name}'.",
+                    recoverable=True,
+                    data={"agent_name": db_agent.name, "project_key": project.human_key},
+                )
+            other_tokens = await session.execute(
+                select(Agent).where(
+                    cast(Any, Agent.project_id) == db_agent.project_id,
+                    Agent.id != db_agent.id,
+                    cast(Any, Agent.registration_token).isnot(None),
+                )
+            )
+            for other in other_tokens.scalars().all():
+                if hmac.compare_digest(new_registration_token, other.registration_token or ""):
+                    raise ToolExecutionError(
+                        "INVALID_ARGUMENT",
+                        "New registration capability collides with another agent in this project.",
+                        recoverable=True,
+                        data={"agent_name": db_agent.name, "project_key": project.human_key},
+                    )
+            db_agent.registration_token = new_registration_token
+            session.add(db_agent)
+            await session.commit()
+            await session.refresh(db_agent)
+
+        if project.id is not None:
+            try:
+                audit_event = _new_hub_audit_event(
+                    project_id=project.id,
+                    actor_agent_id=actor_id,
+                    event_type="agent_lifecycle",
+                    source_type="agent",
+                    source_id=agent.id,
+                    outcome="capability_rotated",
+                    target_project_id=project.id,
+                    target_agent_id=agent.id,
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to build rotate-capability audit event agent_id=%s",
+                    agent.id,
+                    exc_info=True,
+                )
+            else:
+                await _record_hub_audit_events([audit_event])
+
+        await ctx.info(
+            f"Rotated registration capability for agent '{agent.name}' in project '{project.human_key}'."
+        )
+        return {
+            "status": "rotated",
+            "agent_name": agent.name,
+            "project_key": project.human_key,
         }
 
     @mcp.tool(

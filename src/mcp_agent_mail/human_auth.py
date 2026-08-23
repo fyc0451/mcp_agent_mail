@@ -341,6 +341,30 @@ class HumanAuthStore:
             "project_slug": project_slug,
         }
 
+    def _valid_team_code(self, invite_code: str) -> bool:
+        """可重复使用的团队码(可选,存放在 data_dir/team-code)。
+
+        团队码不过期、不限次数,按次读取文件,轮换无需重启;
+        注册仍落 pending,需管理员激活后才能登录,泄露不会直接放行。
+        文件缺失/不可读/非 UTF-8/超限一律视为未配置(返回 False)。
+        """
+        try:
+            raw = (self.config.data_dir / "team-code").read_bytes()
+        except OSError:
+            return False
+        if len(raw) > 4096:
+            return False
+        try:
+            expected = raw.decode("utf-8").strip()
+        except UnicodeDecodeError:
+            return False
+        if not expected:
+            return False
+        # 统一按 UTF-8 bytes 比较:str compare_digest 遇非 ASCII 抛 TypeError
+        return hmac.compare_digest(
+            invite_code.strip().encode("utf-8"), expected.encode("utf-8")
+        )
+
     def register(
         self,
         *,
@@ -366,8 +390,14 @@ class HumanAuthStore:
                 """,
                 (code_hash, now),
             ).fetchone()
-            if invitation is None:
+            # 团队码命中时不消费任何 invitation 行:团队码可能复用了
+            # 已消费/过期邀请码的值,改写其 used_by/used_at 会破坏审计。
+            consume_invitation = invitation is not None
+            if invitation is None and not self._valid_team_code(invite_code):
                 raise ValueError("Invalid or expired invitation")
+            requested_project_slug = (
+                invitation["project_slug"] if invitation is not None else None
+            )
             existing = connection.execute(
                 "SELECT 1 FROM users WHERE username = ?", (username,)
             ).fetchone()
@@ -388,18 +418,19 @@ class HumanAuthStore:
                     _password_hash(password),
                     json.dumps(["writer"]),
                     now,
-                    invitation["project_slug"],
+                    requested_project_slug,
                 ),
             )
-            connection.execute(
-                "UPDATE invitations SET used_by = ?, used_at = ? WHERE code_hash = ?",
-                (subject, now, code_hash),
-            )
+            if consume_invitation:
+                connection.execute(
+                    "UPDATE invitations SET used_by = ?, used_at = ? WHERE code_hash = ?",
+                    (subject, now, code_hash),
+                )
         return {
             "username": username,
             "display_name": display_name,
             "status": "pending",
-            "requested_project_slug": invitation["project_slug"],
+            "requested_project_slug": requested_project_slug,
         }
 
     def list_users(self) -> list[dict[str, Any]]:
@@ -482,7 +513,9 @@ class HumanAuthStore:
         return token.decode("ascii"), self.config.token_ttl_seconds
 
 
-class _LoginLimiter:
+class _RateLimiter:
+    """按 key 的滑动窗口失败限流:5 次/300s,成功后清零。"""
+
     def __init__(self) -> None:
         self.failures: dict[str, list[float]] = {}
 
@@ -502,7 +535,8 @@ class _LoginLimiter:
 
 def create_app(config: HumanAuthConfig) -> FastAPI:
     store = HumanAuthStore(config)
-    limiter = _LoginLimiter()
+    limiter = _RateLimiter()
+    register_limiter = _RateLimiter()
     app = FastAPI(title="Agent Hub Human Auth", docs_url=None, redoc_url=None)
     app.state.store = store
 
@@ -589,7 +623,13 @@ def create_app(config: HumanAuthConfig) -> FastAPI:
         return {"ok": True}
 
     @app.post("/register", status_code=201)
-    async def register(body: RegistrationRequest) -> dict[str, Any]:
+    async def register(request: Request, body: RegistrationRequest) -> dict[str, Any]:
+        # 按 client IP 失败限流:可复用团队码把爆破/抢占用户名的风险
+        # 从一次性高熵码扩大为可持续尝试,必须兜底(成功后清零)。
+        client_host = request.client.host if request.client else "unknown"
+        now = time.monotonic()
+        if register_limiter.blocked(client_host, now):
+            raise HTTPException(status_code=429, detail="Too many registration attempts")
         try:
             account = store.register(
                 username=body.username,
@@ -598,9 +638,12 @@ def create_app(config: HumanAuthConfig) -> FastAPI:
                 invite_code=body.invite_code,
             )
         except FileExistsError as exc:
+            register_limiter.failed(client_host, now)
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except ValueError as exc:
+            register_limiter.failed(client_host, now)
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        register_limiter.succeeded(client_host)
         return {"account": account}
 
     @app.post("/admin/invitations", status_code=201)

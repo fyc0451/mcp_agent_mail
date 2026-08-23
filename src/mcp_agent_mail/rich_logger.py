@@ -194,16 +194,28 @@ def _create_params_display(ctx: ToolCallContext) -> Panel | None:
 def _create_result_display(ctx: ToolCallContext) -> Panel:
     """Create a panel displaying the result or error."""
     if ctx.error:
+        # 日志专用安全 error 表示：优先用脱敏后的文本/data（safe_* 协议）
+        error_type = getattr(ctx.error, "log_error_type", type(ctx.error).__name__)
+        error_message = (
+            ctx.error.safe_str()
+            if hasattr(ctx.error, "safe_str")
+            else str(ctx.error)
+        )
+        error_data = (
+            ctx.error.safe_data()
+            if hasattr(ctx.error, "safe_data")
+            else getattr(ctx.error, "data", None)
+        )
         error_info = {
-            "error_type": type(ctx.error).__name__,
-            "error_message": str(ctx.error),
+            "error_type": error_type,
+            "error_message": error_message,
         }
 
         # Add additional error details if available
         if hasattr(ctx.error, "error_code"):
             error_info["error_code"] = ctx.error.error_code
-        if hasattr(ctx.error, "data"):
-            error_info["error_data"] = ctx.error.data
+        if error_data is not None:
+            error_info["error_data"] = error_data
 
         json_content = _safe_json_format(error_info)
         return Panel(
@@ -307,7 +319,11 @@ def _create_tool_call_summary_table(ctx: ToolCallContext) -> Table:
         if ctx.success:
             table.add_row("📊 Status", "[bold bright_green]✅ SUCCESS[/bold bright_green]")
         else:
-            error_msg = str(ctx.error) if ctx.error else "Unknown error"
+            error_msg = (
+                ctx.error.safe_str()
+                if hasattr(ctx.error, "safe_str")
+                else (str(ctx.error) if ctx.error else "Unknown error")
+            )
             table.add_row("📊 Status", "[bold bright_red]❌ FAILED[/bold bright_red]")
             table.add_row("⚠️  Error", f"[red]{escape(error_msg[:100])}[/red]")
 

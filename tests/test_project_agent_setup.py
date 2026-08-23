@@ -20,6 +20,7 @@ Reference: mcp_agent_mail-mm2
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 from pathlib import Path
 
@@ -799,3 +800,428 @@ async def test_get_agents_batch_placeholder_detection(isolated_env):
     with pytest.raises(ToolExecutionError) as exc_info:
         await _get_agents_batch(project, ["YOUR_AGENT_NAME"])
     assert exc_info.value.error_type == "CONFIGURATION_ERROR"
+
+
+# ============================================================================
+# Test: rotate_agent_capability
+# ============================================================================
+
+
+async def _register_with_token(client, project_key: str, name: str | None = None):
+    args = {"project_key": project_key, "program": "test-program", "model": "test-model"}
+    if name:
+        args["name"] = name
+    result = await client.call_tool("register_agent", args)
+    return result.data
+
+
+@pytest.mark.asyncio
+async def test_rotate_capability_preserves_identity_and_inbox(isolated_env):
+    """同 id/name 原位轮换：unread/历史不变，旧值失效、新值正向。"""
+    project_key = "/test/setup/rotate-preserve"
+    server = build_mcp_server()
+    async with Client(server) as client:
+        await client.call_tool("ensure_project", {"human_key": project_key})
+        target = await _register_with_token(client, project_key)
+        sender = await _register_with_token(client, project_key)
+        t_name, t_old = target["name"], target["registration_token"]
+        s_name, s_token = sender["name"], sender["registration_token"]
+
+        await client.call_tool("send_message", {
+            "project_key": project_key,
+            "sender_name": s_name,
+            "sender_token": s_token,
+            "to": [t_name],
+            "subject": "rotate probe",
+            "body_md": "before rotation",
+        })
+        inbox_before = await client.call_tool("fetch_inbox", {
+            "project_key": project_key,
+            "agent_name": t_name,
+            "registration_token": t_old,
+            "limit": 10,
+        })
+        assert len(inbox_before.structured_content["result"]) == 1
+        message_id = inbox_before.structured_content["result"][0]["id"]
+
+        new_token = "a" * 43
+        rotated = await client.call_tool("rotate_agent_capability", {
+            "project_key": project_key,
+            "agent_name": t_name,
+            "old_registration_token": t_old,
+            "new_registration_token": new_token,
+        })
+        assert rotated.data["status"] == "rotated"
+        assert rotated.data["agent_name"] == t_name
+        # 返回值不得包含任何 capability 值
+        serialized = str(rotated.data)
+        assert t_old not in serialized
+        assert new_token not in serialized
+
+        project = await get_project_from_db(project_key)
+        db_agent = await get_agent_from_db(project["id"], t_name)
+        assert db_agent is not None
+        assert db_agent["id"] == target["id"]
+        assert db_agent["name"] == t_name
+
+        # 新值正向（新会话，绕开绑定会话的 token 直通）：whois / fetch_inbox
+        async with Client(server) as new_session:
+            whois = await new_session.call_tool("whois", {
+                "project_key": project_key,
+                "agent_name": t_name,
+                "registration_token": new_token,
+            })
+            assert whois.data["name"] == t_name
+            inbox_after = await new_session.call_tool("fetch_inbox", {
+                "project_key": project_key,
+                "agent_name": t_name,
+                "registration_token": new_token,
+                "limit": 10,
+            })
+            assert [m["id"] for m in inbox_after.structured_content["result"]] == [message_id]
+
+        # 旧值立即失效（独立新会话；同会话先成功认证会绑定并放行后续调用）
+        async with Client(server) as old_session:
+            with pytest.raises(Exception) as exc_info:
+                await old_session.call_tool("whois", {
+                    "project_key": project_key,
+                    "agent_name": t_name,
+                    "registration_token": t_old,
+                })
+            assert "registration_token" in str(exc_info.value).lower() or "invalid" in str(exc_info.value).lower()
+
+
+@pytest.mark.asyncio
+async def test_rotate_capability_wrong_old_token_has_no_state_change(isolated_env):
+    """错误旧值：拒绝且 token 无变化。"""
+    project_key = "/test/setup/rotate-wrong-old"
+    server = build_mcp_server()
+    async with Client(server) as client:
+        await client.call_tool("ensure_project", {"human_key": project_key})
+        agent = await _register_with_token(client, project_key)
+        name, old = agent["name"], agent["registration_token"]
+
+        with pytest.raises(Exception) as exc_info:
+            await client.call_tool("rotate_agent_capability", {
+                "project_key": project_key,
+                "agent_name": name,
+                "old_registration_token": "b" * 43,
+                "new_registration_token": "c" * 43,
+            })
+        assert "capability" in str(exc_info.value).lower() or "invalid" in str(exc_info.value).lower()
+
+        # 新会话验证 token 未被轮换（绑定会话会绕过 token 检查）
+        async with Client(server) as fresh:
+            whois = await fresh.call_tool("whois", {
+                "project_key": project_key,
+                "agent_name": name,
+                "registration_token": old,
+            })
+            assert whois.data["name"] == name
+
+
+@pytest.mark.asyncio
+async def test_rotate_capability_rejects_invalid_new_value(isolated_env):
+    """弱/非法新值：INVALID_ARGUMENT 且无状态变化。"""
+    project_key = "/test/setup/rotate-bad-new"
+    server = build_mcp_server()
+    async with Client(server) as client:
+        await client.call_tool("ensure_project", {"human_key": project_key})
+        agent = await _register_with_token(client, project_key)
+        name, old = agent["name"], agent["registration_token"]
+
+        bad_values = ["", "short", "x" * 65, "has space and !@#" * 3, old]
+        for bad in bad_values:
+            with pytest.raises(Exception) as exc_info:
+                await client.call_tool("rotate_agent_capability", {
+                    "project_key": project_key,
+                    "agent_name": name,
+                    "old_registration_token": old,
+                    "new_registration_token": bad,
+                })
+            assert any(k in str(exc_info.value).lower() for k in ("capability", "invalid", "differ"))
+
+        whois = await client.call_tool("whois", {
+            "project_key": project_key,
+            "agent_name": name,
+            "registration_token": old,
+        })
+        assert whois.data["name"] == name
+
+
+@pytest.mark.asyncio
+async def test_rotate_capability_requires_token_for_tokenless_agent(isolated_env):
+    """无 token 的旧 agent：拒绝邻接代认证。"""
+    project_key = "/test/setup/rotate-tokenless"
+    server = build_mcp_server()
+    async with Client(server) as client:
+        await client.call_tool("ensure_project", {"human_key": project_key})
+        agent = await _register_with_token(client, project_key)
+        # 构造 tokenless 旧行
+        from sqlmodel import select as _sm_select
+        from mcp_agent_mail.models import Agent as AgentModel
+        async with get_session() as session:
+            result = await session.execute(
+                _sm_select(AgentModel).where(AgentModel.name == agent["name"])
+            )
+            db_agent = result.scalars().first()
+            db_agent.registration_token = None
+            session.add(db_agent)
+            await session.commit()
+
+        with pytest.raises(Exception) as exc_info:
+            await client.call_tool("rotate_agent_capability", {
+                "project_key": project_key,
+                "agent_name": agent["name"],
+                "old_registration_token": "d" * 43,
+                "new_registration_token": "e" * 43,
+            })
+        assert "capability" in str(exc_info.value).lower() or "token" in str(exc_info.value).lower()
+
+
+@pytest.mark.asyncio
+async def test_rotate_capability_rejects_collision_with_other_agent(isolated_env):
+    """新值与同项目其他 agent 冲突：拒绝且无状态变化。"""
+    project_key = "/test/setup/rotate-collision"
+    server = build_mcp_server()
+    async with Client(server) as client:
+        await client.call_tool("ensure_project", {"human_key": project_key})
+        agent_a = await _register_with_token(client, project_key)
+        agent_b = await _register_with_token(client, project_key)
+
+        with pytest.raises(Exception) as exc_info:
+            await client.call_tool("rotate_agent_capability", {
+                "project_key": project_key,
+                "agent_name": agent_a["name"],
+                "old_registration_token": agent_a["registration_token"],
+                "new_registration_token": agent_b["registration_token"],
+            })
+        assert "collision" in str(exc_info.value).lower() or "another agent" in str(exc_info.value).lower()
+
+        whois = await client.call_tool("whois", {
+            "project_key": project_key,
+            "agent_name": agent_a["name"],
+            "registration_token": agent_a["registration_token"],
+        })
+        assert whois.data["name"] == agent_a["name"]
+
+
+@pytest.mark.asyncio
+async def test_rotate_capability_preserves_retired_at(isolated_env):
+    """retired 行轮换：retired_at 不变。"""
+    project_key = "/test/setup/rotate-retired"
+    server = build_mcp_server()
+    async with Client(server) as client:
+        await client.call_tool("ensure_project", {"human_key": project_key})
+        agent = await _register_with_token(client, project_key)
+        name, old = agent["name"], agent["registration_token"]
+        await client.call_tool("retire_agent", {
+            "project_key": project_key,
+            "agent_name": name,
+            "registration_token": old,
+        })
+
+        new_token = "f" * 43
+        await client.call_tool("rotate_agent_capability", {
+            "project_key": project_key,
+            "agent_name": name,
+            "old_registration_token": old,
+            "new_registration_token": new_token,
+        })
+
+        from sqlmodel import select as _sm_select
+        from mcp_agent_mail.models import Agent as AgentModel
+        async with get_session() as session:
+            result = await session.execute(
+                _sm_select(AgentModel).where(AgentModel.name == name)
+            )
+            db_agent = result.scalars().first()
+            assert db_agent.retired_at is not None
+            assert db_agent.registration_token == new_token
+
+
+@pytest.mark.asyncio
+async def test_rotate_capability_logs_never_contain_capability_values(isolated_env, capsys):
+    """默认 TOOLS_LOG_ENABLED=true 时，工具日志不得出现旧/新 capability 值。"""
+    project_key = "/test/setup/rotate-log-redaction"
+    server = build_mcp_server()
+    async with Client(server) as client:
+        await client.call_tool("ensure_project", {"human_key": project_key})
+        agent = await _register_with_token(client, project_key)
+        name, old = agent["name"], agent["registration_token"]
+        new_token = "m" * 43
+        await client.call_tool("rotate_agent_capability", {
+            "project_key": project_key,
+            "agent_name": name,
+            "old_registration_token": old,
+            "new_registration_token": new_token,
+        })
+        captured = capsys.readouterr()
+        combined = captured.out + captured.err
+        assert old not in combined
+        assert new_token not in combined
+        assert "<redacted>" in combined
+
+
+@pytest.mark.asyncio
+async def test_rotate_capability_concurrent_same_old_token_single_success(isolated_env):
+    """同旧值并发轮换：BEGIN IMMEDIATE 串行化，恰好一个成功，最终值可认证。"""
+    import asyncio
+
+    project_key = "/test/setup/rotate-concurrent"
+    server = build_mcp_server()
+    async with Client(server) as client:
+        await client.call_tool("ensure_project", {"human_key": project_key})
+        agent = await _register_with_token(client, project_key)
+        name, old = agent["name"], agent["registration_token"]
+        new_a, new_b = "q" * 43, "r" * 43
+
+        results = await asyncio.gather(
+            client.call_tool("rotate_agent_capability", {
+                "project_key": project_key,
+                "agent_name": name,
+                "old_registration_token": old,
+                "new_registration_token": new_a,
+            }),
+            client.call_tool("rotate_agent_capability", {
+                "project_key": project_key,
+                "agent_name": name,
+                "old_registration_token": old,
+                "new_registration_token": new_b,
+            }),
+            return_exceptions=True,
+        )
+        successes = [r for r in results if not isinstance(r, Exception)]
+        assert len(successes) == 1, f"期望恰好一个成功，实际: {results!r}"
+
+        from sqlmodel import select as _sm_select
+        from mcp_agent_mail.models import Agent as AgentModel
+        async with get_session() as session:
+            db_agent = (await session.execute(
+                _sm_select(AgentModel).where(AgentModel.name == name)
+            )).scalars().first()
+        final_token = db_agent.registration_token
+        assert final_token in (new_a, new_b)
+        loser = new_b if final_token == new_a else new_a
+
+        async with Client(server) as fresh:
+            whois = await fresh.call_tool("whois", {
+                "project_key": project_key,
+                "agent_name": name,
+                "registration_token": final_token,
+            })
+            assert whois.data["name"] == name
+        async with Client(server) as loser_session:
+            with pytest.raises(Exception) as exc_info:
+                await loser_session.call_tool("whois", {
+                    "project_key": project_key,
+                    "agent_name": name,
+                    "registration_token": loser,
+                })
+            assert "registration_token" in str(exc_info.value).lower() or "invalid" in str(exc_info.value).lower()
+
+
+@pytest.mark.asyncio
+async def test_rotate_capability_concurrent_agents_same_new_value_single_success(isolated_env):
+    """两个 agent 并发轮换到同一 new capability：恰一个成功，最终无重复。"""
+    import asyncio
+
+    project_key = "/test/setup/rotate-concurrent-shared-new"
+    server = build_mcp_server()
+    async with Client(server) as client:
+        await client.call_tool("ensure_project", {"human_key": project_key})
+        agent_a = await _register_with_token(client, project_key)
+        agent_b = await _register_with_token(client, project_key)
+        shared_new = "s" * 43
+
+        results = await asyncio.gather(
+            client.call_tool("rotate_agent_capability", {
+                "project_key": project_key,
+                "agent_name": agent_a["name"],
+                "old_registration_token": agent_a["registration_token"],
+                "new_registration_token": shared_new,
+            }),
+            client.call_tool("rotate_agent_capability", {
+                "project_key": project_key,
+                "agent_name": agent_b["name"],
+                "old_registration_token": agent_b["registration_token"],
+                "new_registration_token": shared_new,
+            }),
+            return_exceptions=True,
+        )
+        successes = [r for r in results if not isinstance(r, Exception)]
+        assert len(successes) == 1, f"期望恰好一个成功，实际: {results!r}"
+
+        # 最终 DB 中该 new 值只能出现一次
+        from sqlmodel import select as _sm_select
+        from mcp_agent_mail.models import Agent as AgentModel
+        async with get_session() as session:
+            rows = (await session.execute(
+                _sm_select(AgentModel).where(AgentModel.registration_token == shared_new)
+            )).scalars().all()
+        assert len(rows) == 1, f"new 值出现 {len(rows)} 次，期望 1 次"
+
+
+@pytest.mark.asyncio
+async def test_rotate_capability_error_panel_redacts_sentinel(isolated_env, capsys, monkeypatch):
+    """异常文本含 capability 值：Rich error panel 不得泄漏（默认 logging=true）。"""
+    project_key = "/test/setup/rotate-error-redact"
+    server = build_mcp_server()
+    async with Client(server) as client:
+        await client.call_tool("ensure_project", {"human_key": project_key})
+        agent = await _register_with_token(client, project_key)
+        name, old = agent["name"], agent["registration_token"]
+        new_token = "z" * 43
+
+        from contextlib import asynccontextmanager
+
+        from mcp_agent_mail import app as app_module
+
+        @asynccontextmanager
+        async def boom(*_args, **_kwargs):
+            raise RuntimeError(f"commit failed old={old} new={new_token}")
+            yield  # pragma: no cover
+
+        monkeypatch.setattr(app_module, "get_immediate_session", boom)
+        with pytest.raises(Exception):
+            await client.call_tool("rotate_agent_capability", {
+                "project_key": project_key,
+                "agent_name": name,
+                "old_registration_token": old,
+                "new_registration_token": new_token,
+            })
+
+        captured = capsys.readouterr()
+        combined = captured.out + captured.err
+        assert old not in combined
+        assert new_token not in combined
+
+
+def test_log_safe_error_redacts_nested_data_and_panel():
+    """异常 data 嵌套 values/raw/message 字符串：safe_data 与渲染面板均无值。"""
+    from mcp_agent_mail.app import ToolExecutionError, _LogSafeError
+    from mcp_agent_mail.rich_logger import ToolCallContext, render_tool_call_panel
+
+    old = "old" + "x" * 40
+    new = "new" + "y" * 40
+    exc = ToolExecutionError(
+        "INVALID_ARGUMENT",
+        f"commit failed old={old} new={new}",
+        recoverable=True,
+        data={
+            "payload": {"values": [f"old={old}", f"nested={new}"]},
+            "raw": f"raw {new}",
+            "message": f"msg {old}",
+            "agent_name": "demo-main",
+        },
+    )
+    safe = _LogSafeError(exc, [old, new])
+    assert old not in safe.safe_str() and new not in safe.safe_str()
+    blob = json.dumps(safe.safe_data(), ensure_ascii=False)
+    assert old not in blob and new not in blob
+
+    ctx = ToolCallContext(tool_name="rotate_agent_capability", args=[], kwargs={})
+    ctx.error = safe
+    ctx.success = False
+    panel_text = render_tool_call_panel(ctx)
+    assert old not in panel_text and new not in panel_text
