@@ -36,6 +36,9 @@ def _configure_hub_jwt(monkeypatch):
     monkeypatch.setenv("HTTP_JWT_ENABLED", "true")
     monkeypatch.setenv("HTTP_JWT_ALGORITHMS", "HS256")
     monkeypatch.setenv("HTTP_JWT_SECRET", "hub-reply-secret")
+    monkeypatch.setenv("HTTP_JWT_JWKS_URL", "")
+    monkeypatch.setenv("HTTP_JWT_AUDIENCE", "")
+    monkeypatch.setenv("HTTP_JWT_ISSUER", "")
     monkeypatch.setenv("HTTP_RBAC_ENABLED", "true")
     monkeypatch.setenv("HTTP_RBAC_WRITER_ROLES", "writer")
     monkeypatch.setenv("HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED", "false")
@@ -84,11 +87,21 @@ async def _join_active(client, admin_headers, member_headers, human_id, handle, 
     assert approve.status_code == 200
 
 
-async def _mk_lead(client: AsyncClient, headers: dict[str, str], session_id: str, label: str = "codex-main"):
+async def _mk_lead(
+    client: AsyncClient,
+    headers: dict[str, str],
+    session_id: str,
+    label: str = "codex-main",
+    reply_mode: str = "auto",
+):
     resp = await client.put(
         "/hub/api/projects/core/session-lead",
         headers=headers,
-        json={"client_session_id": session_id, "lead_label": label},
+        json={
+            "client_session_id": session_id,
+            "lead_label": label,
+            "reply_mode": reply_mode,
+        },
     )
     assert resp.status_code in (200, 201), resp.text
     return resp
@@ -419,3 +432,251 @@ async def test_rotate_reply_token_requires_bool(hub):
         assert bad.status_code == 400
         still = await _reply(client, "s1", token1)
         assert still.status_code == 201
+
+
+@pytest.mark.anyio
+async def test_confirm_claim_draft_approve_reject_and_complete(hub):
+    settings, app = hub
+    root = _headers(settings, "oidc|root", admin=True)
+    alice = _headers(settings, "oidc|alice")
+    bob = _headers(settings, "oidc|bob")
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        await _setup_team(client, root)
+        alice_id = await _register_human(client, alice, "Alice")
+        bob_id = await _register_human(client, bob, "Bob")
+        await _join_active(client, root, alice, alice_id, "alice")
+        await _join_active(client, root, bob, bob_id, "bob")
+        alice_lead = await _mk_lead(
+            client, alice, "alice-1", reply_mode="confirm"
+        )
+        alice_token = alice_lead.json()["reply_token"]
+        await _mk_lead(client, bob, "bob-1")
+
+        incoming = await client.post(
+            "/hub/api/projects/core/support-requests",
+            headers=bob,
+            json={
+                "subject": "需要处理",
+                "body_md": "请回复",
+                "mention_handles": ["alice"],
+            },
+        )
+        assert incoming.status_code == 201, incoming.text
+
+        claim = await client.post(
+            "/hub/api/projects/core/session-lead/inbox/claim",
+            json={"client_session_id": "alice-1", "reply_token": alice_token},
+        )
+        assert claim.status_code == 201, claim.text
+        claimed = claim.json()
+        assert claimed["reply_mode"] == "confirm"
+        assert claimed["message"]["subject"] == "需要处理"
+        assert claimed["message"]["sender_handle"] == "bob"
+        inbox_item_id = claimed["message"]["inbox_item_id"]
+        claim_token = claimed["claim_token"]
+
+        blocked = await _reply(
+            client,
+            "alice-1",
+            alice_token,
+            subject="不得直发",
+            mentions=["bob"],
+        )
+        assert blocked.status_code == 409
+        assert blocked.json()["detail"] == "Human confirmation is required"
+
+        draft_payload = {
+            "client_session_id": "alice-1",
+            "reply_token": alice_token,
+            "inbox_item_id": inbox_item_id,
+            "claim_token": claim_token,
+            "subject": "确认后回复",
+            "body_md": "已处理",
+            "mention_handles": ["bob"],
+            "idempotency_key": "draft-1",
+        }
+        draft = await client.post(
+            "/hub/api/projects/core/session-lead/reply-drafts",
+            json=draft_payload,
+        )
+        assert draft.status_code == 201, draft.text
+        draft_id = draft.json()["draft"]["id"]
+        replay = await client.post(
+            "/hub/api/projects/core/session-lead/reply-drafts",
+            json=draft_payload,
+        )
+        assert replay.status_code == 200
+        assert replay.json()["status"] == "already_exists"
+        assert replay.json()["draft"]["id"] == draft_id
+
+        listed = await client.get(
+            "/hub/api/projects/core/reply-drafts", headers=alice
+        )
+        assert listed.status_code == 200
+        assert [item["id"] for item in listed.json()["drafts"]] == [draft_id]
+
+        approved = await client.post(
+            f"/hub/api/projects/core/reply-drafts/{draft_id}/approve",
+            headers=alice,
+        )
+        assert approved.status_code == 201, approved.text
+        assert approved.json()["status"] == "approved"
+        approved_again = await client.post(
+            f"/hub/api/projects/core/reply-drafts/{draft_id}/approve",
+            headers=alice,
+        )
+        assert approved_again.status_code == 200
+        assert approved_again.json()["status"] == "already_approved"
+
+        denied_complete = await client.post(
+            f"/hub/api/projects/core/session-lead/inbox/{inbox_item_id}/complete",
+            json={
+                "client_session_id": "alice-1",
+                "reply_token": alice_token,
+                "claim_token": "wrong-claim-token",
+            },
+        )
+        assert denied_complete.status_code == 403
+
+        completed = await client.post(
+            f"/hub/api/projects/core/session-lead/inbox/{inbox_item_id}/complete",
+            json={
+                "client_session_id": "alice-1",
+                "reply_token": alice_token,
+                "claim_token": claim_token,
+            },
+        )
+        assert completed.status_code == 200
+        assert completed.json()["status"] == "completed"
+        completed_again = await client.post(
+            f"/hub/api/projects/core/session-lead/inbox/{inbox_item_id}/complete",
+            json={
+                "client_session_id": "alice-1",
+                "reply_token": alice_token,
+                "claim_token": claim_token,
+            },
+        )
+        assert completed_again.json()["status"] == "already_completed"
+
+        second_incoming = await client.post(
+            "/hub/api/projects/core/support-requests",
+            headers=bob,
+            json={
+                "subject": "拒绝测试",
+                "body_md": "请回复",
+                "mention_handles": ["alice"],
+            },
+        )
+        assert second_incoming.status_code == 201
+        second_claim = await client.post(
+            "/hub/api/projects/core/session-lead/inbox/claim",
+            json={"client_session_id": "alice-1", "reply_token": alice_token},
+        )
+        second = second_claim.json()
+        second_draft = await client.post(
+            "/hub/api/projects/core/session-lead/reply-drafts",
+            json={
+                "client_session_id": "alice-1",
+                "reply_token": alice_token,
+                "inbox_item_id": second["message"]["inbox_item_id"],
+                "claim_token": second["claim_token"],
+                "subject": "拒绝草稿",
+                "body_md": "不会发送",
+                "mention_handles": ["bob"],
+                "idempotency_key": "draft-2",
+            },
+        )
+        second_draft_id = second_draft.json()["draft"]["id"]
+        rejected = await client.post(
+            f"/hub/api/projects/core/reply-drafts/{second_draft_id}/reject",
+            headers=alice,
+        )
+        assert rejected.status_code == 200
+        assert rejected.json()["status"] == "rejected"
+        cannot_approve = await client.post(
+            f"/hub/api/projects/core/reply-drafts/{second_draft_id}/approve",
+            headers=alice,
+        )
+        assert cannot_approve.status_code == 409
+
+        async with get_session() as session:
+            sent = (
+                await session.execute(
+                    select(ChannelMessage).where(
+                        ChannelMessage.subject == "确认后回复"
+                    )
+                )
+            ).scalars().all()
+            rejected_messages = (
+                await session.execute(
+                    select(ChannelMessage).where(
+                        ChannelMessage.subject == "拒绝草稿"
+                    )
+                )
+            ).scalars().all()
+            assert len(sent) == 1
+            assert rejected_messages == []
+
+
+@pytest.mark.anyio
+async def test_reply_mode_switch_rotates_capability_and_auto_sends(hub):
+    settings, app = hub
+    root = _headers(settings, "oidc|root", admin=True)
+    alice = _headers(settings, "oidc|alice")
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        await _setup_team(client, root)
+        alice_id = await _register_human(client, alice, "Alice")
+        await _join_active(client, root, alice, alice_id, "alice")
+        confirm = await _mk_lead(
+            client, alice, "alice-1", reply_mode="confirm"
+        )
+        old_token = confirm.json()["reply_token"]
+
+        switched = await client.put(
+            "/hub/api/projects/core/session-lead",
+            headers=alice,
+            json={
+                "client_session_id": "alice-1",
+                "lead_label": "codex-main",
+                "reply_mode": "auto",
+            },
+        )
+        assert switched.status_code == 200
+        assert switched.json()["binding"]["reply_mode"] == "auto"
+        new_token = switched.json()["reply_token"]
+        assert new_token != old_token
+        assert (await _reply(client, "alice-1", old_token)).status_code == 403
+        direct = await _reply(
+            client,
+            "alice-1",
+            new_token,
+            subject="自动回复",
+            idem="auto-1",
+        )
+        assert direct.status_code == 201, direct.text
+
+        invalid_mode = await client.put(
+            "/hub/api/projects/core/session-lead",
+            headers=alice,
+            json={
+                "client_session_id": "alice-1",
+                "lead_label": "codex-main",
+                "reply_mode": "sometimes",
+            },
+        )
+        assert invalid_mode.status_code == 400
+
+        unbound = await client.request(
+            "DELETE",
+            "/hub/api/projects/core/session-lead",
+            headers=alice,
+            json={"client_session_id": "alice-1"},
+        )
+        assert unbound.status_code == 200
+        claim = await client.post(
+            "/hub/api/projects/core/session-lead/inbox/claim",
+            json={"client_session_id": "alice-1", "reply_token": new_token},
+        )
+        assert claim.status_code == 403

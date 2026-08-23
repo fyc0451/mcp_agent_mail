@@ -944,6 +944,13 @@ def _setup_fts(connection: Any) -> None:
         "ALTER TABLE session_lead_bindings ADD COLUMN reply_token_hash VARCHAR(64) DEFAULT NULL",
         # M3 session-team: original mention handles for reply-key replays.
         "ALTER TABLE session_lead_reply_keys ADD COLUMN mention_handles VARCHAR(8192) DEFAULT '[]'",
+        # M4 team reply policy: legacy bindings are confirm-mode.
+        "ALTER TABLE session_lead_bindings ADD COLUMN reply_mode VARCHAR(16) DEFAULT 'confirm'",
+        # M4 capability-scoped inbox claim lifecycle.
+        "ALTER TABLE human_inbox_items ADD COLUMN claim_binding_id INTEGER DEFAULT NULL",
+        "ALTER TABLE human_inbox_items ADD COLUMN claim_token_hash VARCHAR(64) DEFAULT NULL",
+        "ALTER TABLE human_inbox_items ADD COLUMN claim_expires_at DATETIME DEFAULT NULL",
+        "ALTER TABLE human_inbox_items ADD COLUMN completed_at DATETIME DEFAULT NULL",
     ]:
         with suppress(Exception):  # Column already exists — safe to ignore
             connection.exec_driver_sql(migration_sql)
@@ -958,6 +965,12 @@ def _setup_fts(connection: Any) -> None:
         # M3a: case-insensitive unique mention_handle within a project.
         "CREATE UNIQUE INDEX IF NOT EXISTS uq_phm_project_handle_ci "
         "ON project_human_memberships (project_id, lower(mention_handle))",
+        "CREATE INDEX IF NOT EXISTS ix_hii_claim_binding_id "
+        "ON human_inbox_items (claim_binding_id)",
+        "CREATE INDEX IF NOT EXISTS ix_hii_claim_expires_at "
+        "ON human_inbox_items (claim_expires_at)",
+        "CREATE INDEX IF NOT EXISTS ix_hii_completed_at "
+        "ON human_inbox_items (completed_at)",
     ]:
         connection.exec_driver_sql(index_sql)
 
@@ -997,6 +1010,10 @@ def _setup_fts(connection: Any) -> None:
     connection.exec_driver_sql(
         "UPDATE human_inbox_items SET kind = 'session_lead' "
         "WHERE kind = 'managed_session_agent'"
+    )
+    connection.exec_driver_sql(
+        "UPDATE session_lead_bindings SET reply_mode = 'confirm' "
+        "WHERE reply_mode IS NULL OR reply_mode NOT IN ('confirm', 'auto')"
     )
 
 

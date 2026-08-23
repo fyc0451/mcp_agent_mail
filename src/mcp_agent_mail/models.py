@@ -522,6 +522,12 @@ class HumanInboxItem(SQLModel, table=True):
     )
     kind: str = Field(default="mention", max_length=16)
     read_ts: Optional[datetime] = Field(default=None)
+    claim_binding_id: Optional[int] = Field(
+        default=None, foreign_key="session_lead_bindings.id", index=True
+    )
+    claim_token_hash: Optional[str] = Field(default=None, max_length=64)
+    claim_expires_at: Optional[datetime] = Field(default=None, index=True)
+    completed_at: Optional[datetime] = Field(default=None, index=True)
     created_ts: datetime = Field(default_factory=_utcnow_naive)
 
 
@@ -564,6 +570,7 @@ class SessionLeadBinding(SQLModel, table=True):
     # SHA-256 hex of the reply capability token; the plaintext is returned
     # once at creation/rotation and never stored. NULL = no capability.
     reply_token_hash: Optional[str] = Field(default=None, max_length=64)
+    reply_mode: str = Field(default="confirm", max_length=16)  # confirm | auto
     status: str = Field(default="active", max_length=16)  # active | unbound
     created_at: datetime = Field(default_factory=_utcnow_naive)
     updated_at: datetime = Field(default_factory=_utcnow_naive)
@@ -591,3 +598,30 @@ class SessionLeadReplyKey(SQLModel, table=True):
     # the retry request's handles, so a recovered delivery matches the first.
     mention_handles: str = Field(default="[]", max_length=8192)
     created_ts: datetime = Field(default_factory=_utcnow_naive)
+
+
+class SessionLeadReplyDraft(SQLModel, table=True):
+    """Human-approved reply proposed by a confirm-mode session lead."""
+
+    __tablename__ = "session_lead_reply_drafts"
+    __table_args__ = (
+        UniqueConstraint("binding_id", "idem_key", name="uq_slrd_binding_key"),
+        UniqueConstraint("binding_id", "inbox_item_id", name="uq_slrd_binding_inbox"),
+        Index("ix_slrd_binding_status", "binding_id", "status"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    binding_id: int = Field(foreign_key="session_lead_bindings.id", index=True)
+    inbox_item_id: int = Field(foreign_key="human_inbox_items.id", index=True)
+    idem_key: str = Field(max_length=128)
+    subject: str = Field(max_length=512)
+    body_md: str
+    importance: str = Field(default="normal", max_length=16)
+    mention_handles: str = Field(default="[]", max_length=8192)
+    status: str = Field(default="pending", max_length=16)  # pending | approved | rejected
+    sent_message_id: Optional[int] = Field(
+        default=None, foreign_key="channel_messages.id", index=True
+    )
+    created_at: datetime = Field(default_factory=_utcnow_naive)
+    updated_at: datetime = Field(default_factory=_utcnow_naive)
+    decided_at: Optional[datetime] = Field(default=None)
