@@ -92,6 +92,34 @@ def test_login_failures_are_generic_and_rate_limited(tmp_path):
     assert response.status_code == 429
 
 
+def test_authenticated_user_changes_password_without_revoking_existing_token(tmp_path):
+    _, client, credentials = _bootstrapped_client(tmp_path)
+    old_secret = json.loads(credentials.read_text())
+    login = client.post("/token", json=old_secret)
+    token = login.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    assert client.patch(
+        "/me/password", json={"new_password": "new-password-1234"}
+    ).status_code == 401
+    too_short = client.patch(
+        "/me/password", headers=headers, json={"new_password": "too-short"}
+    )
+    assert too_short.status_code == 400
+    changed = client.patch(
+        "/me/password", headers=headers, json={"new_password": "new-password-1234"}
+    )
+    assert changed.status_code == 200
+    assert changed.json() == {"ok": True}
+
+    assert client.get("/me", headers=headers).status_code == 200
+    assert client.post("/token", json=old_secret).status_code == 401
+    assert client.post(
+        "/token",
+        json={"username": old_secret["username"], "password": "new-password-1234"},
+    ).status_code == 200
+
+
 def test_discovery_exposes_public_metadata_only(tmp_path):
     _, client, credentials = _bootstrapped_client(tmp_path)
     discovery = client.get("/.well-known/openid-configuration")
