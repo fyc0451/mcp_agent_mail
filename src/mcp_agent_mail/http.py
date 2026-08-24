@@ -2696,6 +2696,11 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             if project is None or project.archived_at is not None:
                 raise HTTPException(status_code=404, detail="Project not found")
             membership = await _hub_active_membership(project, human, session=session)
+            if requested_handles is None and membership.role != "admin":
+                raise HTTPException(
+                    status_code=403,
+                    detail="只有话题管理员可以使用 @all",
+                )
             sender, sender_kind = await _hub_support_sender(
                 project,
                 human,
