@@ -449,6 +449,27 @@ class Human(SQLModel, table=True):
     created_at: datetime = Field(default_factory=_utcnow_naive)
 
 
+class HumanPresence(SQLModel, table=True):
+    """Per-client Human presence heartbeat.
+
+    Presence is global to the authenticated Human, not tied to a project.
+    Separate client rows prevent one device logout from marking another active
+    device offline. Roster reads derive online state from recent rows.
+    """
+
+    __tablename__ = "human_presences"
+    __table_args__ = (
+        UniqueConstraint("human_id", "client_id", name="uq_human_presence_client"),
+        Index("ix_human_presence_recent", "human_id", "online", "last_seen_at"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    human_id: int = Field(foreign_key="humans.id", index=True)
+    client_id: str = Field(max_length=128)
+    online: bool = Field(default=True)
+    last_seen_at: datetime = Field(default_factory=_utcnow_naive)
+
+
 class ProjectHumanMembership(SQLModel, table=True):
     """M3a membership of a global human within a project (per-project role).
 

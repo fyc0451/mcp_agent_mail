@@ -17,6 +17,7 @@ import asyncio
 import base64
 import contextlib
 import json
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pytest
@@ -28,7 +29,7 @@ from mcp_agent_mail import config as _config
 from mcp_agent_mail.app import build_mcp_server
 from mcp_agent_mail.db import get_session
 from mcp_agent_mail.http import build_http_app
-from mcp_agent_mail.models import Agent, Project, TeamProject
+from mcp_agent_mail.models import Agent, HumanPresence, Project, TeamProject
 
 
 def _rpc(method: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -1141,6 +1142,7 @@ class TestHubHumanIdentityApi:
             for m in members:
                 assert set(m) == {
                     "human_id", "display_name", "mention_handle", "role", "status",
+                    "online", "last_seen_at",
                 }
                 assert m["status"] == "active"
 
@@ -1152,4 +1154,102 @@ class TestHubHumanIdentityApi:
             for m in admin_members:
                 assert "default_agent_id" in m
                 assert "id" in m and "project_id" in m
+                assert "online" in m and "last_seen_at" in m
             assert next(m for m in admin_members if m["mention_handle"] == "carol")["status"] == "invited"
+
+    @pytest.mark.asyncio
+    async def test_human_presence_supports_multiple_clients_logout_and_timeout(
+        self, isolated_env, monkeypatch
+    ):
+        settings = _configure_hub_jwt(monkeypatch)
+        app = build_http_app(settings, build_mcp_server())
+        alice_headers = _hub_headers(settings, "oidc|alice", role=["writer", "admin"])
+        bob_headers = _hub_headers(settings, "oidc|bob")
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            alice = await client.put(
+                "/hub/api/humans/me", headers=alice_headers, json={"display_name": "Alice"},
+            )
+            bob = await client.put(
+                "/hub/api/humans/me", headers=bob_headers, json={"display_name": "Bob"},
+            )
+            assert alice.status_code == bob.status_code == 200
+            created = await client.post(
+                "/hub/api/projects",
+                headers=alice_headers,
+                json={"name": "Presence", "slug": "presence", "mention_handle": "alice"},
+            )
+            assert created.status_code == 201
+            joined = await client.post(
+                "/hub/api/projects/presence/join-requests",
+                headers=bob_headers,
+                json={"mention_handle": "bob"},
+            )
+            assert joined.status_code == 201
+            approved = await client.patch(
+                f"/hub/api/projects/presence/members/{bob.json()['id']}",
+                headers=alice_headers,
+                json={"status": "active"},
+            )
+            assert approved.status_code == 200
+
+            for client_id in ("cockpit-wsl-1234", "cockpit-mac-5678"):
+                heartbeat = await client.post(
+                    "/hub/api/presence",
+                    headers=bob_headers,
+                    json={"client_id": client_id, "online": True},
+                )
+                assert heartbeat.status_code == 200
+                assert heartbeat.json()["online"] is True
+
+            one_client_logout = await client.post(
+                "/hub/api/presence",
+                headers=bob_headers,
+                json={"client_id": "cockpit-wsl-1234", "online": False},
+            )
+            assert one_client_logout.status_code == 200
+            assert one_client_logout.json()["online"] is True
+
+            roster = await client.get(
+                "/hub/api/projects/presence/members", headers=alice_headers,
+            )
+            bob_row = next(
+                row for row in roster.json()["members"] if row["mention_handle"] == "bob"
+            )
+            assert bob_row["online"] is True
+            assert bob_row["last_seen_at"].endswith("Z")
+
+            async with get_session() as session:
+                rows = (await session.execute(select(HumanPresence))).scalars().all()
+                for row in rows:
+                    row.last_seen_at = (
+                        datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=61)
+                    )
+                    session.add(row)
+                await session.commit()
+
+            expired = await client.get(
+                "/hub/api/projects/presence/members", headers=alice_headers,
+            )
+            expired_bob = next(
+                row for row in expired.json()["members"] if row["mention_handle"] == "bob"
+            )
+            assert expired_bob["online"] is False
+            assert expired_bob["last_seen_at"].endswith("Z")
+
+            resumed = await client.post(
+                "/hub/api/presence",
+                headers=bob_headers,
+                json={"client_id": "cockpit-mac-5678", "online": True},
+            )
+            assert resumed.status_code == 200
+            assert resumed.json()["online"] is True
+            resumed_roster = await client.get(
+                "/hub/api/projects/presence/members", headers=alice_headers,
+            )
+            resumed_bob = next(
+                row for row in resumed_roster.json()["members"]
+                if row["mention_handle"] == "bob"
+            )
+            assert resumed_bob["online"] is True

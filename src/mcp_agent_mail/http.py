@@ -61,6 +61,7 @@ from .models import (
     ChannelMessage,
     Human,
     HumanInboxItem,
+    HumanPresence,
     Message,
     Project,
     ProjectHumanMembership,
@@ -91,6 +92,9 @@ from .storage import (
     write_agent_profile,
     write_file_reservation_record,
 )
+
+_HUMAN_PRESENCE_TTL_SECONDS = 60
+_HUMAN_PRESENCE_CLIENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{15,127}$")
 
 
 async def _project_slug_from_id(pid: int | None) -> str | None:
@@ -1866,6 +1870,43 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             "default_agent_id": membership.default_agent_id,
         }
 
+    def _hub_presence_timestamp(value: datetime | None) -> str | None:
+        if value is None:
+            return None
+        return value.replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
+
+    async def _hub_presence_states(
+        human_ids: list[int],
+        *,
+        session: AsyncSession,
+    ) -> dict[int, dict[str, Any]]:
+        if not human_ids:
+            return {}
+        rows = await session.execute(
+            select(HumanPresence).where(
+                cast(Any, HumanPresence.human_id).in_(human_ids)
+            )
+        )
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        cutoff = now - timedelta(seconds=_HUMAN_PRESENCE_TTL_SECONDS)
+        states: dict[int, dict[str, Any]] = {}
+        for row in rows.scalars().all():
+            state = states.setdefault(
+                row.human_id,
+                {"online": False, "last_seen_at": None},
+            )
+            if state["last_seen_at"] is None or row.last_seen_at > state["last_seen_at"]:
+                state["last_seen_at"] = row.last_seen_at
+            if row.online and row.last_seen_at >= cutoff:
+                state["online"] = True
+        return {
+            human_id: {
+                "online": bool(state["online"]),
+                "last_seen_at": _hub_presence_timestamp(state["last_seen_at"]),
+            }
+            for human_id, state in states.items()
+        }
+
     def _hub_agent_payload(agent: Agent) -> dict[str, Any]:
         return {
             "id": agent.id,
@@ -1982,6 +2023,43 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         async with get_session() as session:
             human = await _hub_human(request, session=session)
             return JSONResponse(_hub_human_payload(human))
+
+    @fastapi_app.post("/hub/api/presence", response_class=JSONResponse)
+    async def hub_update_presence(request: Request) -> JSONResponse:
+        """Record one authenticated Cockpit client's online/offline state."""
+        await ensure_schema()
+        body = await _hub_json_body(request)
+        if set(body) != {"client_id", "online"}:
+            raise HTTPException(status_code=400, detail="client_id and online are required")
+        client_id = body.get("client_id")
+        online = body.get("online")
+        if not isinstance(client_id, str) or not _HUMAN_PRESENCE_CLIENT_RE.fullmatch(client_id):
+            raise HTTPException(status_code=400, detail="Invalid presence client_id")
+        if not isinstance(online, bool):
+            raise HTTPException(status_code=400, detail="online must be a boolean")
+        async with get_session() as session:
+            human = await _hub_materialize_claimed_human(request, session=session)
+            if human.id is None:
+                raise HTTPException(status_code=404, detail="Human identity is not registered")
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
+            statement = sqlite_insert(HumanPresence).values(
+                human_id=human.id,
+                client_id=client_id,
+                online=online,
+                last_seen_at=now,
+            )
+            await session.execute(
+                statement.on_conflict_do_update(
+                    index_elements=["human_id", "client_id"],
+                    set_={"online": online, "last_seen_at": now},
+                )
+            )
+            await session.commit()
+            state = (await _hub_presence_states([human.id], session=session)).get(
+                human.id,
+                {"online": False, "last_seen_at": None},
+            )
+            return JSONResponse(state)
 
     @fastapi_app.get("/hub/api/agents", response_class=JSONResponse)
     async def hub_list_agent_directory(request: Request) -> JSONResponse:
@@ -2269,7 +2347,12 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 .order_by(cast(Any, ProjectHumanMembership.created_at))
             )
             members = []
-            for membership, member_human in rows.all():
+            member_rows = rows.all()
+            presence_states = await _hub_presence_states(
+                [membership.human_id for membership, _member_human in member_rows],
+                session=session,
+            )
+            for membership, member_human in member_rows:
                 if is_admin:
                     payload = _hub_membership_payload(membership)
                 else:
@@ -2280,6 +2363,10 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                         "status": membership.status,
                     }
                 payload["display_name"] = member_human.display_name
+                payload.update(presence_states.get(
+                    membership.human_id,
+                    {"online": False, "last_seen_at": None},
+                ))
                 members.append(payload)
             return JSONResponse({"members": members})
 
