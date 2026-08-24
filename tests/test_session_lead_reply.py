@@ -208,7 +208,7 @@ async def test_member_removal_invalidates_token(hub):
 
 
 @pytest.mark.anyio
-async def test_reply_delivers_support_with_attribution_and_fallback(hub):
+async def test_reply_delivers_support_without_recursive_lead_work(hub):
     settings, app = hub
     root = _headers(settings, "oidc|root", admin=True)
     alice = _headers(settings, "oidc|alice")
@@ -236,15 +236,14 @@ async def test_reply_delivers_support_with_attribution_and_fallback(hub):
             ).scalars().one()
             sender = await session.get(Agent, message.sender_id)
             assert sender is not None and sender.program == "team-session-lead"
-            # @bob 有默认 lead -> 投递到 lead 且回落 bob 的人工收件箱
+            # The managed lead gets the normal mention receipt, but a Session Lead
+            # answer is terminal and must not become another managed-lead work item.
             items = (
                 await session.execute(
                     select(HumanInboxItem).where(HumanInboxItem.human_id == bob_id)
                 )
             ).scalars().all()
-            assert len(items) == 1
-            assert items[0].kind == "session_lead"
-            assert items[0].source_channel_message_id == message.id
+            assert items == []
 
 
 @pytest.mark.anyio
@@ -410,7 +409,8 @@ async def test_replay_recovers_failed_mention_delivery(hub, monkeypatch):
                     select(HumanInboxItem).where(HumanInboxItem.human_id == bob_id)
                 )
             ).scalars().all()
-            assert len(items) == 1  # 恢复投递成功, bob 收到了
+            # Session Lead 回复的重放同样不能创建下一轮 managed-lead 工作。
+            assert items == []
 
 
 @pytest.mark.anyio

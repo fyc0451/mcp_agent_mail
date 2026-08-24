@@ -5007,6 +5007,8 @@ async def _write_channel_mention_receipt(
     sender: Agent,
     source: ChannelMessage,
     recipients: Sequence[Agent],
+    *,
+    create_session_lead_inbox: bool = True,
 ) -> dict[int, tuple[str, int | None]]:
     """Atomically create one receipt group, then archive or compensate it.
 
@@ -5074,13 +5076,18 @@ async def _write_channel_mention_receipt(
                             receipt_message_id=message.id,
                         )
                     )
-                await _fallback_session_lead_inbox(
-                    target_project,
-                    message,
-                    [recipient.id for recipient in new_recipients if recipient.id is not None],
-                    source_channel_message_id=source.id,
-                    session=session,
-                )
+                if create_session_lead_inbox:
+                    await _fallback_session_lead_inbox(
+                        target_project,
+                        message,
+                        [
+                            recipient.id
+                            for recipient in new_recipients
+                            if recipient.id is not None
+                        ],
+                        source_channel_message_id=source.id,
+                        session=session,
+                    )
                 try:
                     await session.commit()
                     await session.refresh(message)
@@ -5232,6 +5239,8 @@ async def _deliver_channel_mentions(
     sender: Agent,
     source: ChannelMessage,
     names: Sequence[str],
+    *,
+    create_session_lead_inbox: bool = True,
 ) -> list[ChannelMentionDeliveryDTO]:
     """Best-effort durable receipt fanout, grouped by target project."""
     if channel_project.id is None or sender.id is None or source.id is None:
@@ -5265,7 +5274,13 @@ async def _deliver_channel_mentions(
     for project, members in groups.values():
         agents = [resolution.agent for _index, resolution in members if resolution.agent is not None]
         try:
-            statuses = await _write_channel_mention_receipt(project, sender, source, agents)
+            statuses = await _write_channel_mention_receipt(
+                project,
+                sender,
+                source,
+                agents,
+                create_session_lead_inbox=create_session_lead_inbox,
+            )
         except Exception:
             logger.exception(
                 "Failed to deliver channel mention receipts for channel_message=%s target_project=%s",

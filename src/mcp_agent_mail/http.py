@@ -3573,9 +3573,14 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         deliveries = await _deliver_channel_mentions(
             cast(Any, _HubHTTPDeliveryContext()),
             project,
-            replay_sender,
-            replay_message,
+            cast(Agent, replay_sender),
+            cast(ChannelMessage, replay_message),
             replay_handles,
+            # A managed lead response is the terminal answer to one authorized
+            # Human message. Keep it in the Team timeline and normal mention
+            # delivery, but never turn it into another managed-lead work item:
+            # two auto bindings would otherwise reply to each other forever.
+            create_session_lead_inbox=False,
         )
         if fresh_insert or not idem_key:
             return JSONResponse(
