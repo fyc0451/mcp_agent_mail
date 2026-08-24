@@ -1745,6 +1745,39 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             raise HTTPException(status_code=404, detail="Human identity is not registered")
         return human
 
+    async def _hub_materialize_claimed_human(
+        request: Request,
+        *,
+        session: AsyncSession,
+    ) -> Human:
+        """幂等补建已认证 Human，使旧客户端也能先列出 Topic。"""
+        subject = _hub_subject(request)
+        human = await _human_by_subject(subject, session=session)
+        if human is not None:
+            return human
+        claims = getattr(request.state, "jwt_claims", None)
+        display_name = None
+        if isinstance(claims, dict):
+            for key in ("name", "preferred_username"):
+                value = claims.get(key)
+                if isinstance(value, str) and value.strip():
+                    display_name = value.strip()
+                    break
+        try:
+            human = await _ensure_human(
+                subject,
+                display_name or subject,
+                session=session,
+            )
+            await session.commit()
+        except IntegrityError:
+            await session.rollback()
+            human = await _human_by_subject(subject, session=session)
+            if human is None:
+                raise HTTPException(status_code=409, detail="Human identity conflict") from None
+        await session.refresh(human)
+        return human
+
     async def _hub_team_project(slug: str, *, session: AsyncSession) -> TeamProject:
         if not _SLUG_VALIDATOR_RE.fullmatch(slug):
             raise HTTPException(status_code=400, detail="Invalid project slug")
@@ -1993,7 +2026,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         """List only user-created logical groups, never technical mail projects."""
         await ensure_schema()
         async with get_session() as session:
-            human = await _hub_human(request, session=session)
+            human = await _hub_materialize_claimed_human(request, session=session)
             if human.id is None:
                 raise HTTPException(status_code=404, detail="Human identity is not registered")
             rows = await session.execute(
