@@ -37,11 +37,20 @@ def _configure_hub_jwt(monkeypatch):
     return _config.get_settings()
 
 
-def _headers(settings, subject: str, *, admin: bool = False) -> dict[str, str]:
+def _headers(
+    settings,
+    subject: str,
+    *,
+    admin: bool = False,
+    name: str | None = None,
+) -> dict[str, str]:
     roles = ["writer", "admin"] if admin else ["writer"]
+    claims = {"sub": subject, settings.http.jwt_role_claim: roles}
+    if name is not None:
+        claims["name"] = name
     token = jwt.encode(
         {"alg": "HS256"},
-        {"sub": subject, settings.http.jwt_role_claim: roles},
+        claims,
         settings.http.jwt_secret,
     ).decode("utf-8")
     return {"Authorization": f"Bearer {token}"}
@@ -206,6 +215,29 @@ async def test_global_admin_binds_without_membership(hub):
         )
         assert bound.status_code == 201
         assert bound.json()["status"] == "active"
+
+
+@pytest.mark.anyio
+async def test_project_listing_materializes_active_jwt_human(hub):
+    settings, app = hub
+    admin = _headers(settings, "human:fyc", admin=True)
+    newcomer = _headers(settings, "human:xieyumin", name="Xie Yumin")
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        await _register_human(client, admin, "Admin")
+        await _create_team(client, admin, "ready", "fyc")
+
+        visible = await client.get("/hub/api/projects", headers=newcomer)
+        assert visible.status_code == 200
+        ready = next(item for item in visible.json()["projects"] if item["slug"] == "ready")
+        assert ready["membership"] is None
+
+        first = await client.get("/hub/api/humans/me", headers=newcomer)
+        repeated = await client.get("/hub/api/projects", headers=newcomer)
+        second = await client.get("/hub/api/humans/me", headers=newcomer)
+        assert first.status_code == repeated.status_code == second.status_code == 200
+        assert first.json()["id"] == second.json()["id"]
+        assert first.json()["display_name"] == "Xie Yumin"
 
 
 @pytest.mark.anyio

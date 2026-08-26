@@ -35,6 +35,9 @@ def _configure_hub_jwt(monkeypatch):
     monkeypatch.setenv("HTTP_JWT_ENABLED", "true")
     monkeypatch.setenv("HTTP_JWT_ALGORITHMS", "HS256")
     monkeypatch.setenv("HTTP_JWT_SECRET", "hub-lead-secret")
+    monkeypatch.setenv("HTTP_JWT_JWKS_URL", "")
+    monkeypatch.setenv("HTTP_JWT_AUDIENCE", "")
+    monkeypatch.setenv("HTTP_JWT_ISSUER", "")
     monkeypatch.setenv("HTTP_RBAC_ENABLED", "true")
     monkeypatch.setenv("HTTP_RBAC_WRITER_ROLES", "writer")
     monkeypatch.setenv("HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED", "false")
@@ -138,6 +141,7 @@ async def test_create_lead_sets_default_atomically_and_hides_token(hub):
         assert payload["membership_default_agent_id"] == payload["agent"]["id"]
         assert payload["agent"]["owner_id"] == bob_id
         assert payload["binding"]["status"] == "active"
+        assert payload["binding"]["reply_mode"] == "confirm"
         assert payload["binding"]["client_session_id"] == "mac-terminal-1"
         assert payload["agent"]["name"].startswith("SessionLead")
         assert "Mac" in payload["agent"]["name"]

@@ -94,6 +94,7 @@ async def _mk_membership(
     handle: str,
     *,
     status: str = "active",
+    role: str = "member",
     default_agent_id: int | None = None,
 ) -> int:
     """Directly persist a human + membership; returns the human id."""
@@ -114,6 +115,7 @@ async def _mk_membership(
             human_id=human.id,
             mention_handle=handle,
             status=status,
+            role=role,
             default_agent_id=default_agent_id,
         )
         session.add(membership)
@@ -512,7 +514,8 @@ async def test_human_support_request_broadcasts_via_default_agent(
         sender = await _register(client, "/m3a/support", "BlueLake")
         sender_id = await _agent_id("BlueLake")
         await _mk_membership(
-            "/m3a/support", "oidc|alice", "alice", default_agent_id=sender_id,
+            "/m3a/support", "oidc|alice", "alice", role="admin",
+            default_agent_id=sender_id,
         )
         bob_id = await _mk_membership("/m3a/support", "oidc|bob", "bob")
         carol_id = await _mk_membership("/m3a/support", "oidc|carol", "carol")
@@ -689,3 +692,70 @@ async def test_human_support_request_can_target_member_without_sender_agent(
             )
         ).scalars().one()
         assert recipient.kind == "mention"
+
+
+@pytest.mark.anyio
+async def test_support_request_requires_targets_and_limits_broadcast_to_admin(
+    isolated_env, monkeypatch,
+):
+    server = build_mcp_server()
+    async with Client(server) as client:
+        await _register(client, "/m3a/recipient-policy", "BlueLake")
+        await _mk_membership(
+            "/m3a/recipient-policy", "oidc|alice", "alice", role="admin",
+        )
+        await _mk_membership("/m3a/recipient-policy", "oidc|bob", "bob")
+        await _mk_membership("/m3a/recipient-policy", "oidc|carol", "carol")
+        await _mk_membership("/m3a/recipient-policy", "oidc|dave", "dave")
+        async with get_session() as session:
+            routing_project = (
+                await session.execute(
+                    select(Project).where(
+                        Project.human_key == "/m3a/recipient-policy",
+                    )
+                )
+            ).scalars().one()
+            session.add(
+                TeamProject(
+                    slug="recipient-policy",
+                    name="Recipient Policy",
+                    routing_project_id=routing_project.id,
+                )
+            )
+            await session.commit()
+
+    settings = _configure_hub_jwt(monkeypatch)
+    app = build_http_app(settings, build_mcp_server())
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as http:
+        member_broadcast = await http.post(
+            "/hub/api/projects/recipient-policy/support-requests",
+            headers=_hub_headers(settings, "oidc|bob"),
+            json={"subject": "越权广播", "body_md": "不应发送"},
+        )
+        assert member_broadcast.status_code == 403
+        assert member_broadcast.json()["detail"] == "只有话题管理员可以使用 @all"
+
+        member_targeted = await http.post(
+            "/hub/api/projects/recipient-policy/support-requests",
+            headers=_hub_headers(settings, "oidc|bob"),
+            json={
+                "subject": "定向协作",
+                "body_md": "请两位处理",
+                "mention_handles": ["carol", "dave"],
+            },
+        )
+        assert member_targeted.status_code == 201
+        assert member_targeted.json()["mention_handles"] == ["carol", "dave"]
+
+        admin_broadcast = await http.post(
+            "/hub/api/projects/recipient-policy/support-requests",
+            headers=_hub_headers(settings, "oidc|alice"),
+            json={"subject": "管理员广播", "body_md": "请全员查看"},
+        )
+        assert admin_broadcast.status_code == 201
+        assert admin_broadcast.json()["mention_handles"] == ["bob", "carol", "dave"]
+
+    async with get_session() as session:
+        messages = (await session.execute(select(ChannelMessage))).scalars().all()
+        assert [message.subject for message in messages] == ["定向协作", "管理员广播"]

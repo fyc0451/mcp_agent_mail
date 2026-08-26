@@ -2508,7 +2508,7 @@ def _project_lookup_base_dir() -> Path:
 
 
 def _canonicalize_project_identifier(identifier: str) -> str:
-    """Normalize path-like project identifiers without collapsing symlink identities."""
+    """Normalize path-like identifiers and resolve symlinks that exist locally."""
     try:
         candidate = Path(identifier).expanduser()
     except Exception:
@@ -2519,6 +2519,8 @@ def _canonicalize_project_identifier(identifier: str) -> str:
     if not looks_like_path:
         return identifier
     absolute_candidate = candidate if candidate.is_absolute() else _project_lookup_base_dir() / candidate
+    if absolute_candidate.exists():
+        return str(absolute_candidate.resolve())
     return os.path.normpath(str(absolute_candidate))
 
 
@@ -5687,6 +5689,7 @@ async def sweep_stale_agents(
     contact-wall stops piling up. It is conservative:
 
     - Skips agents that are already retired.
+    - Skips managed leads that still have an active session binding.
     - Skips agents whose `last_active_ts` is within the threshold.
     - Optionally scopes to a single project_id.
     - Optionally excludes one agent (used by the on-demand tool so callers
@@ -5712,6 +5715,15 @@ async def sweep_stale_agents(
             cast(Any, Agent.retired_at).is_(None),
             cast(Any, Agent.last_active_ts) < cutoff_naive,
         )
+        active_session_lead = (
+            select(SessionLeadBinding.id)
+            .where(
+                cast(Any, SessionLeadBinding.agent_id) == Agent.id,
+                cast(Any, SessionLeadBinding.status) == "active",
+            )
+            .correlate(Agent)
+        )
+        stmt = stmt.where(~exists(active_session_lead))
         if project_id is not None:
             stmt = stmt.where(cast(Any, Agent.project_id) == project_id)
         if exclude_agent_id is not None:
@@ -7476,12 +7488,14 @@ def build_mcp_server() -> FastMCP:
         """
         # Validate that human_key is an absolute path-like project key (cross-platform).
         # It need not exist on disk - it is an opaque project KEY, not a filesystem probe.
-        if not Path(human_key).is_absolute():
+        project_path = Path(human_key)
+        if not project_path.is_absolute():
             raise ValueError(
                 f"human_key must be an absolute path-like project key, got: '{human_key}'. "
                 "Use the agent's working directory path (e.g., '/data/projects/backend' on Unix "
                 "or 'C:\\projects\\backend' on Windows)."
             )
+        human_key = _canonicalize_project_identifier(human_key)
 
         await _ctx_info_safe(ctx, f"Ensuring project for key '{human_key}'.")
         project = await _ensure_project(human_key)

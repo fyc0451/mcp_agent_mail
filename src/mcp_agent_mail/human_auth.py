@@ -395,6 +395,9 @@ class HumanAuthStore:
             consume_invitation = invitation is not None
             if invitation is None and not self._valid_team_code(invite_code):
                 raise ValueError("Invalid or expired invitation")
+            requested_project_slug = (
+                invitation["project_slug"] if invitation is not None else None
+            )
             existing = connection.execute(
                 "SELECT 1 FROM users WHERE username = ?", (username,)
             ).fetchone()
@@ -415,7 +418,7 @@ class HumanAuthStore:
                     _password_hash(password),
                     json.dumps(["writer"]),
                     now,
-                    invitation["project_slug"] if invitation is not None else None,
+                    requested_project_slug,
                 ),
             )
             if consume_invitation:
@@ -427,9 +430,7 @@ class HumanAuthStore:
             "username": username,
             "display_name": display_name,
             "status": "pending",
-            "requested_project_slug": (
-                invitation["project_slug"] if invitation is not None else None
-            ),
+            "requested_project_slug": requested_project_slug,
         }
 
     def list_users(self) -> list[dict[str, Any]]:

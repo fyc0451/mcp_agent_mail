@@ -14,7 +14,7 @@ import logging
 import re
 import uuid
 from collections.abc import MutableMapping
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Protocol, cast
 
@@ -25,7 +25,7 @@ from fastapi.exception_handlers import http_exception_handler
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import and_, select, text, update
+from sqlalchemy import and_, or_, select, text, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError, NoResultFound
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -61,10 +61,12 @@ from .models import (
     ChannelMessage,
     Human,
     HumanInboxItem,
+    HumanPresence,
     Message,
     Project,
     ProjectHumanMembership,
     SessionLeadBinding,
+    SessionLeadReplyDraft,
     SessionLeadReplyKey,
     TeamProject,
     TeamProjectAgentBinding,
@@ -90,6 +92,10 @@ from .storage import (
     write_agent_profile,
     write_file_reservation_record,
 )
+
+_HUMAN_PRESENCE_TTL_SECONDS = 60
+_SESSION_LEAD_RUNTIME_TTL_SECONDS = 15
+_HUMAN_PRESENCE_CLIENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{15,127}$")
 
 
 async def _project_slug_from_id(pid: int | None) -> str | None:
@@ -726,13 +732,17 @@ def _jwks_candidate_keys(key_set, header: dict, algorithms: list[str]) -> list:
     return candidates
 
 
-_CAPABILITY_REPLY_RE = re.compile(r"^/hub/api/projects/[A-Za-z0-9_-]+/session-lead/reply$")
+_SESSION_LEAD_CAPABILITY_RE = re.compile(
+    r"^/hub/api/projects/[A-Za-z0-9_-]+/session-lead/"
+    r"(?:status|reply|reply-drafts|inbox/claim|inbox/[1-9][0-9]*/complete)$"
+)
 
 
-def _is_capability_reply(path: str, method: str) -> bool:
-    """The session-lead reply endpoint authenticates via its own capability
-    token, not the Hub bearer/JWT — exempt it from both auth middlewares."""
-    return method.upper() == "POST" and bool(_CAPABILITY_REPLY_RE.fullmatch(path))
+def _is_session_lead_capability(path: str, method: str) -> bool:
+    """Recognize endpoints authenticated by a binding-scoped capability."""
+    return method.upper() == "POST" and bool(
+        _SESSION_LEAD_CAPABILITY_RE.fullmatch(path)
+    )
 
 
 class BearerAuthMiddleware(BaseHTTPMiddleware):
@@ -773,7 +783,7 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
         if request.url.path.startswith("/health/") or request.url.path == "/api/health":
             return await call_next(request)
-        if _is_capability_reply(request.url.path, request.method):
+        if _is_session_lead_capability(request.url.path, request.method):
             return await call_next(request)
         if _localhost_bypass_allowed(
             request,
@@ -1039,10 +1049,12 @@ class SecurityAndRateLimitMiddleware(BaseHTTPMiddleware):
 
         # Capability-auth reply endpoint carries its own token (#1093); skip
         # JWT/RBAC here but keep rate limiting below.
-        capability_reply = _is_capability_reply(request.url.path, request.method)
+        session_lead_capability = _is_session_lead_capability(
+            request.url.path, request.method
+        )
 
         # JWT auth (if enabled)
-        if self._jwt_enabled and not capability_reply:
+        if self._jwt_enabled and not session_lead_capability:
             auth_header = request.headers.get("Authorization", "")
             # #210: when JWT is enabled, a valid *static* bearer is still accepted
             # as the OR-alternative to a JWT (the outer BearerAuthMiddleware defers
@@ -1534,13 +1546,15 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         # (each http_app() call owns an independent StreamableHTTPSessionManager).
         mcp_lifespan_app = cast(_FastAPILifespan, mcp_http_app)
         mcp_stateful_lifespan_app = cast(_FastAPILifespan, mcp_stateful_http_app)
-        async with mcp_lifespan_app.lifespan(mcp_http_app):
-            async with mcp_stateful_lifespan_app.lifespan(mcp_stateful_http_app):
-                await _startup()
-                try:
-                    yield
-                finally:
-                    await _shutdown()
+        async with (
+            mcp_lifespan_app.lifespan(mcp_http_app),
+            mcp_stateful_lifespan_app.lifespan(mcp_stateful_http_app),
+        ):
+            await _startup()
+            try:
+                yield
+            finally:
+                await _shutdown()
 
     # Now construct FastAPI with the composed lifespan so ASGI transports run it.
     # Give the app a real title/version so the auto-generated /openapi.json has a
@@ -1736,6 +1750,39 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             raise HTTPException(status_code=404, detail="Human identity is not registered")
         return human
 
+    async def _hub_materialize_claimed_human(
+        request: Request,
+        *,
+        session: AsyncSession,
+    ) -> Human:
+        """幂等补建已认证 Human，使旧客户端也能先列出 Topic。"""
+        subject = _hub_subject(request)
+        human = await _human_by_subject(subject, session=session)
+        if human is not None:
+            return human
+        claims = getattr(request.state, "jwt_claims", None)
+        display_name = None
+        if isinstance(claims, dict):
+            for key in ("name", "preferred_username"):
+                value = claims.get(key)
+                if isinstance(value, str) and value.strip():
+                    display_name = value.strip()
+                    break
+        try:
+            human = await _ensure_human(
+                subject,
+                display_name or subject,
+                session=session,
+            )
+            await session.commit()
+        except IntegrityError:
+            await session.rollback()
+            human = await _human_by_subject(subject, session=session)
+            if human is None:
+                raise HTTPException(status_code=409, detail="Human identity conflict") from None
+        await session.refresh(human)
+        return human
+
     async def _hub_team_project(slug: str, *, session: AsyncSession) -> TeamProject:
         if not _SLUG_VALIDATOR_RE.fullmatch(slug):
             raise HTTPException(status_code=400, detail="Invalid project slug")
@@ -1823,6 +1870,81 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             "status": membership.status,
             "default_agent_id": membership.default_agent_id,
         }
+
+    def _hub_presence_timestamp(value: datetime | None) -> str | None:
+        if value is None:
+            return None
+        return value.replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
+
+    async def _hub_presence_states(
+        human_ids: list[int],
+        *,
+        session: AsyncSession,
+    ) -> dict[int, dict[str, Any]]:
+        if not human_ids:
+            return {}
+        rows = await session.execute(
+            select(HumanPresence).where(
+                cast(Any, HumanPresence.human_id).in_(human_ids)
+            )
+        )
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        cutoff = now - timedelta(seconds=_HUMAN_PRESENCE_TTL_SECONDS)
+        states: dict[int, dict[str, Any]] = {}
+        for row in rows.scalars().all():
+            state = states.setdefault(
+                row.human_id,
+                {"online": False, "last_seen_at": None},
+            )
+            if state["last_seen_at"] is None or row.last_seen_at > state["last_seen_at"]:
+                state["last_seen_at"] = row.last_seen_at
+            if row.online and row.last_seen_at >= cutoff:
+                state["online"] = True
+        return {
+            human_id: {
+                "online": bool(state["online"]),
+                "last_seen_at": _hub_presence_timestamp(state["last_seen_at"]),
+            }
+            for human_id, state in states.items()
+        }
+
+    async def _hub_session_lead_states(
+        team_project_id: int,
+        human_ids: list[int],
+        *,
+        session: AsyncSession,
+    ) -> dict[int, dict[str, Any]]:
+        if not human_ids:
+            return {}
+        rows = await session.execute(
+            select(SessionLeadBinding).where(
+                cast(Any, SessionLeadBinding.team_project_id) == team_project_id,
+                cast(Any, SessionLeadBinding.human_id).in_(human_ids),
+                cast(Any, SessionLeadBinding.status) == "active",
+            )
+        )
+        cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(
+            seconds=_SESSION_LEAD_RUNTIME_TTL_SECONDS
+        )
+        states: dict[int, dict[str, Any]] = {}
+        for binding in rows.scalars().all():
+            runtime_status = (
+                binding.runtime_status
+                if binding.runtime_status in {"working", "idle", "blocked"}
+                and binding.runtime_seen_at is not None
+                and binding.runtime_seen_at >= cutoff
+                else "stopped"
+            )
+            states[binding.human_id] = {
+                "agent": {
+                    "name": binding.lead_label or None,
+                    "kind": None,
+                    "status": runtime_status,
+                    "managed": True,
+                    "last_seen_at": _hub_presence_timestamp(binding.runtime_seen_at),
+                }
+            }
+        return states
 
     def _hub_agent_payload(agent: Agent) -> dict[str, Any]:
         return {
@@ -1941,6 +2063,43 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             human = await _hub_human(request, session=session)
             return JSONResponse(_hub_human_payload(human))
 
+    @fastapi_app.post("/hub/api/presence", response_class=JSONResponse)
+    async def hub_update_presence(request: Request) -> JSONResponse:
+        """Record one authenticated Cockpit client's online/offline state."""
+        await ensure_schema()
+        body = await _hub_json_body(request)
+        if set(body) != {"client_id", "online"}:
+            raise HTTPException(status_code=400, detail="client_id and online are required")
+        client_id = body.get("client_id")
+        online = body.get("online")
+        if not isinstance(client_id, str) or not _HUMAN_PRESENCE_CLIENT_RE.fullmatch(client_id):
+            raise HTTPException(status_code=400, detail="Invalid presence client_id")
+        if not isinstance(online, bool):
+            raise HTTPException(status_code=400, detail="online must be a boolean")
+        async with get_session() as session:
+            human = await _hub_materialize_claimed_human(request, session=session)
+            if human.id is None:
+                raise HTTPException(status_code=404, detail="Human identity is not registered")
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
+            statement = sqlite_insert(HumanPresence).values(
+                human_id=human.id,
+                client_id=client_id,
+                online=online,
+                last_seen_at=now,
+            )
+            await session.execute(
+                statement.on_conflict_do_update(
+                    index_elements=["human_id", "client_id"],
+                    set_={"online": online, "last_seen_at": now},
+                )
+            )
+            await session.commit()
+            state = (await _hub_presence_states([human.id], session=session)).get(
+                human.id,
+                {"online": False, "last_seen_at": None},
+            )
+            return JSONResponse(state)
+
     @fastapi_app.get("/hub/api/agents", response_class=JSONResponse)
     async def hub_list_agent_directory(request: Request) -> JSONResponse:
         """List safe Agent candidates for explicit TeamProject binding.
@@ -1984,7 +2143,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         """List only user-created logical groups, never technical mail projects."""
         await ensure_schema()
         async with get_session() as session:
-            human = await _hub_human(request, session=session)
+            human = await _hub_materialize_claimed_human(request, session=session)
             if human.id is None:
                 raise HTTPException(status_code=404, detail="Human identity is not registered")
             rows = await session.execute(
@@ -2209,7 +2368,10 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         await ensure_schema()
         async with get_session() as session:
             human = await _hub_human(request, session=session)
-            project = await _hub_project(project_slug, session=session)
+            team_project = await _hub_team_project(project_slug, session=session)
+            project = await session.get(Project, team_project.routing_project_id)
+            if project is None or project.archived_at is not None:
+                raise HTTPException(status_code=404, detail="Project not found")
             caller = await _hub_active_membership(project, human, session=session)
             is_admin = caller.role == "admin"
             # Ordinary members get a minimal roster of ACTIVE members only —
@@ -2227,7 +2389,17 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 .order_by(cast(Any, ProjectHumanMembership.created_at))
             )
             members = []
-            for membership, member_human in rows.all():
+            member_rows = rows.all()
+            presence_states = await _hub_presence_states(
+                [membership.human_id for membership, _member_human in member_rows],
+                session=session,
+            )
+            lead_states = await _hub_session_lead_states(
+                cast(int, team_project.id),
+                [membership.human_id for membership, _member_human in member_rows],
+                session=session,
+            )
+            for membership, member_human in member_rows:
                 if is_admin:
                     payload = _hub_membership_payload(membership)
                 else:
@@ -2238,6 +2410,11 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                         "status": membership.status,
                     }
                 payload["display_name"] = member_human.display_name
+                payload.update(presence_states.get(
+                    membership.human_id,
+                    {"online": False, "last_seen_at": None},
+                ))
+                payload.update(lead_states.get(membership.human_id, {"agent": None}))
                 members.append(payload)
             return JSONResponse({"members": members})
 
@@ -2654,6 +2831,11 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             if project is None or project.archived_at is not None:
                 raise HTTPException(status_code=404, detail="Project not found")
             membership = await _hub_active_membership(project, human, session=session)
+            if requested_handles is None and membership.role != "admin":
+                raise HTTPException(
+                    status_code=403,
+                    detail="只有话题管理员可以使用 @all",
+                )
             sender, sender_kind = await _hub_support_sender(
                 project,
                 human,
@@ -3093,6 +3275,9 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
     # bad tokens get the same opaque refusal.
     _claim_locks: dict[int, asyncio.Lock] = {}
     _session_lead_locks: dict[tuple[int, int], asyncio.Lock] = {}
+    _session_lead_claim_locks: dict[int, asyncio.Lock] = {}
+    _session_lead_draft_decision_locks: dict[int, asyncio.Lock] = {}
+    _session_lead_reply_request_locks: dict[int, asyncio.Lock] = {}
     # Exposed for race-controlled tests (pre-acquire an agent's lock).
     fastapi_app.state.hub_claim_locks = _claim_locks
 
@@ -3292,6 +3477,106 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         # 统一不透明: 不区分 未知 session / 已撤销 / 错 token
         return HTTPException(status_code=403, detail="Invalid reply credentials")
 
+    def _session_lead_credentials(body: dict[str, Any]) -> tuple[str, str]:
+        raw_session_id = body.get("client_session_id")
+        client_session_id = (
+            raw_session_id.strip() if isinstance(raw_session_id, str) else ""
+        )
+        if not _CLIENT_SESSION_ID_RE.fullmatch(client_session_id):
+            raise HTTPException(
+                status_code=400, detail="client_session_id must be a valid id"
+            )
+        raw_token = body.get("reply_token")
+        reply_token = raw_token.strip() if isinstance(raw_token, str) else ""
+        if not reply_token or len(reply_token) > 128:
+            raise HTTPException(status_code=400, detail="reply_token is required")
+        return client_session_id, reply_token
+
+    async def _session_lead_capability_context(
+        project_slug: str,
+        client_session_id: str,
+        reply_token: str,
+        *,
+        session: AsyncSession,
+    ) -> tuple[TeamProject, Project, SessionLeadBinding, Agent]:
+        team_project = await _hub_team_project(project_slug, session=session)
+        project = await session.get(Project, team_project.routing_project_id)
+        if project is None or project.archived_at is not None:
+            raise HTTPException(status_code=404, detail="Project not found")
+        binding_row = await session.execute(
+            select(SessionLeadBinding).where(
+                cast(Any, SessionLeadBinding.team_project_id) == team_project.id,
+                cast(Any, SessionLeadBinding.client_session_id) == client_session_id,
+                cast(Any, SessionLeadBinding.status) == "active",
+            )
+        )
+        binding = binding_row.scalars().first()
+        if binding is None or not binding.reply_token_hash:
+            raise _hub_reply_credentials_invalid()
+        if not hmac.compare_digest(
+            binding.reply_token_hash, _hash_reply_token(reply_token)
+        ):
+            raise _hub_reply_credentials_invalid()
+        membership_row = await session.execute(
+            select(ProjectHumanMembership).where(
+                cast(Any, ProjectHumanMembership.project_id) == project.id,
+                cast(Any, ProjectHumanMembership.human_id) == binding.human_id,
+                cast(Any, ProjectHumanMembership.status) == "active",
+                cast(Any, ProjectHumanMembership.default_agent_id) == binding.agent_id,
+            )
+        )
+        if membership_row.scalars().first() is None:
+            raise _hub_reply_credentials_invalid()
+        sender = await session.get(Agent, binding.agent_id)
+        if sender is None:
+            raise HTTPException(
+                status_code=409, detail="Managed lead agent is unavailable"
+            )
+        if sender.retired_at is not None:
+            sender.retired_at = None
+            sender.last_active_ts = datetime.now(timezone.utc).replace(tzinfo=None)
+            session.add(sender)
+        return team_project, project, binding, sender
+
+    @fastapi_app.post(
+        "/hub/api/projects/{project_slug}/session-lead/status",
+        response_class=JSONResponse,
+    )
+    async def hub_session_lead_status(project_slug: str, request: Request) -> JSONResponse:
+        """Record a binding-scoped runtime heartbeat for the safe team roster."""
+        await ensure_schema()
+        body = await _hub_json_body(request)
+        if set(body) != {"client_session_id", "reply_token", "status"}:
+            raise HTTPException(
+                status_code=400,
+                detail="client_session_id, reply_token and status are required",
+            )
+        client_session_id, reply_token = _session_lead_credentials(body)
+        runtime_status = body.get("status")
+        if runtime_status not in {"working", "idle", "blocked"}:
+            raise HTTPException(status_code=400, detail="Invalid runtime status")
+        async with get_session() as session:
+            _team_project, _project, binding, sender = (
+                await _session_lead_capability_context(
+                    project_slug,
+                    client_session_id,
+                    reply_token,
+                    session=session,
+                )
+            )
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
+            binding.runtime_status = cast(str, runtime_status)
+            binding.runtime_seen_at = now
+            binding.updated_at = now
+            sender.last_active_ts = now
+            session.add(binding)
+            session.add(sender)
+            await session.commit()
+            return JSONResponse({
+                "status": binding.runtime_status,
+                "last_seen_at": _hub_presence_timestamp(binding.runtime_seen_at),
+            })
+
     @fastapi_app.post(
         "/hub/api/projects/{project_slug}/session-lead/reply",
         response_class=JSONResponse,
@@ -3308,18 +3593,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         """
         await ensure_schema()
         body = await _hub_json_body(request)
-        raw_session_id = body.get("client_session_id")
-        client_session_id = raw_session_id.strip() if isinstance(raw_session_id, str) else ""
-        if not _CLIENT_SESSION_ID_RE.fullmatch(client_session_id):
-            raise HTTPException(status_code=400, detail="client_session_id must be a valid id")
-        reply_token = body.get("reply_token")
-        if (
-            not isinstance(reply_token, str)
-            or not reply_token.strip()
-            or len(reply_token.strip()) > 128
-        ):
-            raise HTTPException(status_code=400, detail="reply_token is required")
-        reply_token = reply_token.strip()
+        client_session_id, reply_token = _session_lead_credentials(body)
         subject = body.get("subject")
         body_md = body.get("body_md")
         importance = body.get("importance", "normal")
@@ -3344,32 +3618,62 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         idem_key = raw_key.strip() if isinstance(raw_key, str) else ""
         if raw_key is not None and (not idem_key or len(idem_key) > 128):
             raise HTTPException(status_code=400, detail="idempotency_key must be 1-128 characters")
+        raw_inbox_item_id = body.get("inbox_item_id")
+        if raw_inbox_item_id is not None and (
+            isinstance(raw_inbox_item_id, bool)
+            or not isinstance(raw_inbox_item_id, int)
+        ):
+            raise HTTPException(status_code=400, detail="inbox_item_id must be an integer")
+        raw_claim_token = body.get("claim_token")
+        claim_token = (
+            raw_claim_token.strip() if isinstance(raw_claim_token, str) else ""
+        )
+        if raw_inbox_item_id is not None and (
+            not claim_token or len(claim_token) > 128
+        ):
+            raise HTTPException(status_code=400, detail="claim_token is required")
 
         replay_message: ChannelMessage | None = None
         replay_handles: list[str] = []
         replay_sender: Agent | None = None
 
         async with get_session() as session:
-            team_project = await _hub_team_project(project_slug, session=session)
-            project = await session.get(Project, team_project.routing_project_id)
-            if project is None or project.archived_at is not None:
-                raise HTTPException(status_code=404, detail="Project not found")
-            binding_row = await session.execute(
-                select(SessionLeadBinding).where(
-                    cast(Any, SessionLeadBinding.team_project_id) == team_project.id,
-                    cast(Any, SessionLeadBinding.client_session_id) == client_session_id,
-                    cast(Any, SessionLeadBinding.status) == "active",
-                )
+            _, project, binding, sender = await _session_lead_capability_context(
+                project_slug,
+                client_session_id,
+                reply_token,
+                session=session,
             )
-            binding = binding_row.scalars().first()
-            if binding is None or not binding.reply_token_hash:
-                raise _hub_reply_credentials_invalid()
-            presented_hash = _hash_reply_token(reply_token)
-            if not hmac.compare_digest(binding.reply_token_hash, presented_hash):
-                raise _hub_reply_credentials_invalid()
-            sender = await session.get(Agent, binding.agent_id)
-            if sender is None or sender.retired_at is not None:
-                raise HTTPException(status_code=409, detail="Managed lead agent is unavailable")
+            if raw_inbox_item_id is None:
+                if binding.reply_mode != "auto":
+                    raise HTTPException(
+                        status_code=409, detail="Human confirmation is required"
+                    )
+            else:
+                item = await session.get(HumanInboxItem, raw_inbox_item_id)
+                now = datetime.now(timezone.utc).replace(tzinfo=None)
+                if (
+                    item is None
+                    or item.project_id != project.id
+                    or item.human_id != binding.human_id
+                    or item.kind != "session_lead"
+                    or item.claim_binding_id != binding.id
+                    or not item.claim_token_hash
+                    or not hmac.compare_digest(
+                        item.claim_token_hash, _hash_reply_token(claim_token)
+                    )
+                ):
+                    raise HTTPException(
+                        status_code=403, detail="Invalid claim credentials"
+                    )
+                if item.completed_at is not None:
+                    raise HTTPException(status_code=409, detail="Inbox item is completed")
+                if item.claim_expires_at is None or item.claim_expires_at <= now:
+                    raise HTTPException(status_code=409, detail="Inbox claim has expired")
+                if item.reply_decision not in {"approved", "auto"}:
+                    raise HTTPException(
+                        status_code=409, detail="Human confirmation is required"
+                    )
 
             if mention_handles:
                 member_rows = await session.execute(
@@ -3476,6 +3780,8 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 replay_message = message
                 replay_handles = mention_handles
 
+        assert replay_sender is not None
+        assert replay_message is not None
         deliveries = await _deliver_channel_mentions(
             cast(Any, _HubHTTPDeliveryContext()),
             project,
@@ -3507,6 +3813,679 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             }
         )
 
+    def _reply_draft_payload(draft: SessionLeadReplyDraft) -> dict[str, Any]:
+        return {
+            "id": draft.id,
+            "binding_id": draft.binding_id,
+            "inbox_item_id": draft.inbox_item_id,
+            "subject": draft.subject,
+            "body_md": draft.body_md,
+            "importance": draft.importance,
+            "mention_handles": json.loads(draft.mention_handles or "[]"),
+            "status": draft.status,
+            "message_id": draft.sent_message_id,
+            "created_at": str(draft.created_at),
+            "updated_at": str(draft.updated_at),
+            "decided_at": str(draft.decided_at) if draft.decided_at else None,
+        }
+
+    def _reply_request_payload(
+        item: HumanInboxItem, *, reply_mode: str = "confirm"
+    ) -> dict[str, Any]:
+        if item.reply_decision == "ignored":
+            request_status = "ignored"
+        elif item.completed_at is not None:
+            request_status = "replied"
+        elif item.reply_decision in {"approved", "auto"} or reply_mode == "auto":
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
+            request_status = (
+                "processing"
+                if item.claim_expires_at is not None
+                and item.claim_expires_at > now
+                and item.claim_token_hash is not None
+                else "queued"
+            )
+        else:
+            request_status = "awaiting_confirmation"
+        return {
+            "inbox_item_id": item.id,
+            "message_id": item.source_channel_message_id,
+            "status": request_status,
+            "decision": (
+                item.reply_decision
+                if item.reply_decision is not None
+                else ("auto" if reply_mode == "auto" else None)
+            ),
+            "decided_at": (
+                str(item.reply_decided_at) if item.reply_decided_at else None
+            ),
+        }
+
+    async def _human_reply_request_context(
+        project_slug: str,
+        inbox_item_id: int,
+        request: Request,
+        *,
+        session: AsyncSession,
+    ) -> tuple[Project, SessionLeadBinding, HumanInboxItem]:
+        team_project = await _hub_team_project(project_slug, session=session)
+        human = await _hub_human(request, session=session)
+        project = await session.get(Project, team_project.routing_project_id)
+        if project is None or project.archived_at is not None:
+            raise HTTPException(status_code=404, detail="Project not found")
+        membership = await _hub_active_membership(project, human, session=session)
+        binding = (
+            await session.execute(
+                select(SessionLeadBinding).where(
+                    cast(Any, SessionLeadBinding.team_project_id) == team_project.id,
+                    cast(Any, SessionLeadBinding.human_id) == human.id,
+                    cast(Any, SessionLeadBinding.status) == "active",
+                )
+            )
+        ).scalars().first()
+        if binding is None or membership.default_agent_id != binding.agent_id:
+            raise HTTPException(status_code=409, detail="Session lead is unavailable")
+        item = await session.get(HumanInboxItem, inbox_item_id)
+        if (
+            item is None
+            or item.project_id != project.id
+            or item.human_id != human.id
+            or item.kind != "session_lead"
+        ):
+            raise HTTPException(status_code=404, detail="Reply request not found")
+        return project, binding, item
+
+    @fastapi_app.get(
+        "/hub/api/projects/{project_slug}/reply-requests",
+        response_class=JSONResponse,
+    )
+    async def hub_list_reply_requests(
+        project_slug: str, request: Request
+    ) -> JSONResponse:
+        """List message-level reply decisions without exposing message bodies."""
+        await ensure_schema()
+        async with get_session() as session:
+            team_project = await _hub_team_project(project_slug, session=session)
+            human = await _hub_human(request, session=session)
+            project = await session.get(Project, team_project.routing_project_id)
+            if project is None or project.archived_at is not None:
+                raise HTTPException(status_code=404, detail="Project not found")
+            membership = await _hub_active_membership(project, human, session=session)
+            binding = (
+                await session.execute(
+                    select(SessionLeadBinding).where(
+                        cast(Any, SessionLeadBinding.team_project_id)
+                        == team_project.id,
+                        cast(Any, SessionLeadBinding.human_id) == human.id,
+                        cast(Any, SessionLeadBinding.status) == "active",
+                    )
+                )
+            ).scalars().first()
+            if binding is None or membership.default_agent_id != binding.agent_id:
+                raise HTTPException(
+                    status_code=409, detail="Session lead is unavailable"
+                )
+            rows = await session.execute(
+                select(HumanInboxItem)
+                .where(
+                    cast(Any, HumanInboxItem.project_id) == project.id,
+                    cast(Any, HumanInboxItem.human_id) == human.id,
+                    cast(Any, HumanInboxItem.kind) == "session_lead",
+                )
+                .order_by(cast(Any, HumanInboxItem.created_ts).desc())
+                .limit(500)
+            )
+            return JSONResponse(
+                {
+                    "requests": [
+                        _reply_request_payload(
+                            item, reply_mode=binding.reply_mode
+                        )
+                        for item in rows.scalars().all()
+                    ]
+                }
+            )
+
+    @fastapi_app.post(
+        "/hub/api/projects/{project_slug}/reply-requests/{inbox_item_id}/approve",
+        response_class=JSONResponse,
+    )
+    async def hub_approve_reply_request(
+        project_slug: str, inbox_item_id: int, request: Request
+    ) -> JSONResponse:
+        await ensure_schema()
+        item_lock = _session_lead_reply_request_locks.setdefault(
+            inbox_item_id, asyncio.Lock()
+        )
+        async with item_lock, get_session() as session:
+            _, binding, item = await _human_reply_request_context(
+                project_slug, inbox_item_id, request, session=session
+            )
+            if item.reply_decision == "ignored":
+                raise HTTPException(status_code=409, detail="Reply request was ignored")
+            if item.completed_at is not None:
+                raise HTTPException(status_code=409, detail="Reply request is completed")
+            replay = item.reply_decision in {"approved", "auto"}
+            if not replay:
+                now = datetime.now(timezone.utc).replace(tzinfo=None)
+                item.reply_decision = (
+                    "auto" if binding.reply_mode == "auto" else "approved"
+                )
+                item.reply_decided_at = now
+                item.claim_binding_id = None
+                item.claim_token_hash = None
+                item.claim_expires_at = None
+                session.add(item)
+                await session.commit()
+                await session.refresh(item)
+            return JSONResponse(
+                {
+                    "status": "already_approved" if replay else "approved",
+                    "request": _reply_request_payload(
+                        item, reply_mode=binding.reply_mode
+                    ),
+                },
+                status_code=200 if replay else 201,
+            )
+
+    @fastapi_app.post(
+        "/hub/api/projects/{project_slug}/reply-requests/{inbox_item_id}/reject",
+        response_class=JSONResponse,
+    )
+    async def hub_reject_reply_request(
+        project_slug: str, inbox_item_id: int, request: Request
+    ) -> JSONResponse:
+        await ensure_schema()
+        item_lock = _session_lead_reply_request_locks.setdefault(
+            inbox_item_id, asyncio.Lock()
+        )
+        async with item_lock, get_session() as session:
+            _, binding, item = await _human_reply_request_context(
+                project_slug, inbox_item_id, request, session=session
+            )
+            if item.reply_decision == "ignored":
+                return JSONResponse(
+                    {
+                        "status": "already_ignored",
+                        "request": _reply_request_payload(
+                            item, reply_mode=binding.reply_mode
+                        ),
+                    }
+                )
+            if item.completed_at is not None:
+                raise HTTPException(status_code=409, detail="Reply request is completed")
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
+            if (
+                item.claim_token_hash is not None
+                and item.claim_expires_at is not None
+                and item.claim_expires_at > now
+            ):
+                raise HTTPException(status_code=409, detail="Reply is already processing")
+            if item.reply_decision in {"approved", "auto"}:
+                raise HTTPException(status_code=409, detail="Reply request was approved")
+            item.reply_decision = "ignored"
+            item.reply_decided_at = now
+            item.completed_at = now
+            item.claim_binding_id = None
+            item.claim_token_hash = None
+            item.claim_expires_at = None
+            session.add(item)
+            await session.commit()
+            await session.refresh(item)
+            return JSONResponse(
+                {
+                    "status": "ignored",
+                    "request": _reply_request_payload(
+                        item, reply_mode=binding.reply_mode
+                    ),
+                },
+                status_code=201,
+            )
+
+    async def _validate_reply_handles(
+        project: Project,
+        mention_handles: list[str],
+        *,
+        session: AsyncSession,
+    ) -> None:
+        if not mention_handles:
+            return
+        rows = await session.execute(
+            select(cast(Any, ProjectHumanMembership.mention_handle)).where(
+                cast(Any, ProjectHumanMembership.project_id) == project.id,
+                cast(Any, ProjectHumanMembership.status) == "active",
+            )
+        )
+        known = {str(value).lower() for value in rows.scalars().all()}
+        missing = [handle for handle in mention_handles if handle.lower() not in known]
+        if missing:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Active team member not found: {missing[0]}",
+            )
+
+    async def _create_session_lead_channel_message(
+        project: Project,
+        sender: Agent,
+        *,
+        subject: str,
+        body_md: str,
+        importance: str,
+        mention_handles: list[str],
+        session: AsyncSession,
+    ) -> ChannelMessage:
+        channel_insert = sqlite_insert(Channel).values(
+            project_id=project.id,
+            name="support",
+            created_ts=datetime.now(timezone.utc).replace(tzinfo=None),
+        )
+        await session.execute(
+            channel_insert.on_conflict_do_nothing(
+                index_elements=["project_id", "name"]
+            )
+        )
+        channel = (
+            await session.execute(
+                select(Channel).where(
+                    cast(Any, Channel.project_id) == project.id,
+                    cast(Any, Channel.name) == "support",
+                )
+            )
+        ).scalars().one()
+        message = ChannelMessage(
+            channel_id=cast(int, channel.id),
+            sender_id=cast(int, sender.id),
+            subject=subject,
+            body_md=(
+                (
+                    " ".join(f"@{handle}" for handle in mention_handles)
+                    + "\n\n"
+                )
+                if mention_handles
+                else ""
+            )
+            + body_md,
+            importance=importance,
+            attachments=[],
+        )
+        sender.last_active_ts = datetime.now(timezone.utc).replace(tzinfo=None)
+        session.add(sender)
+        session.add(message)
+        await session.flush()
+        return message
+
+    @fastapi_app.post(
+        "/hub/api/projects/{project_slug}/session-lead/inbox/claim",
+        response_class=JSONResponse,
+    )
+    async def hub_session_lead_claim_inbox(
+        project_slug: str, request: Request
+    ) -> JSONResponse:
+        """Claim one pending message for the current active bound lead."""
+        await ensure_schema()
+        body = await _hub_json_body(request)
+        client_session_id, reply_token = _session_lead_credentials(body)
+        async with get_session() as session:
+            _, project, binding, _ = await _session_lead_capability_context(
+                project_slug,
+                client_session_id,
+                reply_token,
+                session=session,
+            )
+            assert binding.id is not None
+            claim_lock = _session_lead_claim_locks.setdefault(
+                binding.id, asyncio.Lock()
+            )
+            async with claim_lock:
+                now = datetime.now(timezone.utc).replace(tzinfo=None)
+                reply_condition = (
+                    cast(Any, HumanInboxItem.reply_decision).in_(
+                        ["approved", "auto"]
+                    )
+                    if binding.reply_mode == "confirm"
+                    else or_(
+                        cast(Any, HumanInboxItem.reply_decision).is_(None),
+                        cast(Any, HumanInboxItem.reply_decision).in_(
+                            ["approved", "auto"]
+                        ),
+                    )
+                )
+                item = (
+                    await session.execute(
+                        select(HumanInboxItem)
+                        .where(
+                            cast(Any, HumanInboxItem.project_id) == project.id,
+                            cast(Any, HumanInboxItem.human_id) == binding.human_id,
+                            cast(Any, HumanInboxItem.kind) == "session_lead",
+                            cast(Any, HumanInboxItem.completed_at).is_(None),
+                            reply_condition,
+                            or_(
+                                cast(Any, HumanInboxItem.claim_expires_at).is_(None),
+                                cast(Any, HumanInboxItem.claim_expires_at) <= now,
+                            ),
+                        )
+                        .order_by(cast(Any, HumanInboxItem.created_ts))
+                        .limit(1)
+                    )
+                ).scalars().first()
+                if item is None:
+                    return JSONResponse({"status": "empty", "message": None})
+                if binding.reply_mode == "auto" and item.reply_decision is None:
+                    item.reply_decision = "auto"
+                    item.reply_decided_at = now
+                claim_token = _new_reply_token()
+                item.claim_binding_id = binding.id
+                item.claim_token_hash = _hash_reply_token(claim_token)
+                item.claim_expires_at = now + timedelta(minutes=15)
+                if item.read_ts is None:
+                    item.read_ts = now
+                session.add(item)
+                message = await session.get(Message, item.message_id)
+                if message is None:
+                    raise HTTPException(
+                        status_code=409, detail="Inbox message is unavailable"
+                    )
+                sender = await session.get(Agent, message.sender_id)
+                if sender is None:
+                    raise HTTPException(
+                        status_code=409, detail="Inbox sender is unavailable"
+                    )
+                sender_human = (
+                    await session.get(Human, sender.owner_id)
+                    if sender.owner_id is not None
+                    else None
+                )
+                sender_membership = None
+                if sender.owner_id is not None:
+                    sender_membership = (
+                        await session.execute(
+                            select(ProjectHumanMembership).where(
+                                cast(Any, ProjectHumanMembership.project_id)
+                                == project.id,
+                                cast(Any, ProjectHumanMembership.human_id)
+                                == sender.owner_id,
+                                cast(Any, ProjectHumanMembership.status) == "active",
+                            )
+                        )
+                    ).scalars().first()
+                await session.commit()
+                return JSONResponse(
+                    {
+                        "status": "claimed",
+                        "claim_token": claim_token,
+                        "claim_expires_at": str(item.claim_expires_at),
+                        "reply_mode": binding.reply_mode,
+                        "message": {
+                            "inbox_item_id": item.id,
+                            "message_id": message.id,
+                            "subject": message.subject,
+                            "body_md": message.body_md,
+                            "importance": message.importance,
+                            "sender_name": (
+                                sender_human.display_name
+                                if sender_human is not None
+                                else "Team member"
+                            ),
+                            "sender_handle": (
+                                sender_membership.mention_handle
+                                if sender_membership is not None
+                                else None
+                            ),
+                            "created_ts": str(message.created_ts),
+                        },
+                    },
+                    status_code=201,
+                )
+
+    @fastapi_app.post(
+        "/hub/api/projects/{project_slug}/session-lead/inbox/{inbox_item_id}/complete",
+        response_class=JSONResponse,
+    )
+    async def hub_session_lead_complete_inbox(
+        project_slug: str, inbox_item_id: int, request: Request
+    ) -> JSONResponse:
+        await ensure_schema()
+        body = await _hub_json_body(request)
+        client_session_id, reply_token = _session_lead_credentials(body)
+        raw_claim_token = body.get("claim_token")
+        claim_token = (
+            raw_claim_token.strip() if isinstance(raw_claim_token, str) else ""
+        )
+        if not claim_token or len(claim_token) > 128:
+            raise HTTPException(status_code=400, detail="claim_token is required")
+        async with get_session() as session:
+            _, project, binding, _ = await _session_lead_capability_context(
+                project_slug,
+                client_session_id,
+                reply_token,
+                session=session,
+            )
+            item = await session.get(HumanInboxItem, inbox_item_id)
+            if (
+                item is None
+                or item.project_id != project.id
+                or item.human_id != binding.human_id
+                or item.claim_binding_id != binding.id
+                or not item.claim_token_hash
+                or not hmac.compare_digest(
+                    item.claim_token_hash, _hash_reply_token(claim_token)
+                )
+            ):
+                raise HTTPException(status_code=403, detail="Invalid claim credentials")
+            if item.completed_at is not None:
+                return JSONResponse(
+                    {"status": "already_completed", "inbox_item_id": item.id}
+                )
+            if item.reply_decision not in {"approved", "auto"}:
+                raise HTTPException(
+                    status_code=409, detail="Reply was not authorized"
+                )
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
+            if item.claim_expires_at is None or item.claim_expires_at <= now:
+                raise HTTPException(status_code=409, detail="Inbox claim has expired")
+            item.completed_at = now
+            session.add(item)
+            await session.commit()
+            return JSONResponse(
+                {"status": "completed", "inbox_item_id": item.id}
+            )
+
+    @fastapi_app.post(
+        "/hub/api/projects/{project_slug}/session-lead/reply-drafts",
+        response_class=JSONResponse,
+    )
+    async def hub_session_lead_create_reply_draft(
+        project_slug: str, request: Request
+    ) -> JSONResponse:
+        """Reject the retired generate-before-approval protocol."""
+        await ensure_schema()
+        body = await _hub_json_body(request)
+        client_session_id, reply_token = _session_lead_credentials(body)
+        async with get_session() as session:
+            await _session_lead_capability_context(
+                project_slug,
+                client_session_id,
+                reply_token,
+                session=session,
+            )
+        raise HTTPException(
+            status_code=410,
+            detail="Reply drafts are retired; authorize the message before generation",
+        )
+    @fastapi_app.get(
+        "/hub/api/projects/{project_slug}/reply-drafts",
+        response_class=JSONResponse,
+    )
+    async def hub_list_reply_drafts(
+        project_slug: str, request: Request, status_filter: str = "pending"
+    ) -> JSONResponse:
+        await ensure_schema()
+        if status_filter not in {"pending", "approved", "rejected", "all"}:
+            raise HTTPException(status_code=400, detail="Invalid status_filter")
+        async with get_session() as session:
+            team_project = await _hub_team_project(project_slug, session=session)
+            human = await _hub_human(request, session=session)
+            project = await session.get(Project, team_project.routing_project_id)
+            if project is None or project.archived_at is not None:
+                raise HTTPException(status_code=404, detail="Project not found")
+            await _hub_active_membership(project, human, session=session)
+            conditions = [
+                cast(Any, SessionLeadBinding.team_project_id) == team_project.id,
+                cast(Any, SessionLeadBinding.human_id) == human.id,
+            ]
+            if status_filter != "all":
+                conditions.append(
+                    cast(Any, SessionLeadReplyDraft.status) == status_filter
+                )
+            rows = await session.execute(
+                select(SessionLeadReplyDraft)
+                .join(
+                    SessionLeadBinding,
+                    cast(Any, SessionLeadBinding.id)
+                    == SessionLeadReplyDraft.binding_id,
+                )
+                .where(*conditions)
+                .order_by(cast(Any, SessionLeadReplyDraft.created_at).desc())
+            )
+            return JSONResponse(
+                {"drafts": [_reply_draft_payload(row) for row in rows.scalars().all()]}
+            )
+
+    async def _human_reply_draft_context(
+        project_slug: str,
+        draft_id: int,
+        request: Request,
+        *,
+        session: AsyncSession,
+    ) -> tuple[Project, SessionLeadBinding, SessionLeadReplyDraft, Agent]:
+        team_project = await _hub_team_project(project_slug, session=session)
+        human = await _hub_human(request, session=session)
+        project = await session.get(Project, team_project.routing_project_id)
+        if project is None or project.archived_at is not None:
+            raise HTTPException(status_code=404, detail="Project not found")
+        membership = await _hub_active_membership(project, human, session=session)
+        row = await session.execute(
+            select(SessionLeadReplyDraft, SessionLeadBinding)
+            .join(
+                SessionLeadBinding,
+                cast(Any, SessionLeadBinding.id) == SessionLeadReplyDraft.binding_id,
+            )
+            .where(
+                cast(Any, SessionLeadReplyDraft.id) == draft_id,
+                cast(Any, SessionLeadBinding.team_project_id) == team_project.id,
+                cast(Any, SessionLeadBinding.human_id) == human.id,
+            )
+        )
+        result = row.first()
+        if result is None:
+            raise HTTPException(status_code=404, detail="Reply draft not found")
+        draft, binding = result
+        if (
+            binding.status != "active"
+            or membership.default_agent_id != binding.agent_id
+        ):
+            raise HTTPException(status_code=409, detail="Session lead is unavailable")
+        sender = await session.get(Agent, binding.agent_id)
+        if sender is None or sender.retired_at is not None:
+            raise HTTPException(status_code=409, detail="Managed lead agent is unavailable")
+        return project, binding, draft, sender
+
+    @fastapi_app.post(
+        "/hub/api/projects/{project_slug}/reply-drafts/{draft_id}/approve",
+        response_class=JSONResponse,
+    )
+    async def hub_approve_reply_draft(
+        project_slug: str, draft_id: int, request: Request
+    ) -> JSONResponse:
+        await ensure_schema()
+        draft_lock = _session_lead_draft_decision_locks.setdefault(
+            draft_id, asyncio.Lock()
+        )
+        async with draft_lock:
+            async with get_session() as session:
+                project, _, draft, sender = await _human_reply_draft_context(
+                    project_slug, draft_id, request, session=session
+                )
+                if draft.status == "rejected":
+                    raise HTTPException(status_code=409, detail="Reply draft was rejected")
+                mention_handles = json.loads(draft.mention_handles or "[]")
+                await _validate_reply_handles(project, mention_handles, session=session)
+                replay = draft.status == "approved"
+                if replay:
+                    message = await session.get(ChannelMessage, draft.sent_message_id)
+                    if message is None:
+                        raise HTTPException(
+                            status_code=409, detail="Approved draft state is inconsistent"
+                        )
+                else:
+                    message = await _create_session_lead_channel_message(
+                        project,
+                        sender,
+                        subject=draft.subject,
+                        body_md=draft.body_md,
+                        importance=draft.importance,
+                        mention_handles=mention_handles,
+                        session=session,
+                    )
+                    draft.status = "approved"
+                    draft.sent_message_id = message.id
+                    draft.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                    draft.decided_at = draft.updated_at
+                    session.add(draft)
+                    await session.commit()
+                    await session.refresh(message)
+                    await session.refresh(sender)
+                    await session.refresh(project)
+            deliveries = await _deliver_channel_mentions(
+                cast(Any, _HubHTTPDeliveryContext()),
+                project,
+                sender,
+                message,
+                mention_handles,
+            )
+            return JSONResponse(
+                {
+                    "status": "already_approved" if replay else "approved",
+                    "draft": _reply_draft_payload(draft),
+                    "deliveries": deliveries,
+                },
+                status_code=200 if replay else 201,
+            )
+
+    @fastapi_app.post(
+        "/hub/api/projects/{project_slug}/reply-drafts/{draft_id}/reject",
+        response_class=JSONResponse,
+    )
+    async def hub_reject_reply_draft(
+        project_slug: str, draft_id: int, request: Request
+    ) -> JSONResponse:
+        await ensure_schema()
+        draft_lock = _session_lead_draft_decision_locks.setdefault(
+            draft_id, asyncio.Lock()
+        )
+        async with draft_lock, get_session() as session:
+            _, _, draft, _ = await _human_reply_draft_context(
+                project_slug, draft_id, request, session=session
+            )
+            if draft.status == "approved":
+                raise HTTPException(status_code=409, detail="Reply draft was approved")
+            if draft.status == "rejected":
+                return JSONResponse(
+                    {
+                        "status": "already_rejected",
+                        "draft": _reply_draft_payload(draft),
+                    }
+                )
+            draft.status = "rejected"
+            draft.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            draft.decided_at = draft.updated_at
+            session.add(draft)
+            await session.commit()
+            await session.refresh(draft)
+            return JSONResponse(
+                {"status": "rejected", "draft": _reply_draft_payload(draft)}
+            )
+
     def _hub_session_lead_payload(binding: SessionLeadBinding) -> dict[str, Any]:
         return {
             "id": binding.id,
@@ -3515,6 +4494,9 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             "client_session_id": binding.client_session_id,
             "agent_id": binding.agent_id,
             "lead_label": binding.lead_label,
+            "reply_mode": binding.reply_mode,
+            "runtime_status": binding.runtime_status,
+            "runtime_seen_at": _hub_presence_timestamp(binding.runtime_seen_at),
             "status": binding.status,
             "created_at": str(binding.created_at),
             "updated_at": str(binding.updated_at),
@@ -3565,6 +4547,11 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         if rotate_raw is not None and not isinstance(rotate_raw, bool):
             raise HTTPException(status_code=400, detail="rotate_reply_token must be a boolean")
         rotate_token = bool(rotate_raw)
+        raw_reply_mode = body.get("reply_mode")
+        if raw_reply_mode is not None and raw_reply_mode not in {"confirm", "auto"}:
+            raise HTTPException(
+                status_code=400, detail="reply_mode must be 'confirm' or 'auto'"
+            )
         async with get_session() as session:
             team_project = await _hub_team_project(project_slug, session=session)
             human = await _hub_human(request, session=session)
@@ -3593,6 +4580,8 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     .values(
                         status="unbound",
                         reply_token_hash=None,
+                        runtime_status="unknown",
+                        runtime_seen_at=None,
                         updated_at=datetime.now(timezone.utc).replace(tzinfo=None),
                     )
                 )
@@ -3617,6 +4606,8 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                         session.add(agent)
                     if binding.status != "active":
                         binding.status = "active"
+                        binding.runtime_status = "unknown"
+                        binding.runtime_seen_at = None
                         binding.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
                         session.add(binding)
                     if binding.lead_label != lead_label:
@@ -3624,7 +4615,15 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                         binding.lead_label = lead_label
                         binding.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
                         session.add(binding)
-                    if rotate_token or not binding.reply_token_hash:
+                    mode_changed = (
+                        raw_reply_mode is not None
+                        and binding.reply_mode != raw_reply_mode
+                    )
+                    if mode_changed:
+                        binding.reply_mode = cast(str, raw_reply_mode)
+                        binding.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                        session.add(binding)
+                    if rotate_token or mode_changed or not binding.reply_token_hash:
                         reply_token = _new_reply_token()
                         binding.reply_token_hash = _hash_reply_token(reply_token)
                         binding.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
@@ -3669,6 +4668,11 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                         agent_id=agent.id,
                         lead_label=lead_label,
                         reply_token_hash=_hash_reply_token(reply_token),
+                        reply_mode=(
+                            cast(str, raw_reply_mode)
+                            if raw_reply_mode is not None
+                            else "confirm"
+                        ),
                         status="active",
                     )
                     await session.execute(
