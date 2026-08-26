@@ -597,6 +597,8 @@ class SessionLeadBinding(SQLModel, table=True):
     # once at creation/rotation and never stored. NULL = no capability.
     reply_token_hash: Optional[str] = Field(default=None, max_length=64)
     reply_mode: str = Field(default="confirm", max_length=16)  # confirm | auto
+    runtime_status: str = Field(default="unknown", max_length=16)
+    runtime_seen_at: Optional[datetime] = Field(default=None, index=True)
     status: str = Field(default="active", max_length=16)  # active | unbound
     created_at: datetime = Field(default_factory=_utcnow_naive)
     updated_at: datetime = Field(default_factory=_utcnow_naive)

@@ -29,7 +29,13 @@ from mcp_agent_mail import config as _config
 from mcp_agent_mail.app import build_mcp_server
 from mcp_agent_mail.db import get_session
 from mcp_agent_mail.http import build_http_app
-from mcp_agent_mail.models import Agent, HumanPresence, Project, TeamProject
+from mcp_agent_mail.models import (
+    Agent,
+    HumanPresence,
+    Project,
+    SessionLeadBinding,
+    TeamProject,
+)
 
 
 def _rpc(method: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -1142,7 +1148,7 @@ class TestHubHumanIdentityApi:
             for m in members:
                 assert set(m) == {
                     "human_id", "display_name", "mention_handle", "role", "status",
-                    "online", "last_seen_at",
+                    "online", "last_seen_at", "agent",
                 }
                 assert m["status"] == "active"
 
@@ -1155,7 +1161,115 @@ class TestHubHumanIdentityApi:
                 assert "default_agent_id" in m
                 assert "id" in m and "project_id" in m
                 assert "online" in m and "last_seen_at" in m
+                assert "agent" in m
             assert next(m for m in admin_members if m["mention_handle"] == "carol")["status"] == "invited"
+
+    @pytest.mark.asyncio
+    async def test_member_roster_exposes_only_fresh_managed_lead_status(
+        self, isolated_env, monkeypatch
+    ):
+        settings = _configure_hub_jwt(monkeypatch)
+        app = build_http_app(settings, build_mcp_server())
+        alice_headers = _hub_headers(settings, "oidc|alice", role=["writer", "admin"])
+        bob_headers = _hub_headers(settings, "oidc|bob")
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            alice = await client.put(
+                "/hub/api/humans/me",
+                headers=alice_headers,
+                json={"display_name": "Alice"},
+            )
+            bob = await client.put(
+                "/hub/api/humans/me",
+                headers=bob_headers,
+                json={"display_name": "Bob"},
+            )
+            assert alice.status_code == bob.status_code == 200
+            created = await client.post(
+                "/hub/api/projects",
+                headers=alice_headers,
+                json={"name": "Runtime", "slug": "runtime", "mention_handle": "alice"},
+            )
+            assert created.status_code == 201
+            joined = await client.post(
+                "/hub/api/projects/runtime/join-requests",
+                headers=bob_headers,
+                json={"mention_handle": "bob"},
+            )
+            assert joined.status_code == 201
+            approved = await client.patch(
+                f"/hub/api/projects/runtime/members/{bob.json()['id']}",
+                headers=alice_headers,
+                json={"status": "active"},
+            )
+            assert approved.status_code == 200
+
+            bound = await client.put(
+                "/hub/api/projects/runtime/session-lead",
+                headers=bob_headers,
+                json={"client_session_id": "client-runtime-1", "lead_label": "RainyRidge"},
+            )
+            assert bound.status_code == 201
+            reply_token = bound.json()["reply_token"]
+            credentials = {
+                "client_session_id": "client-runtime-1",
+                "reply_token": reply_token,
+            }
+
+            wrong = await client.post(
+                "/hub/api/projects/runtime/session-lead/status",
+                json={**credentials, "reply_token": "wrong", "status": "working"},
+            )
+            assert wrong.status_code == 403
+            invalid = await client.post(
+                "/hub/api/projects/runtime/session-lead/status",
+                json={**credentials, "status": "done"},
+            )
+            assert invalid.status_code == 400
+            heartbeat = await client.post(
+                "/hub/api/projects/runtime/session-lead/status",
+                json={**credentials, "status": "working"},
+            )
+            assert heartbeat.status_code == 200
+            assert heartbeat.json()["status"] == "working"
+
+            roster = await client.get(
+                "/hub/api/projects/runtime/members", headers=alice_headers,
+            )
+            assert roster.status_code == 200
+            rows = roster.json()["members"]
+            assert next(row for row in rows if row["mention_handle"] == "alice")["agent"] is None
+            bob_agent = next(row for row in rows if row["mention_handle"] == "bob")["agent"]
+            assert bob_agent == {
+                "name": "RainyRidge",
+                "kind": None,
+                "status": "working",
+                "managed": True,
+                "last_seen_at": heartbeat.json()["last_seen_at"],
+            }
+            assert not {
+                "agent_id", "client_session_id", "reply_token", "project", "pane",
+            }.intersection(bob_agent)
+
+            async with get_session() as session:
+                binding = (
+                    await session.execute(select(SessionLeadBinding))
+                ).scalars().one()
+                binding.runtime_seen_at = (
+                    datetime.now(timezone.utc).replace(tzinfo=None)
+                    - timedelta(seconds=16)
+                )
+                session.add(binding)
+                await session.commit()
+
+            stale = await client.get(
+                "/hub/api/projects/runtime/members", headers=bob_headers,
+            )
+            stale_bob = next(
+                row for row in stale.json()["members"] if row["mention_handle"] == "bob"
+            )
+            assert stale_bob["agent"]["status"] == "stopped"
 
     @pytest.mark.asyncio
     async def test_human_presence_supports_multiple_clients_logout_and_timeout(

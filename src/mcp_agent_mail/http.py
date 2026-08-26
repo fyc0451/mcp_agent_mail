@@ -94,6 +94,7 @@ from .storage import (
 )
 
 _HUMAN_PRESENCE_TTL_SECONDS = 60
+_SESSION_LEAD_RUNTIME_TTL_SECONDS = 15
 _HUMAN_PRESENCE_CLIENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{15,127}$")
 
 
@@ -733,7 +734,7 @@ def _jwks_candidate_keys(key_set, header: dict, algorithms: list[str]) -> list:
 
 _SESSION_LEAD_CAPABILITY_RE = re.compile(
     r"^/hub/api/projects/[A-Za-z0-9_-]+/session-lead/"
-    r"(?:reply|reply-drafts|inbox/claim|inbox/[1-9][0-9]*/complete)$"
+    r"(?:status|reply|reply-drafts|inbox/claim|inbox/[1-9][0-9]*/complete)$"
 )
 
 
@@ -1907,6 +1908,44 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             for human_id, state in states.items()
         }
 
+    async def _hub_session_lead_states(
+        team_project_id: int,
+        human_ids: list[int],
+        *,
+        session: AsyncSession,
+    ) -> dict[int, dict[str, Any]]:
+        if not human_ids:
+            return {}
+        rows = await session.execute(
+            select(SessionLeadBinding).where(
+                cast(Any, SessionLeadBinding.team_project_id) == team_project_id,
+                cast(Any, SessionLeadBinding.human_id).in_(human_ids),
+                cast(Any, SessionLeadBinding.status) == "active",
+            )
+        )
+        cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(
+            seconds=_SESSION_LEAD_RUNTIME_TTL_SECONDS
+        )
+        states: dict[int, dict[str, Any]] = {}
+        for binding in rows.scalars().all():
+            runtime_status = (
+                binding.runtime_status
+                if binding.runtime_status in {"working", "idle", "blocked"}
+                and binding.runtime_seen_at is not None
+                and binding.runtime_seen_at >= cutoff
+                else "stopped"
+            )
+            states[binding.human_id] = {
+                "agent": {
+                    "name": binding.lead_label or None,
+                    "kind": None,
+                    "status": runtime_status,
+                    "managed": True,
+                    "last_seen_at": _hub_presence_timestamp(binding.runtime_seen_at),
+                }
+            }
+        return states
+
     def _hub_agent_payload(agent: Agent) -> dict[str, Any]:
         return {
             "id": agent.id,
@@ -2329,7 +2368,10 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         await ensure_schema()
         async with get_session() as session:
             human = await _hub_human(request, session=session)
-            project = await _hub_project(project_slug, session=session)
+            team_project = await _hub_team_project(project_slug, session=session)
+            project = await session.get(Project, team_project.routing_project_id)
+            if project is None or project.archived_at is not None:
+                raise HTTPException(status_code=404, detail="Project not found")
             caller = await _hub_active_membership(project, human, session=session)
             is_admin = caller.role == "admin"
             # Ordinary members get a minimal roster of ACTIVE members only —
@@ -2352,6 +2394,11 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 [membership.human_id for membership, _member_human in member_rows],
                 session=session,
             )
+            lead_states = await _hub_session_lead_states(
+                cast(int, team_project.id),
+                [membership.human_id for membership, _member_human in member_rows],
+                session=session,
+            )
             for membership, member_human in member_rows:
                 if is_admin:
                     payload = _hub_membership_payload(membership)
@@ -2367,6 +2414,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     membership.human_id,
                     {"online": False, "last_seen_at": None},
                 ))
+                payload.update(lead_states.get(membership.human_id, {"agent": None}))
                 members.append(payload)
             return JSONResponse({"members": members})
 
@@ -3491,6 +3539,45 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         return team_project, project, binding, sender
 
     @fastapi_app.post(
+        "/hub/api/projects/{project_slug}/session-lead/status",
+        response_class=JSONResponse,
+    )
+    async def hub_session_lead_status(project_slug: str, request: Request) -> JSONResponse:
+        """Record a binding-scoped runtime heartbeat for the safe team roster."""
+        await ensure_schema()
+        body = await _hub_json_body(request)
+        if set(body) != {"client_session_id", "reply_token", "status"}:
+            raise HTTPException(
+                status_code=400,
+                detail="client_session_id, reply_token and status are required",
+            )
+        client_session_id, reply_token = _session_lead_credentials(body)
+        runtime_status = body.get("status")
+        if runtime_status not in {"working", "idle", "blocked"}:
+            raise HTTPException(status_code=400, detail="Invalid runtime status")
+        async with get_session() as session:
+            _team_project, _project, binding, sender = (
+                await _session_lead_capability_context(
+                    project_slug,
+                    client_session_id,
+                    reply_token,
+                    session=session,
+                )
+            )
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
+            binding.runtime_status = cast(str, runtime_status)
+            binding.runtime_seen_at = now
+            binding.updated_at = now
+            sender.last_active_ts = now
+            session.add(binding)
+            session.add(sender)
+            await session.commit()
+            return JSONResponse({
+                "status": binding.runtime_status,
+                "last_seen_at": _hub_presence_timestamp(binding.runtime_seen_at),
+            })
+
+    @fastapi_app.post(
         "/hub/api/projects/{project_slug}/session-lead/reply",
         response_class=JSONResponse,
     )
@@ -4408,6 +4495,8 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             "agent_id": binding.agent_id,
             "lead_label": binding.lead_label,
             "reply_mode": binding.reply_mode,
+            "runtime_status": binding.runtime_status,
+            "runtime_seen_at": _hub_presence_timestamp(binding.runtime_seen_at),
             "status": binding.status,
             "created_at": str(binding.created_at),
             "updated_at": str(binding.updated_at),
@@ -4491,6 +4580,8 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     .values(
                         status="unbound",
                         reply_token_hash=None,
+                        runtime_status="unknown",
+                        runtime_seen_at=None,
                         updated_at=datetime.now(timezone.utc).replace(tzinfo=None),
                     )
                 )
@@ -4515,6 +4606,8 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                         session.add(agent)
                     if binding.status != "active":
                         binding.status = "active"
+                        binding.runtime_status = "unknown"
+                        binding.runtime_seen_at = None
                         binding.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
                         session.add(binding)
                     if binding.lead_label != lead_label:

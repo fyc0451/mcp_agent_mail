@@ -946,6 +946,9 @@ def _setup_fts(connection: Any) -> None:
         "ALTER TABLE session_lead_reply_keys ADD COLUMN mention_handles VARCHAR(8192) DEFAULT '[]'",
         # M4 team reply policy: legacy bindings are confirm-mode.
         "ALTER TABLE session_lead_bindings ADD COLUMN reply_mode VARCHAR(16) DEFAULT 'confirm'",
+        # Team roster: capability-authenticated minimal local runtime status.
+        "ALTER TABLE session_lead_bindings ADD COLUMN runtime_status VARCHAR(16) DEFAULT 'unknown'",
+        "ALTER TABLE session_lead_bindings ADD COLUMN runtime_seen_at DATETIME DEFAULT NULL",
         # M4 capability-scoped inbox claim lifecycle.
         "ALTER TABLE human_inbox_items ADD COLUMN claim_binding_id INTEGER DEFAULT NULL",
         "ALTER TABLE human_inbox_items ADD COLUMN claim_token_hash VARCHAR(64) DEFAULT NULL",
@@ -976,6 +979,8 @@ def _setup_fts(connection: Any) -> None:
         "ON human_inbox_items (completed_at)",
         "CREATE INDEX IF NOT EXISTS ix_hii_reply_decision "
         "ON human_inbox_items (reply_decision)",
+        "CREATE INDEX IF NOT EXISTS ix_session_lead_bindings_runtime_seen_at "
+        "ON session_lead_bindings (runtime_seen_at)",
     ]:
         connection.exec_driver_sql(index_sql)
 
