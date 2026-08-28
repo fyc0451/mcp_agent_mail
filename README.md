@@ -2029,12 +2029,14 @@ Common variables you may set:
 | `HTTP_HOST` | `127.0.0.1` | Bind host for HTTP transport |
 | `HTTP_PORT` | `8765` | Bind port for HTTP transport |
 | `HTTP_PATH` | `/mcp/` | Preferred MCP endpoint mount path (`/api` and `/mcp` aliases are also mounted) |
+| `HTTP_PUBLIC_MODE` | `false` | Fail-closed public Team Hub profile; requires loopback bind, RS256 issuer + introspection, Redis limits, and disabled CORS/static bearer/localhost bypass |
 | `HTTP_JWT_ENABLED` | `false` | Enable JWT validation middleware |
 | `HTTP_JWT_SECRET` |  | HMAC secret for HS* algorithms (dev) |
 | `HTTP_JWT_JWKS_URL` |  | JWKS URL for public key verification |
 | `HTTP_JWT_ALGORITHMS` | `HS256` | CSV of allowed algs |
 | `HTTP_JWT_AUDIENCE` |  | Expected `aud` (optional) |
 | `HTTP_JWT_ISSUER` |  | Expected `iss` (optional) |
+| `HTTP_JWT_INTROSPECTION_URL` |  | Issuer revocation check URL; required HTTPS URL in public mode |
 | `HTTP_JWT_ROLE_CLAIM` | `role` | JWT claim name containing role(s) |
 | `HTTP_RBAC_ENABLED` | `true` | Enforce read-only vs tools RBAC |
 | `HTTP_RBAC_READER_ROLES` | `reader,read,ro` | CSV of reader roles |
@@ -2120,7 +2122,7 @@ Common variables you may set:
 | `RETENTION_IGNORE_PROJECT_PATTERNS` | `demo,test*,testproj*,testproject,backendproj*,frontendproj*` | CSV of project patterns to ignore in retention/quota reports |
 | `AGENT_NAME_ENFORCEMENT_MODE` | `coerce` | Agent naming policy: `strict` (reject invalid adjective+noun names), `coerce` (auto-generate if invalid), `always_auto` (always auto-generate) |
 
-### Standalone beta Human issuer
+### Standalone Human issuer
 
 `mcp_agent_mail.human_auth` is a small RS256 issuer for deployments that do not
 yet have an external IdP. It runs as a separate process, binds to loopback by
@@ -2128,8 +2130,9 @@ default, and keeps its signing key, user DB, and generated bootstrap credentials
 outside the source tree with mode `0600`. Agent Cockpit may proxy `/token`, but
 it never receives the signing key.
 
-Use `deploy/systemd/mcp-agent-mail-human-auth.service` as a deployment template,
-then configure the Hub with:
+For a public Team Hub, use the complete fail-closed profile in
+[`deploy/public-hub/README.md`](deploy/public-hub/README.md). The following
+loopback example is only for local/private development:
 
 ```dotenv
 HTTP_JWT_ENABLED=true
@@ -2444,6 +2447,11 @@ Operations teams can follow `docs/operations_alignment_checklist.md`, which link
 
 ## Deployment quick notes
 
+For an Internet-facing Team Hub, do not use the generic direct-start examples
+below. Follow [`deploy/public-hub/README.md`](deploy/public-hub/README.md) so the
+backend remains loopback-only behind HTTPS and public mode validates the full
+security profile before startup.
+
 - **Direct uvicorn**: `uvicorn mcp_agent_mail.http:create_app --factory --host 0.0.0.0 --port 8765`
 - **Python module**: `python -m mcp_agent_mail.http --host 0.0.0.0 --port 8765`
 - **Gunicorn**: `gunicorn -c deploy/gunicorn.conf.py mcp_agent_mail.http:create_app --factory`
@@ -2463,7 +2471,9 @@ If not using journald, a sample logrotate config is provided at `deploy/logrotat
 
 - Default systemd unit (`deploy/systemd/mcp-agent-mail.service`) is configured to send logs to journald (StandardOutput/StandardError=journal).
 - For file logging, configure your process manager to write to files under `/var/log/mcp-agent-mail/*.log` and install the provided logrotate config.
-- Environment file path for systemd is `/etc/mcp-agent-mail.env` (see `deploy/systemd/mcp-agent-mail.service`).
+- The opt-in hardened public systemd unit under `deploy/public-hub/` reads
+  `/etc/mcp-agent-mail/public-hub.env`; see its README. The generic unit keeps
+  its existing `/etc/mcp-agent-mail.env` contract.
 
 ### Container build and multi-arch push
 
@@ -2489,7 +2499,8 @@ Recommended tags: a moving `latest` and immutable version tags per release. Ensu
 ### Systemd manual deployment steps
 
 1. Copy project files to `/opt/mcp-agent-mail` and ensure permissions (owner `appuser`).
-2. Place environment file at `/etc/mcp-agent-mail.env` based on `deploy/env/production.env`.
+2. For a public Team Hub, install the two environment examples from
+   `deploy/public-hub/` under `/etc/mcp-agent-mail/` as documented there.
 3. Install service file `deploy/systemd/mcp-agent-mail.service` to `/etc/systemd/system/`.
 4. Reload systemd and start:
 

@@ -129,6 +129,72 @@ async def test_http_jwks_validation_and_resource_rate_limit(isolated_env, monkey
 
 
 @pytest.mark.asyncio
+async def test_http_jwt_introspection_fails_closed(isolated_env, monkeypatch):
+    monkeypatch.setenv("HTTP_JWT_ENABLED", "true")
+    monkeypatch.setenv("HTTP_JWT_ALGORITHMS", "RS256")
+    monkeypatch.setenv("HTTP_JWT_JWKS_URL", "https://auth.local/.well-known/jwks.json")
+    monkeypatch.setenv("HTTP_JWT_INTROSPECTION_URL", "https://auth.local/introspect")
+    monkeypatch.setenv("HTTP_JWT_AUDIENCE", "mcp-agent-mail-human")
+    monkeypatch.setenv("HTTP_JWT_ISSUER", "https://auth.local")
+    monkeypatch.setenv("HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED", "false")
+    _config.clear_settings_cache()
+    settings = _config.get_settings()
+
+    private_jwk = JsonWebKey.generate_key("RSA", 2048, is_private=True).as_dict(
+        is_private=True
+    )
+    private_jwk["kid"] = "public-kid"
+    public_jwk = JsonWebKey.import_key(private_jwk).as_dict(is_private=False)
+    token = jwt.encode(
+        {"alg": "RS256", "kid": "public-kid"},
+        {
+            "sub": "human:alice",
+            "aud": "mcp-agent-mail-human",
+            "iss": "https://auth.local",
+            settings.http.jwt_role_claim: "writer",
+        },
+        private_jwk,
+    ).decode("utf-8")
+
+    class _Response:
+        def __init__(self, payload: dict[str, Any], status_code: int = 200):
+            self._payload = payload
+            self.status_code = status_code
+
+        def json(self) -> dict[str, Any]:
+            return self._payload
+
+    async def fake_get(self, url: str):
+        return _Response({"keys": [public_jwk]})
+
+    import httpx
+
+    from mcp_agent_mail import http as http_module
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", fake_get, raising=False)
+    introspection_active = True
+
+    async def fake_introspect(url: str, candidate: str) -> bool:
+        assert url == "https://auth.local/introspect"
+        assert candidate == token
+        return introspection_active
+
+    monkeypatch.setattr(http_module, "_introspect_jwt", fake_introspect)
+    app = build_http_app(settings, build_mcp_server())
+    request = _rpc("tools/call", {"name": "health_check", "arguments": {}})
+    headers = {"Authorization": f"Bearer {token}"}
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        assert (
+            await client.post(settings.http.path, headers=headers, json=request)
+        ).status_code == 200
+        introspection_active = False
+        assert (
+            await client.post(settings.http.path, headers=headers, json=request)
+        ).status_code == 401
+
+
+@pytest.mark.asyncio
 async def test_http_path_mount_trailing_and_no_slash(isolated_env):
     server = build_mcp_server()
     settings = _config.get_settings()

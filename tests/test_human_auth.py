@@ -7,7 +7,13 @@ import pytest
 from authlib.jose import JsonWebKey, JsonWebToken
 from fastapi.testclient import TestClient
 
-from mcp_agent_mail.human_auth import HumanAuthConfig, _validated_bind_host, create_app
+from mcp_agent_mail.human_auth import (
+    HumanAuthConfig,
+    _read_secret_file,
+    _validate_runtime_config,
+    _validated_bind_host,
+    create_app,
+)
 
 
 def test_bind_host_requires_explicit_private_http_opt_in():
@@ -24,12 +30,44 @@ def test_bind_host_requires_explicit_private_http_opt_in():
             _validated_bind_host(host, allow_private_http=True)
 
 
-def _bootstrapped_client(tmp_path):
+def test_public_mode_and_admin_secret_fail_closed(tmp_path):
+    base = {
+        "data_dir": tmp_path / "state",
+        "issuer": "https://auth.example.com",
+        "audience": "mcp-agent-mail-human",
+        "admin_access_token": "public-admin-factor-0123456789abcdef",
+        "public_mode": True,
+    }
+    _validate_runtime_config(HumanAuthConfig(**base))
+    with pytest.raises(ValueError, match="HTTPS issuer"):
+        _validate_runtime_config(
+            HumanAuthConfig(**{**base, "issuer": "http://127.0.0.1:8766"})
+        )
+    with pytest.raises(ValueError, match=r"32\+ character"):
+        _validate_runtime_config(
+            HumanAuthConfig(**{**base, "admin_access_token": "short"})
+        )
+    with pytest.raises(ValueError, match="forbids reusable"):
+        _validate_runtime_config(
+            HumanAuthConfig(**{**base, "allow_reusable_team_code": True})
+        )
+
+    secret = tmp_path / "admin-access-token"
+    secret.write_text("public-admin-factor-0123456789abcdef", encoding="utf-8")
+    secret.chmod(0o644)
+    with pytest.raises(ValueError, match="0600"):
+        _read_secret_file(secret)
+    secret.chmod(0o600)
+    assert _read_secret_file(secret) == "public-admin-factor-0123456789abcdef"
+
+
+def _bootstrapped_client(tmp_path, **config_overrides):
     config = HumanAuthConfig(
         data_dir=tmp_path / "state",
         issuer="http://127.0.0.1:8766",
         audience="mcp-agent-mail-human",
         token_ttl_seconds=600,
+        **config_overrides,
     )
     app = create_app(config)
     credentials = tmp_path / "admin.json"
@@ -63,6 +101,7 @@ def test_bootstrap_login_and_jwks_verification(tmp_path):
     assert claims["aud"] == "mcp-agent-mail-human"
     assert claims["sub"] == "human:fyc"
     assert claims["name"] == "付彦超"
+    assert claims["ver"] == 1
     assert set(claims["role"]) == {"writer", "admin"}
 
 
@@ -92,7 +131,7 @@ def test_login_failures_are_generic_and_rate_limited(tmp_path):
     assert response.status_code == 429
 
 
-def test_authenticated_user_changes_password_without_revoking_existing_token(tmp_path):
+def test_password_change_revokes_existing_token_immediately(tmp_path):
     _, client, credentials = _bootstrapped_client(tmp_path)
     old_secret = json.loads(credentials.read_text())
     login = client.post("/token", json=old_secret)
@@ -110,14 +149,48 @@ def test_authenticated_user_changes_password_without_revoking_existing_token(tmp
         "/me/password", headers=headers, json={"new_password": "new-password-1234"}
     )
     assert changed.status_code == 200
-    assert changed.json() == {"ok": True}
+    changed_payload = changed.json()
+    assert changed_payload["ok"] is True
+    assert changed_payload["token_type"] == "Bearer"
+    assert changed_payload["expires_in"] == 600
+    replacement_headers = {
+        "Authorization": f"Bearer {changed_payload['access_token']}"
+    }
 
-    assert client.get("/me", headers=headers).status_code == 200
+    assert client.get("/me", headers=headers).status_code == 401
+    introspection = client.post("/introspect", headers=headers)
+    assert introspection.status_code == 200
+    assert introspection.json() == {"active": False}
+    assert client.get("/me", headers=replacement_headers).status_code == 200
+    assert client.post("/introspect", headers=replacement_headers).json() == {
+        "active": True
+    }
     assert client.post("/token", json=old_secret).status_code == 401
-    assert client.post(
+    new_login = client.post(
         "/token",
         json={"username": old_secret["username"], "password": "new-password-1234"},
-    ).status_code == 200
+    )
+    assert new_login.status_code == 200
+    assert client.post(
+        "/introspect",
+        headers={"Authorization": f"Bearer {new_login.json()['access_token']}"},
+    ).json() == {"active": True}
+
+
+def test_admin_second_factor_is_required_when_configured(tmp_path):
+    _, client, credentials = _bootstrapped_client(
+        tmp_path, admin_access_token="public-admin-factor-0123456789abcdef"
+    )
+    token = client.post("/token", json=json.loads(credentials.read_text())).json()[
+        "access_token"
+    ]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    assert client.get("/admin/users", headers=headers).status_code == 403
+    headers["X-Agent-Hub-Admin-Key"] = "wrong-factor"
+    assert client.get("/admin/users", headers=headers).status_code == 403
+    headers["X-Agent-Hub-Admin-Key"] = "public-admin-factor-0123456789abcdef"
+    assert client.get("/admin/users", headers=headers).status_code == 200
 
 
 def test_discovery_exposes_public_metadata_only(tmp_path):
@@ -331,7 +404,9 @@ def test_concurrent_registration_consumes_invitation_once(tmp_path):
 
 
 def test_team_code_is_reusable_and_never_consumed(tmp_path):
-    app, client, _credentials = _bootstrapped_client(tmp_path)
+    _app, client, _credentials = _bootstrapped_client(
+        tmp_path, allow_reusable_team_code=True
+    )
     (tmp_path / "state" / "team-code").write_text("team-secret-2026", encoding="utf-8")
 
     for username in ("carol", "dave"):
@@ -366,7 +441,9 @@ def test_team_code_absent_file_falls_back_to_invitations_only(tmp_path):
 
 
 def test_team_code_unicode_and_invalid_utf8_file(tmp_path):
-    _app, client, _credentials = _bootstrapped_client(tmp_path)
+    _app, client, _credentials = _bootstrapped_client(
+        tmp_path, allow_reusable_team_code=True
+    )
     state = tmp_path / "state"
     (state / "team-code").write_text("团队码-2026", encoding="utf-8")
 
@@ -398,7 +475,9 @@ def test_team_code_unicode_and_invalid_utf8_file(tmp_path):
 
 
 def test_team_code_matching_consumed_invitation_does_not_rewrite_audit(tmp_path):
-    app, client, credentials = _bootstrapped_client(tmp_path)
+    app, client, credentials = _bootstrapped_client(
+        tmp_path, allow_reusable_team_code=True
+    )
     admin_secret = json.loads(credentials.read_text())
     admin_token = client.post("/token", json=admin_secret).json()["access_token"]
     invitation = client.post(
@@ -439,8 +518,10 @@ def test_team_code_matching_consumed_invitation_does_not_rewrite_audit(tmp_path)
     assert row["used_at"] == original_used_at
 
 
-def test_register_failures_are_rate_limited_and_success_clears(tmp_path):
-    _app, client, _credentials = _bootstrapped_client(tmp_path)
+def test_register_failures_are_rate_limited_across_success_and_restart(tmp_path):
+    app, client, _credentials = _bootstrapped_client(
+        tmp_path, allow_reusable_team_code=True
+    )
     (tmp_path / "state" / "team-code").write_text("team-secret-2026", encoding="utf-8")
 
     def attempt(username, code):
@@ -453,12 +534,79 @@ def test_register_failures_are_rate_limited_and_success_clears(tmp_path):
 
     for i in range(4):
         assert attempt(f"bad{i}", "wrong").status_code == 400
-    # 一次成功清零失败计数
+    # 成功注册不能替攻击源清空 IP 失败计数。
     assert attempt("kate", "team-secret-2026").status_code == 201
-    for i in range(4, 8):
-        assert attempt(f"bad{i}", "wrong").status_code == 400
-    # 连续第 5 次失败后被限流
-    assert attempt("bad8", "wrong").status_code == 400  # 第 5 次失败本身仍执行
-    assert attempt("bad9", "wrong").status_code == 429
-    # 限流期间即使团队码正确也拒绝
-    assert attempt("liam", "team-secret-2026").status_code == 429
+    assert attempt("bad4", "wrong").status_code == 400
+
+    restarted = TestClient(create_app(app.state.store.config))
+    assert restarted.post(
+        "/register",
+        json={
+            "username": "liam",
+            "display_name": "Liam",
+            "password": "liam-password-123",
+            "invite_code": "team-secret-2026",
+        },
+    ).status_code == 429
+
+
+def test_public_proxy_rate_limit_uses_caddy_client_ip(tmp_path):
+    config = HumanAuthConfig(
+        data_dir=tmp_path / "state",
+        issuer="https://auth.example.com",
+        audience="mcp-agent-mail-human",
+        admin_access_token="public-admin-factor-0123456789abcdef",
+        public_mode=True,
+    )
+    app = create_app(config)
+    credentials = tmp_path / "admin.json"
+    assert app.state.store.bootstrap_admin(
+        username="fyc", display_name="付彦超", credentials_path=credentials
+    )
+    client = TestClient(app, client=("127.0.0.1", 50000))
+    admin_token = client.post(
+        "/token",
+        headers={"X-Forwarded-For": "198.51.100.10"},
+        json=json.loads(credentials.read_text()),
+    ).json()["access_token"]
+    invitation = client.post(
+        "/admin/invitations",
+        headers={
+            "Authorization": f"Bearer {admin_token}",
+            "X-Agent-Hub-Admin-Key": "public-admin-factor-0123456789abcdef",
+            "X-Forwarded-For": "198.51.100.10",
+        },
+        json={"expires_in": 3600},
+    ).json()["invite_code"]
+
+    for index in range(5):
+        assert client.post(
+            "/register",
+            headers={"X-Forwarded-For": "198.51.100.20"},
+            json={
+                "username": f"blocked{index}",
+                "display_name": f"Blocked {index}",
+                "password": "member-password-123",
+                "invite_code": "invalid-code",
+            },
+        ).status_code == 400
+    assert client.post(
+        "/register",
+        headers={"X-Forwarded-For": "198.51.100.20"},
+        json={
+            "username": "blocked5",
+            "display_name": "Blocked 5",
+            "password": "member-password-123",
+            "invite_code": invitation,
+        },
+    ).status_code == 429
+    assert client.post(
+        "/register",
+        headers={"X-Forwarded-For": "198.51.100.21"},
+        json={
+            "username": "alice",
+            "display_name": "Alice",
+            "password": "member-password-123",
+            "invite_code": invitation,
+        },
+    ).status_code == 201

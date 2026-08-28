@@ -1,0 +1,35 @@
+{
+	email admin@example.com
+}
+
+team-api.example.com {
+	encode zstd gzip
+	request_body {
+		max_size 2MB
+	}
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+	reverse_proxy 127.0.0.1:8765 {
+		header_up X-Forwarded-For {remote_host}
+	}
+}
+
+team-auth.example.com {
+	encode zstd gzip
+	request_body {
+		max_size 64KB
+	}
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+	reverse_proxy 127.0.0.1:8766 {
+		header_up X-Forwarded-For {remote_host}
+	}
+}

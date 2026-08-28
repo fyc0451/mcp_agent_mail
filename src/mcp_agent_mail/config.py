@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import ipaddress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
+from urllib.parse import urlsplit
 
 from decouple import (
     Config as DecoupleConfig,
@@ -43,6 +45,7 @@ class HttpSettings:
     port: int
     path: str
     bearer_token: str | None
+    public_mode: bool
     # Basic per-IP limiter (legacy/simple)
     rate_limit_enabled: bool
     rate_limit_per_minute: int
@@ -65,6 +68,7 @@ class HttpSettings:
     jwt_jwks_url: str | None
     jwt_audience: str | None
     jwt_issuer: str | None
+    jwt_introspection_url: str | None
     jwt_role_claim: str
     rbac_enabled: bool
     rbac_reader_roles: list[str]
@@ -399,6 +403,7 @@ def _build_settings() -> Settings:
         port=_i("HTTP_PORT", default=8765),
         path=decouple_config("HTTP_PATH", default="/api/"),
         bearer_token=decouple_config("HTTP_BEARER_TOKEN", default="") or None,
+        public_mode=_b("HTTP_PUBLIC_MODE", default=False),
         rate_limit_enabled=_b("HTTP_RATE_LIMIT_ENABLED", default=False),
         rate_limit_per_minute=_i("HTTP_RATE_LIMIT_PER_MINUTE", default=60),
         rate_limit_backend=_enum(
@@ -422,6 +427,9 @@ def _build_settings() -> Settings:
         jwt_jwks_url=decouple_config("HTTP_JWT_JWKS_URL", default="") or None,
         jwt_audience=decouple_config("HTTP_JWT_AUDIENCE", default="") or None,
         jwt_issuer=decouple_config("HTTP_JWT_ISSUER", default="") or None,
+        jwt_introspection_url=(
+            decouple_config("HTTP_JWT_INTROSPECTION_URL", default="") or None
+        ),
         jwt_role_claim=decouple_config("HTTP_JWT_ROLE_CLAIM", default="role") or "role",
         rbac_enabled=_b("HTTP_RBAC_ENABLED", default=True),
         rbac_reader_roles=_csv("HTTP_RBAC_READER_ROLES", default="reader,read,ro"),
@@ -461,6 +469,45 @@ def _build_settings() -> Settings:
         allow_methods=_csv("HTTP_CORS_ALLOW_METHODS", default="*"),
         allow_headers=_csv("HTTP_CORS_ALLOW_HEADERS", default="*"),
     )
+
+    if http_settings.public_mode:
+        try:
+            bind_address = ipaddress.ip_address(http_settings.host)
+        except ValueError:
+            bind_address = None
+        public_errors: list[str] = []
+        if http_settings.host != "localhost" and not (
+            bind_address is not None and bind_address.is_loopback
+        ):
+            public_errors.append("HTTP_HOST must be loopback")
+        if http_settings.allow_localhost_unauthenticated:
+            public_errors.append("HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED must be false")
+        if http_settings.bearer_token:
+            public_errors.append("HTTP_BEARER_TOKEN must be empty")
+        if not http_settings.jwt_enabled:
+            public_errors.append("HTTP_JWT_ENABLED must be true")
+        if set(http_settings.jwt_algorithms) != {"RS256"}:
+            public_errors.append("HTTP_JWT_ALGORITHMS must be RS256")
+        for key, value in (
+            ("HTTP_JWT_JWKS_URL", http_settings.jwt_jwks_url),
+            ("HTTP_JWT_ISSUER", http_settings.jwt_issuer),
+            ("HTTP_JWT_INTROSPECTION_URL", http_settings.jwt_introspection_url),
+        ):
+            if not value or urlsplit(value).scheme != "https":
+                public_errors.append(f"{key} must be an HTTPS URL")
+        if not http_settings.jwt_audience:
+            public_errors.append("HTTP_JWT_AUDIENCE is required")
+        if not http_settings.rate_limit_enabled:
+            public_errors.append("HTTP_RATE_LIMIT_ENABLED must be true")
+        if (
+            http_settings.rate_limit_backend != "redis"
+            or not http_settings.rate_limit_redis_url
+        ):
+            public_errors.append("HTTP_RATE_LIMIT_BACKEND must use configured Redis")
+        if cors_settings.enabled:
+            public_errors.append("HTTP_CORS_ENABLED must be false")
+        if public_errors:
+            raise ConfigError("HTTP_PUBLIC_MODE: " + "; ".join(public_errors))
 
     def _float(value: str, *, default: float, key: str) -> float:
         text = str(value or "").strip()

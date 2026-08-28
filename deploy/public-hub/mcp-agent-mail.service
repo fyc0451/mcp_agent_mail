@@ -1,0 +1,35 @@
+[Unit]
+Description=MCP Agent Mail public Team Hub API
+Wants=network-online.target
+After=network-online.target redis-server.service
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/mcp-agent-mail/public-hub.env
+WorkingDirectory=/opt/mcp-agent-mail
+ExecStart=/opt/mcp-agent-mail/.venv/bin/python -m mcp_agent_mail.cli serve-http
+Restart=always
+RestartSec=5
+User=appuser
+Group=appuser
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/mcp-agent-mail
+TimeoutStopSec=15
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

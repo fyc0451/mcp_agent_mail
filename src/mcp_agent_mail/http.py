@@ -687,6 +687,31 @@ async def _fetch_jwks(jwks_url: str, *, force: bool = False):
     return key_set
 
 
+async def _introspect_jwt(introspection_url: str, token: str) -> bool:
+    """Ask the issuer whether a locally verified JWT is still active.
+
+    Redirects and all network/JSON failures fail closed so a compromised or
+    unavailable issuer cannot silently turn revocation checks into allow.
+    """
+    try:
+        httpx = importlib.import_module("httpx")
+        AsyncClient = httpx.AsyncClient
+        async with AsyncClient(timeout=5, follow_redirects=False) as client:
+            response = await client.post(
+                introspection_url,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Accept": "application/json",
+                },
+            )
+        if response.status_code != 200:
+            return False
+        payload = response.json()
+        return isinstance(payload, dict) and payload.get("active") is True
+    except Exception:
+        return False
+
+
 def _select_jwks_key(key_set, header: dict, algorithms: list[str]):
     """Resolve the verification key from a JWKS key set by ``kid``.
 
@@ -917,6 +942,14 @@ class SecurityAndRateLimitMiddleware(BaseHTTPMiddleware):
                         if not audience_matches:
                             continue
                     if issuer and str(claims.get("iss") or "") != issuer:
+                        continue
+                    introspection_url = (
+                        getattr(self.settings.http, "jwt_introspection_url", None)
+                        or None
+                    )
+                    if introspection_url and not await _introspect_jwt(
+                        introspection_url, token
+                    ):
                         continue
                     return dict(claims)
         return None
@@ -1755,7 +1788,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         *,
         session: AsyncSession,
     ) -> Human:
-        """幂等补建已认证 Human，使旧客户端也能先列出 Topic。"""
+        """幂等补建已认证 Human,使旧客户端也能先列出 Topic。"""
         subject = _hub_subject(request)
         human = await _human_by_subject(subject, session=session)
         if human is not None:

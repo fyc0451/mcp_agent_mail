@@ -48,7 +48,10 @@ class HumanAuthConfig:
     data_dir: Path
     issuer: str
     audience: str
-    token_ttl_seconds: int = 8 * 60 * 60
+    token_ttl_seconds: int = 60 * 60
+    admin_access_token: str | None = None
+    allow_reusable_team_code: bool = False
+    public_mode: bool = False
 
 
 class LoginRequest(BaseModel):
@@ -195,6 +198,10 @@ class HumanAuthStore:
                 connection.execute(
                     "ALTER TABLE users ADD COLUMN requested_project_slug TEXT"
                 )
+            if "token_version" not in columns:
+                connection.execute(
+                    "ALTER TABLE users ADD COLUMN token_version INTEGER NOT NULL DEFAULT 1"
+                )
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS invitations (
@@ -215,6 +222,21 @@ class HumanAuthStore:
                 connection.execute(
                     "ALTER TABLE invitations ADD COLUMN project_slug TEXT"
                 )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS auth_failures (
+                    scope TEXT NOT NULL,
+                    failure_key TEXT NOT NULL,
+                    failed_at INTEGER NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS ix_auth_failures_lookup
+                ON auth_failures(scope, failure_key, failed_at)
+                """
+            )
         self.db_path.chmod(0o600)
 
     def _load_or_create_key(self):
@@ -273,7 +295,8 @@ class HumanAuthStore:
         with self._connect() as connection:
             row = connection.execute(
                 """
-                SELECT subject, username, display_name, password_hash, roles_json, status
+                SELECT subject, username, display_name, password_hash, roles_json,
+                       status, token_version
                 FROM users WHERE username = ? AND active = 1 AND status = 'active'
                 """,
                 (username,),
@@ -283,18 +306,29 @@ class HumanAuthStore:
             return None
         return row
 
-    def change_password(self, *, subject: str, new_password: str) -> None:
+    def change_password(self, *, subject: str, new_password: str) -> sqlite3.Row:
         password_hash = _password_hash(new_password)
         with self._connect() as connection:
             result = connection.execute(
                 """
-                UPDATE users SET password_hash = ?
+                UPDATE users SET password_hash = ?, token_version = token_version + 1
                 WHERE subject = ? AND active = 1 AND status = 'active'
                 """,
                 (password_hash, subject),
             )
             if result.rowcount != 1:
                 raise LookupError("User not found")
+            user = connection.execute(
+                """
+                SELECT subject, username, display_name, password_hash, roles_json,
+                       status, token_version
+                FROM users WHERE subject = ? AND active = 1 AND status = 'active'
+                """,
+                (subject,),
+            ).fetchone()
+        if user is None:
+            raise LookupError("User not found")
+        return user
 
     @staticmethod
     def profile(user: sqlite3.Row) -> dict[str, Any]:
@@ -309,7 +343,8 @@ class HumanAuthStore:
         with self._connect() as connection:
             return connection.execute(
                 """
-                SELECT subject, username, display_name, roles_json, status
+                SELECT subject, username, display_name, roles_json, status,
+                       token_version
                 FROM users WHERE subject = ? AND active = 1 AND status = 'active'
                 """,
                 (subject,),
@@ -348,6 +383,8 @@ class HumanAuthStore:
         注册仍落 pending,需管理员激活后才能登录,泄露不会直接放行。
         文件缺失/不可读/非 UTF-8/超限一律视为未配置(返回 False)。
         """
+        if not self.config.allow_reusable_team_code:
+            return False
         try:
             raw = (self.config.data_dir / "team-code").read_bytes()
         except OSError:
@@ -477,7 +514,11 @@ class HumanAuthStore:
             if "admin" in json.loads(target["roles_json"]):
                 raise ValueError("Administrator accounts cannot be disabled here")
             connection.execute(
-                "UPDATE users SET status = ?, active = ? WHERE subject = ?",
+                """
+                UPDATE users
+                SET status = ?, active = ?, token_version = token_version + 1
+                WHERE subject = ?
+                """,
                 (status, 1 if status == "active" else 0, target["subject"]),
             )
         return {
@@ -504,6 +545,7 @@ class HumanAuthStore:
             "preferred_username": user["username"],
             "name": user["display_name"],
             "role": json.loads(user["roles_json"]),
+            "ver": int(user["token_version"]),
         }
         token = JsonWebToken(["RS256"]).encode(
             {"alg": "RS256", "typ": "JWT", "kid": self.kid},
@@ -512,33 +554,68 @@ class HumanAuthStore:
         )
         return token.decode("ascii"), self.config.token_ttl_seconds
 
+    def rate_limited(
+        self,
+        *,
+        scope: str,
+        failure_key: str,
+        now: int,
+        limit: int,
+        window_seconds: int = 300,
+    ) -> bool:
+        with self._connect() as connection:
+            connection.execute(
+                "DELETE FROM auth_failures WHERE failed_at < ?", (now - window_seconds,)
+            )
+            row = connection.execute(
+                """
+                SELECT COUNT(*) AS failures FROM auth_failures
+                WHERE scope = ? AND failure_key = ? AND failed_at >= ?
+                """,
+                (scope, failure_key, now - window_seconds),
+            ).fetchone()
+        return row is not None and int(row["failures"]) >= limit
 
-class _RateLimiter:
-    """按 key 的滑动窗口失败限流:5 次/300s,成功后清零。"""
+    def record_failure(
+        self, *, scope: str, failure_keys: tuple[str, ...], now: int
+    ) -> None:
+        with self._connect() as connection:
+            connection.executemany(
+                """
+                INSERT INTO auth_failures(scope, failure_key, failed_at)
+                VALUES (?, ?, ?)
+                """,
+                [(scope, failure_key, now) for failure_key in failure_keys],
+            )
 
-    def __init__(self) -> None:
-        self.failures: dict[str, list[float]] = {}
-
-    def blocked(self, key: str, now: float) -> bool:
-        recent = [value for value in self.failures.get(key, []) if now - value < 300]
-        self.failures[key] = recent
-        return len(recent) >= 5
-
-    def failed(self, key: str, now: float) -> None:
-        self.failures.setdefault(key, []).append(now)
-        if len(self.failures) > 2048:
-            self.failures.pop(next(iter(self.failures)))
-
-    def succeeded(self, key: str) -> None:
-        self.failures.pop(key, None)
+    def clear_failures(self, *, scope: str, failure_key: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "DELETE FROM auth_failures WHERE scope = ? AND failure_key = ?",
+                (scope, failure_key),
+            )
 
 
 def create_app(config: HumanAuthConfig) -> FastAPI:
+    _validate_runtime_config(config)
     store = HumanAuthStore(config)
-    limiter = _RateLimiter()
-    register_limiter = _RateLimiter()
     app = FastAPI(title="Agent Hub Human Auth", docs_url=None, redoc_url=None)
     app.state.store = store
+
+    def rate_limit_host(request: Request) -> str:
+        peer = request.client.host if request.client else "unknown"
+        if not config.public_mode:
+            return peer
+        try:
+            if not ipaddress.ip_address(peer).is_loopback:
+                return peer
+        except ValueError:
+            return peer
+        forwarded = request.headers.get("x-forwarded-for", "").strip()
+        try:
+            return str(ipaddress.ip_address(forwarded))
+        except ValueError:
+            return peer
 
     @app.get("/health")
     async def health() -> dict[str, str]:
@@ -576,25 +653,41 @@ def create_app(config: HumanAuthConfig) -> FastAPI:
         ):
             raise HTTPException(status_code=401, detail="Authentication required")
         user = store.active_user(claims["sub"])
-        if user is None:
+        if user is None or claims.get("ver") != int(user["token_version"]):
             raise HTTPException(status_code=401, detail="Authentication required")
         if admin and "admin" not in json.loads(user["roles_json"]):
             raise HTTPException(status_code=403, detail="Administrator role required")
+        if admin and config.admin_access_token:
+            supplied = request.headers.get("x-agent-hub-admin-key", "")
+            if not hmac.compare_digest(
+                supplied.encode("utf-8"), config.admin_access_token.encode("utf-8")
+            ):
+                raise HTTPException(
+                    status_code=403, detail="Administrator second factor required"
+                )
         return user
 
     @app.post("/token")
     async def token(request: Request, body: LoginRequest) -> dict[str, Any]:
         username = body.username.strip().lower()
-        client_host = request.client.host if request.client else "unknown"
-        limit_key = f"{client_host}:{username}"
-        now = time.monotonic()
-        if limiter.blocked(limit_key, now):
+        client_host = rate_limit_host(request)
+        now = int(time.time())
+        if store.rate_limited(
+            scope="login-ip", failure_key=client_host, now=now, limit=20
+        ) or store.rate_limited(
+            scope="login-user", failure_key=username, now=now, limit=5
+        ):
             raise HTTPException(status_code=429, detail="Too many login attempts")
         user = store.authenticate(username, body.password)
         if user is None:
-            limiter.failed(limit_key, now)
+            store.record_failure(
+                scope="login-ip", failure_keys=(client_host,), now=now
+            )
+            store.record_failure(
+                scope="login-user", failure_keys=(username,), now=now
+            )
             raise HTTPException(status_code=401, detail="Invalid username or password")
-        limiter.succeeded(limit_key)
+        store.clear_failures(scope="login-user", failure_key=username)
         access_token, expires_in = store.issue_token(user)
         return {
             "access_token": access_token,
@@ -607,28 +700,44 @@ def create_app(config: HumanAuthConfig) -> FastAPI:
     async def me(request: Request) -> dict[str, Any]:
         return {"profile": store.profile(authenticated_user(request))}
 
+    @app.post("/introspect")
+    async def introspect(request: Request) -> dict[str, bool]:
+        try:
+            authenticated_user(request)
+        except HTTPException:
+            return {"active": False}
+        return {"active": True}
+
     @app.patch("/me/password")
     async def change_password(
         request: Request, body: PasswordChangeRequest
-    ) -> dict[str, bool]:
+    ) -> dict[str, Any]:
         user = authenticated_user(request)
         try:
-            store.change_password(
+            refreshed_user = store.change_password(
                 subject=user["subject"], new_password=body.new_password
             )
         except LookupError as exc:
             raise HTTPException(status_code=401, detail="Authentication required") from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return {"ok": True}
+        access_token, expires_in = store.issue_token(refreshed_user)
+        return {
+            "ok": True,
+            "access_token": access_token,
+            "token_type": "Bearer",
+            "expires_in": expires_in,
+        }
 
     @app.post("/register", status_code=201)
     async def register(request: Request, body: RegistrationRequest) -> dict[str, Any]:
         # 按 client IP 失败限流:可复用团队码把爆破/抢占用户名的风险
         # 从一次性高熵码扩大为可持续尝试,必须兜底(成功后清零)。
-        client_host = request.client.host if request.client else "unknown"
-        now = time.monotonic()
-        if register_limiter.blocked(client_host, now):
+        client_host = rate_limit_host(request)
+        now = int(time.time())
+        if store.rate_limited(
+            scope="register-ip", failure_key=client_host, now=now, limit=5
+        ):
             raise HTTPException(status_code=429, detail="Too many registration attempts")
         try:
             account = store.register(
@@ -638,12 +747,15 @@ def create_app(config: HumanAuthConfig) -> FastAPI:
                 invite_code=body.invite_code,
             )
         except FileExistsError as exc:
-            register_limiter.failed(client_host, now)
+            store.record_failure(
+                scope="register-ip", failure_keys=(client_host,), now=now
+            )
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except ValueError as exc:
-            register_limiter.failed(client_host, now)
+            store.record_failure(
+                scope="register-ip", failure_keys=(client_host,), now=now
+            )
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        register_limiter.succeeded(client_host)
         return {"account": account}
 
     @app.post("/admin/invitations", status_code=201)
@@ -692,6 +804,38 @@ def _validated_issuer(value: str) -> str:
     return value.rstrip("/")
 
 
+def _validate_runtime_config(config: HumanAuthConfig) -> None:
+    if not 300 <= config.token_ttl_seconds <= 8 * 60 * 60:
+        raise ValueError("token TTL must be between 300 and 28800 seconds")
+    if config.public_mode:
+        if urlsplit(config.issuer).scheme != "https":
+            raise ValueError("public mode requires an HTTPS issuer")
+        if config.token_ttl_seconds > 60 * 60:
+            raise ValueError("public mode limits access tokens to 3600 seconds")
+        if not config.admin_access_token or len(config.admin_access_token) < 32:
+            raise ValueError("public mode requires a 32+ character admin access token")
+        if config.allow_reusable_team_code:
+            raise ValueError("public mode forbids reusable team codes")
+
+
+def _read_secret_file(path: Path) -> str:
+    info = path.stat()
+    if not path.is_file() or info.st_mode & 0o077:
+        raise ValueError(
+            "admin access token file must be a private regular file (mode 0600)"
+        )
+    raw = path.read_bytes()
+    if not 32 <= len(raw.strip()) <= 512:
+        raise ValueError("admin access token must be between 32 and 512 bytes")
+    try:
+        value = raw.decode("utf-8").strip()
+    except UnicodeDecodeError as exc:
+        raise ValueError("admin access token must be valid UTF-8") from exc
+    if not value:
+        raise ValueError("admin access token must not be empty")
+    return value
+
+
 def _validated_bind_host(value: str, *, allow_private_http: bool = False) -> str:
     """Keep the issuer loopback-only unless an exact private IP is opted in."""
     if value == "localhost":
@@ -724,9 +868,14 @@ def main() -> None:
     parser.add_argument("--data-dir", type=Path, required=True)
     parser.add_argument("--issuer", required=True)
     parser.add_argument("--audience", default="mcp-agent-mail-human")
+    parser.add_argument("--token-ttl-seconds", type=int, default=60 * 60)
+    parser.add_argument("--admin-access-token-file", type=Path)
+    parser.add_argument("--public-mode", action="store_true")
+    parser.add_argument("--allow-reusable-team-code", action="store_true")
     parser.add_argument("--bootstrap-username")
     parser.add_argument("--bootstrap-display-name")
     parser.add_argument("--bootstrap-credentials-file", type=Path)
+    parser.add_argument("--bootstrap-only", action="store_true")
     parser.add_argument(
         "--allow-private-http",
         action="store_true",
@@ -739,18 +888,31 @@ def main() -> None:
         )
     except ValueError as exc:
         parser.error(str(exc))
-    config = HumanAuthConfig(
-        data_dir=args.data_dir,
-        issuer=_validated_issuer(args.issuer),
-        audience=args.audience,
-    )
+    try:
+        admin_access_token = (
+            _read_secret_file(args.admin_access_token_file)
+            if args.admin_access_token_file
+            else None
+        )
+        config = HumanAuthConfig(
+            data_dir=args.data_dir,
+            issuer=_validated_issuer(args.issuer),
+            audience=args.audience,
+            token_ttl_seconds=args.token_ttl_seconds,
+            admin_access_token=admin_access_token,
+            allow_reusable_team_code=args.allow_reusable_team_code,
+            public_mode=args.public_mode,
+        )
+        _validate_runtime_config(config)
+    except (OSError, ValueError) as exc:
+        parser.error(str(exc))
     app = create_app(config)
     bootstrap_values = (
         args.bootstrap_username,
         args.bootstrap_display_name,
         args.bootstrap_credentials_file,
     )
-    if any(bootstrap_values) and not all(bootstrap_values):
+    if (any(bootstrap_values) or args.bootstrap_only) and not all(bootstrap_values):
         parser.error("all bootstrap arguments are required together")
     if all(bootstrap_values):
         app.state.store.bootstrap_admin(
@@ -758,6 +920,8 @@ def main() -> None:
             display_name=args.bootstrap_display_name,
             credentials_path=args.bootstrap_credentials_file,
         )
+    if args.bootstrap_only:
+        return
     import uvicorn
 
     uvicorn.run(app, host=args.host, port=args.port)

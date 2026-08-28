@@ -1,0 +1,35 @@
+[Unit]
+Description=MCP Agent Mail public Human JWT issuer
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/mcp-agent-mail/human-auth.env
+WorkingDirectory=/opt/mcp-agent-mail
+ExecStart=/opt/mcp-agent-mail/.venv/bin/python -m mcp_agent_mail.human_auth --host 127.0.0.1 --port 8766 --data-dir /var/lib/mcp-agent-mail-human-auth --issuer ${HUMAN_AUTH_ISSUER} --audience ${HUMAN_AUTH_AUDIENCE} --token-ttl-seconds ${HUMAN_AUTH_TOKEN_TTL_SECONDS} --admin-access-token-file /etc/mcp-agent-mail/admin-access-token --public-mode
+Restart=always
+RestartSec=5
+User=appuser
+Group=appuser
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/mcp-agent-mail-human-auth
+TimeoutStopSec=15
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

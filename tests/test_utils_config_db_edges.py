@@ -112,6 +112,52 @@ def test_config_unknown_rate_limit_backend_raises(monkeypatch):
     assert "HTTP_RATE_LIMIT_BACKEND" in str(exc.value)
 
 
+def test_public_http_mode_rejects_insecure_defaults(isolated_env, monkeypatch):
+    insecure = {
+        "HTTP_PUBLIC_MODE": "true",
+        "HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED": "true",
+        "HTTP_JWT_ENABLED": "false",
+        "HTTP_RATE_LIMIT_ENABLED": "false",
+        "HTTP_CORS_ENABLED": "true",
+    }
+    for key, value in insecure.items():
+        monkeypatch.setenv(key, value)
+    clear_settings_cache()
+    with pytest.raises(ConfigError) as exc:
+        get_settings()
+    message = str(exc.value)
+    assert "HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED" in message
+    assert "HTTP_JWT_ENABLED" in message
+    assert "HTTP_RATE_LIMIT_ENABLED" in message
+
+
+def test_public_http_mode_accepts_fail_closed_profile(isolated_env, monkeypatch):
+    profile = {
+        "HTTP_PUBLIC_MODE": "true",
+        "HTTP_HOST": "127.0.0.1",
+        "HTTP_BEARER_TOKEN": "",
+        "HTTP_ALLOW_LOCALHOST_UNAUTHENTICATED": "false",
+        "HTTP_JWT_ENABLED": "true",
+        "HTTP_JWT_ALGORITHMS": "RS256",
+        "HTTP_JWT_JWKS_URL": "https://auth.example.com/.well-known/jwks.json",
+        "HTTP_JWT_ISSUER": "https://auth.example.com",
+        "HTTP_JWT_AUDIENCE": "mcp-agent-mail-human",
+        "HTTP_JWT_INTROSPECTION_URL": "https://auth.example.com/introspect",
+        "HTTP_RATE_LIMIT_ENABLED": "true",
+        "HTTP_RATE_LIMIT_BACKEND": "redis",
+        "HTTP_RATE_LIMIT_REDIS_URL": "redis://127.0.0.1:6379/2",
+        "HTTP_CORS_ENABLED": "false",
+    }
+    for key, value in profile.items():
+        monkeypatch.setenv(key, value)
+    clear_settings_cache()
+    settings = get_settings()
+    assert settings.http.public_mode is True
+    assert settings.http.jwt_introspection_url == profile[
+        "HTTP_JWT_INTROSPECTION_URL"
+    ]
+
+
 def test_config_malformed_optional_int_raises_with_key(monkeypatch):
     monkeypatch.setenv("DATABASE_POOL_SIZE", "lots")
     clear_settings_cache()
