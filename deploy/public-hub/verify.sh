@@ -40,7 +40,8 @@ if command -v ss >/dev/null 2>&1; then
       echo "no local listener found on $port" >&2
       exit 1
     fi
-    if echo "$listeners" | grep -Eq '(^|[[:space:]])(0\.0\.0\.0|\[::\]|\*):'; then
+    local_addresses=$(printf '%s\n' "$listeners" | awk '{print $4}')
+    if printf '%s\n' "$local_addresses" | grep -Eq '^(0\.0\.0\.0|\[::\]|\*):'; then
       echo "port $port is publicly bound instead of loopback-only" >&2
       exit 1
     fi
