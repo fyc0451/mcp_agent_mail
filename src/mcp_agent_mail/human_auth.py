@@ -25,6 +25,7 @@ from urllib.parse import urlsplit
 
 from authlib.jose import JsonWebKey, JsonWebToken
 from authlib.jose.errors import JoseError
+from cryptography.fernet import Fernet, InvalidToken
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
@@ -69,6 +70,10 @@ class RegistrationRequest(BaseModel):
 class InvitationRequest(BaseModel):
     expires_in: int = Field(default=24 * 60 * 60, ge=300, le=7 * 24 * 60 * 60)
     project_slug: str | None = Field(default=None, min_length=1, max_length=128)
+
+
+class TeamInvitationRequest(BaseModel):
+    expires_in: int | None = Field(default=None, ge=300, le=7 * 24 * 60 * 60)
 
 
 class UserStatusRequest(BaseModel):
@@ -138,8 +143,10 @@ class HumanAuthStore:
         self.config.data_dir.chmod(0o700)
         self.db_path = self.config.data_dir / "users.sqlite3"
         self.key_path = self.config.data_dir / "signing-key.pem"
+        self.invitation_key_path = self.config.data_dir / "invitation-key"
         self._ensure_schema()
         self._key = self._load_or_create_key()
+        self._invitation_cipher = Fernet(self._load_or_create_invitation_key())
         public_pem = self._key.as_pem(is_private=False)
         self.kid = hashlib.sha256(public_pem).hexdigest()[:16]
         public_jwk = self._key.as_dict(is_private=False)
@@ -222,6 +229,17 @@ class HumanAuthStore:
                 connection.execute(
                     "ALTER TABLE invitations ADD COLUMN project_slug TEXT"
                 )
+            for column, definition in (
+                ("reusable", "INTEGER NOT NULL DEFAULT 0"),
+                ("permanent", "INTEGER NOT NULL DEFAULT 0"),
+                ("code_ciphertext", "BLOB"),
+                ("revoked_at", "INTEGER"),
+                ("use_count", "INTEGER NOT NULL DEFAULT 0"),
+            ):
+                if column not in invitation_columns:
+                    connection.execute(
+                        f"ALTER TABLE invitations ADD COLUMN {column} {definition}"
+                    )
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS auth_failures (
@@ -246,6 +264,13 @@ class HumanAuthStore:
                 _write_private_file(self.key_path, key.as_pem(is_private=True))
         self.key_path.chmod(0o600)
         return JsonWebKey.import_key(self.key_path.read_bytes(), {"kty": "RSA"})
+
+    def _load_or_create_invitation_key(self) -> bytes:
+        if not self.invitation_key_path.exists():
+            with contextlib.suppress(FileExistsError):
+                _write_private_file(self.invitation_key_path, Fernet.generate_key())
+        self.invitation_key_path.chmod(0o600)
+        return self.invitation_key_path.read_bytes().strip()
 
     def bootstrap_admin(
         self,
@@ -376,6 +401,108 @@ class HumanAuthStore:
             "project_slug": project_slug,
         }
 
+    @staticmethod
+    def _team_invitation_payload(row: sqlite3.Row, invite_code: str) -> dict[str, Any]:
+        return {
+            "invite_code": invite_code,
+            "created_at": row["created_at"],
+            "expires_at": None if row["permanent"] else row["expires_at"],
+            "use_count": row["use_count"],
+        }
+
+    def active_team_invitation(self) -> dict[str, Any] | None:
+        now = int(time.time())
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT created_at, expires_at, permanent, code_ciphertext, use_count
+                FROM invitations
+                WHERE reusable = 1 AND revoked_at IS NULL AND expires_at >= ?
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (now,),
+            ).fetchone()
+        if row is None or row["code_ciphertext"] is None:
+            return None
+        try:
+            invite_code = self._invitation_cipher.decrypt(row["code_ciphertext"]).decode("utf-8")
+        except (InvalidToken, UnicodeDecodeError) as exc:
+            raise RuntimeError("Stored team invitation cannot be decrypted") from exc
+        return self._team_invitation_payload(row, invite_code)
+
+    def create_team_invitation(
+        self, *, created_by: str, expires_in: int | None
+    ) -> dict[str, Any]:
+        now = int(time.time())
+        code = secrets.token_urlsafe(24)
+        code_hash = hashlib.sha256(code.encode("utf-8")).hexdigest()
+        permanent = expires_in is None
+        expires_at = 253402300799 if permanent else now + expires_in
+        ciphertext = self._invitation_cipher.encrypt(code.encode("utf-8"))
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                UPDATE invitations SET revoked_at = ?
+                WHERE reusable = 1 AND revoked_at IS NULL
+                """,
+                (now,),
+            )
+            connection.execute(
+                """
+                INSERT INTO invitations(
+                    code_hash, created_by, created_at, expires_at, project_slug,
+                    reusable, permanent, code_ciphertext
+                ) VALUES (?, ?, ?, ?, NULL, 1, ?, ?)
+                """,
+                (code_hash, created_by, now, expires_at, int(permanent), ciphertext),
+            )
+            row = connection.execute(
+                """
+                SELECT created_at, expires_at, permanent, code_ciphertext, use_count
+                FROM invitations WHERE code_hash = ?
+                """,
+                (code_hash,),
+            ).fetchone()
+        return self._team_invitation_payload(row, code)
+
+    def update_team_invitation_expiry(self, *, expires_in: int | None) -> dict[str, Any]:
+        now = int(time.time())
+        permanent = expires_in is None
+        expires_at = 253402300799 if permanent else now + expires_in
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT code_hash, code_ciphertext FROM invitations
+                WHERE reusable = 1 AND revoked_at IS NULL AND expires_at >= ?
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (now,),
+            ).fetchone()
+            if row is None:
+                raise LookupError("No active team invitation")
+            connection.execute(
+                "UPDATE invitations SET expires_at = ?, permanent = ? WHERE code_hash = ?",
+                (expires_at, int(permanent), row["code_hash"]),
+            )
+        invitation = self.active_team_invitation()
+        if invitation is None:
+            raise LookupError("No active team invitation")
+        return invitation
+
+    def revoke_team_invitation(self) -> bool:
+        now = int(time.time())
+        with self._connect() as connection:
+            result = connection.execute(
+                """
+                UPDATE invitations SET revoked_at = ?
+                WHERE reusable = 1 AND revoked_at IS NULL AND expires_at >= ?
+                """,
+                (now, now),
+            )
+        return result.rowcount > 0
+
     def _valid_team_code(self, invite_code: str) -> bool:
         """可重复使用的团队码(可选,存放在 data_dir/team-code)。
 
@@ -422,8 +549,9 @@ class HumanAuthStore:
             connection.execute("BEGIN IMMEDIATE")
             invitation = connection.execute(
                 """
-                SELECT code_hash, project_slug FROM invitations
-                WHERE code_hash = ? AND used_at IS NULL AND expires_at >= ?
+                SELECT code_hash, project_slug, reusable FROM invitations
+                WHERE code_hash = ? AND revoked_at IS NULL AND expires_at >= ?
+                  AND (reusable = 1 OR used_at IS NULL)
                 """,
                 (code_hash, now),
             ).fetchone()
@@ -458,7 +586,12 @@ class HumanAuthStore:
                     requested_project_slug,
                 ),
             )
-            if consume_invitation:
+            if consume_invitation and invitation["reusable"]:
+                connection.execute(
+                    "UPDATE invitations SET use_count = use_count + 1 WHERE code_hash = ?",
+                    (code_hash,),
+                )
+            elif consume_invitation:
                 connection.execute(
                     "UPDATE invitations SET used_by = ?, used_at = ? WHERE code_hash = ?",
                     (subject, now, code_hash),
@@ -771,6 +904,38 @@ def create_app(config: HumanAuthConfig) -> FastAPI:
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/admin/team-invitation")
+    async def get_team_invitation(request: Request) -> dict[str, Any]:
+        authenticated_user(request, admin=True)
+        return {"invitation": store.active_team_invitation()}
+
+    @app.post("/admin/team-invitation", status_code=201)
+    async def create_team_invitation(
+        request: Request, body: TeamInvitationRequest
+    ) -> dict[str, Any]:
+        admin_user = authenticated_user(request, admin=True)
+        return {
+            "invitation": store.create_team_invitation(
+                created_by=admin_user["subject"], expires_in=body.expires_in
+            )
+        }
+
+    @app.patch("/admin/team-invitation")
+    async def update_team_invitation(
+        request: Request, body: TeamInvitationRequest
+    ) -> dict[str, Any]:
+        authenticated_user(request, admin=True)
+        try:
+            invitation = store.update_team_invitation_expiry(expires_in=body.expires_in)
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {"invitation": invitation}
+
+    @app.delete("/admin/team-invitation")
+    async def revoke_team_invitation(request: Request) -> dict[str, Any]:
+        authenticated_user(request, admin=True)
+        return {"revoked": store.revoke_team_invitation()}
 
     @app.get("/admin/users")
     async def list_users(request: Request) -> dict[str, Any]:

@@ -289,6 +289,92 @@ def test_invitation_registration_approval_and_disable(tmp_path):
     ).status_code == 401
 
 
+def test_team_invitation_is_reusable_visible_and_not_topic_bound(tmp_path):
+    app, client, credentials = _bootstrapped_client(tmp_path)
+    token = client.post("/token", json=json.loads(credentials.read_text())).json()[
+        "access_token"
+    ]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    created = client.post(
+        "/admin/team-invitation", headers=headers, json={"expires_in": None}
+    )
+    assert created.status_code == 201
+    invitation = created.json()["invitation"]
+    assert invitation["expires_at"] is None
+    assert invitation["use_count"] == 0
+
+    assert client.get("/admin/team-invitation", headers=headers).json()[
+        "invitation"
+    ] == invitation
+    with app.state.store._connect() as connection:
+        stored = connection.execute(
+            "SELECT code_hash, code_ciphertext, reusable, permanent FROM invitations"
+        ).fetchone()
+    assert stored["code_hash"] != invitation["invite_code"]
+    assert invitation["invite_code"].encode() not in stored["code_ciphertext"]
+    assert stored["reusable"] == 1
+    assert stored["permanent"] == 1
+
+    for username in ("alice", "bob"):
+        response = client.post(
+            "/register",
+            json={
+                "username": username,
+                "display_name": username.title(),
+                "password": f"{username}-password-123",
+                "invite_code": invitation["invite_code"],
+            },
+        )
+        assert response.status_code == 201
+        assert response.json()["account"]["requested_project_slug"] is None
+    assert client.get("/admin/team-invitation", headers=headers).json()["invitation"][
+        "use_count"
+    ] == 2
+
+
+def test_team_invitation_expiry_revoke_and_rotation(tmp_path):
+    _, client, credentials = _bootstrapped_client(tmp_path)
+    token = client.post("/token", json=json.loads(credentials.read_text())).json()[
+        "access_token"
+    ]
+    headers = {"Authorization": f"Bearer {token}"}
+    first = client.post(
+        "/admin/team-invitation", headers=headers, json={"expires_in": None}
+    ).json()["invitation"]
+
+    updated = client.patch(
+        "/admin/team-invitation", headers=headers, json={"expires_in": 3600}
+    )
+    assert updated.status_code == 200
+    assert updated.json()["invitation"]["invite_code"] == first["invite_code"]
+    assert updated.json()["invitation"]["expires_at"] is not None
+
+    second = client.post(
+        "/admin/team-invitation", headers=headers, json={"expires_in": None}
+    ).json()["invitation"]
+    assert second["invite_code"] != first["invite_code"]
+    assert client.post(
+        "/register",
+        json={
+            "username": "old-code",
+            "display_name": "Old Code",
+            "password": "old-code-password-123",
+            "invite_code": first["invite_code"],
+        },
+    ).status_code == 400
+
+    assert client.delete("/admin/team-invitation", headers=headers).json() == {
+        "revoked": True
+    }
+    assert client.get("/admin/team-invitation", headers=headers).json() == {
+        "invitation": None
+    }
+    assert client.delete("/admin/team-invitation", headers=headers).json() == {
+        "revoked": False
+    }
+
+
 def test_invitation_admin_guards_and_invalid_code(tmp_path):
     _, client, credentials = _bootstrapped_client(tmp_path)
     admin_token = client.post(
