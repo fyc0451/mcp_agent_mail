@@ -444,7 +444,7 @@ class HumanAuthStore:
             connection.execute(
                 """
                 UPDATE invitations SET revoked_at = ?
-                WHERE reusable = 1 AND revoked_at IS NULL
+                WHERE revoked_at IS NULL
                 """,
                 (now,),
             )

@@ -339,9 +339,23 @@ def test_team_invitation_expiry_revoke_and_rotation(tmp_path):
         "access_token"
     ]
     headers = {"Authorization": f"Bearer {token}"}
+    legacy = client.post(
+        "/admin/invitations",
+        headers=headers,
+        json={"expires_in": 3600, "project_slug": "old-topic"},
+    ).json()["invite_code"]
     first = client.post(
         "/admin/team-invitation", headers=headers, json={"expires_in": None}
     ).json()["invitation"]
+    assert client.post(
+        "/register",
+        json={
+            "username": "legacy-code",
+            "display_name": "Legacy Code",
+            "password": "legacy-code-password-123",
+            "invite_code": legacy,
+        },
+    ).status_code == 400
 
     updated = client.patch(
         "/admin/team-invitation", headers=headers, json={"expires_in": 3600}
