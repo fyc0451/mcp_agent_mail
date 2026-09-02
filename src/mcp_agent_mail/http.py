@@ -11,21 +11,22 @@ import hmac
 import importlib
 import json
 import logging
+import os
 import re
 import uuid
 from collections.abc import MutableMapping
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
-from typing import Any, Protocol, cast
+from typing import Annotated, Any, Protocol, cast
 
 import structlog
 import uvicorn
-from fastapi import FastAPI, HTTPException, Query, Request, status
+from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile, status
 from fastapi.exception_handlers import http_exception_handler
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import and_, or_, select, text, update
+from sqlalchemy import and_, func, or_, select, text, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError, NoResultFound
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -68,6 +69,7 @@ from .models import (
     SessionLeadBinding,
     SessionLeadReplyDraft,
     SessionLeadReplyKey,
+    TeamAttachment,
     TeamProject,
     TeamProjectAgentBinding,
 )
@@ -96,6 +98,60 @@ from .storage import (
 _HUMAN_PRESENCE_TTL_SECONDS = 60
 _SESSION_LEAD_RUNTIME_TTL_SECONDS = 15
 _HUMAN_PRESENCE_CLIENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{15,127}$")
+_TEAM_ATTACHMENT_MAX_BYTES = 10 * 1024 * 1024
+_TEAM_ATTACHMENT_MAX_PER_MESSAGE = 4
+_TEAM_ATTACHMENT_MEDIA_TYPES = {
+    ".csv": "text/csv",
+    ".gif": "image/gif",
+    ".jpeg": "image/jpeg",
+    ".jpg": "image/jpeg",
+    ".json": "application/json",
+    ".log": "text/plain",
+    ".md": "text/markdown",
+    ".pdf": "application/pdf",
+    ".png": "image/png",
+    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ".txt": "text/plain",
+    ".webp": "image/webp",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".zip": "application/zip",
+}
+
+
+def _team_attachment_root(settings: Settings | None = None) -> Path:
+    active_settings = settings or get_settings()
+    root = Path(active_settings.storage.root).expanduser().resolve() / "team-attachments"
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with contextlib.suppress(OSError):
+        root.chmod(0o700)
+    return root
+
+
+def _team_attachment_filename(value: str | None) -> tuple[str, str]:
+    raw = (value or "").replace("\\", "/")
+    filename = raw.rsplit("/", 1)[-1].strip()
+    if (
+        not filename
+        or len(filename) > 255
+        or any(ord(char) < 32 for char in filename)
+    ):
+        raise HTTPException(status_code=400, detail="附件文件名无效")
+    suffix = Path(filename).suffix.lower()
+    media_type = _TEAM_ATTACHMENT_MEDIA_TYPES.get(suffix)
+    if media_type is None:
+        raise HTTPException(status_code=415, detail="不支持该附件类型")
+    return filename, media_type
+
+
+def _public_team_attachment(row: TeamAttachment) -> dict[str, Any]:
+    return {
+        "id": row.token,
+        "filename": row.filename,
+        "media_type": row.media_type,
+        "size": row.size,
+        "sha256": row.sha256,
+    }
 
 
 async def _project_slug_from_id(pid: int | None) -> str | None:
@@ -2730,6 +2786,178 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         async def info(self, message: str) -> None:
             structlog.get_logger("hub-support").info("delivery", message=message)
 
+    @fastapi_app.post(
+        "/hub/api/projects/{project_slug}/attachments",
+        response_class=JSONResponse,
+        status_code=201,
+    )
+    async def hub_upload_team_attachment(
+        project_slug: str,
+        request: Request,
+        file: Annotated[UploadFile, File()],
+    ) -> JSONResponse:
+        """Store one opaque Team attachment; contents are never Agent input."""
+        await ensure_schema()
+        filename, media_type = _team_attachment_filename(file.filename)
+        async with get_session() as session:
+            human = await _hub_human(request, session=session)
+            team_project = await _hub_team_project(project_slug, session=session)
+            project = await session.get(Project, team_project.routing_project_id)
+            if project is None or project.archived_at is not None:
+                raise HTTPException(status_code=404, detail="Project not found")
+            await _hub_active_membership(project, human, session=session)
+            stale_before = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=1)
+            stale_rows = (await session.execute(
+                select(TeamAttachment).where(
+                    cast(Any, TeamAttachment.project_id) == project.id,
+                    cast(Any, TeamAttachment.owner_human_id) == human.id,
+                    cast(Any, TeamAttachment.message_id).is_(None),
+                    cast(Any, TeamAttachment.created_ts) < stale_before,
+                )
+            )).scalars().all()
+            stale_names = [row.storage_name for row in stale_rows]
+            for row in stale_rows:
+                await session.delete(row)
+            if stale_rows:
+                await session.commit()
+                for stale_name in stale_names:
+                    with contextlib.suppress(OSError):
+                        (_team_attachment_root(settings) / stale_name).unlink()
+            pending_count = int((await session.execute(
+                select(func.count(TeamAttachment.id)).where(
+                    cast(Any, TeamAttachment.project_id) == project.id,
+                    cast(Any, TeamAttachment.owner_human_id) == human.id,
+                    cast(Any, TeamAttachment.message_id).is_(None),
+                )
+            )).scalar_one())
+            if pending_count >= 8:
+                raise HTTPException(status_code=429, detail="待发送附件过多: 请先发送或移除")
+            content = await file.read(_TEAM_ATTACHMENT_MAX_BYTES + 1)
+            await file.close()
+            if not content:
+                raise HTTPException(status_code=400, detail="附件不能为空")
+            if len(content) > _TEAM_ATTACHMENT_MAX_BYTES:
+                raise HTTPException(status_code=413, detail="附件不能超过 10 MiB")
+            quota = int(settings.quota_attachments_limit_bytes)
+            if quota > 0:
+                used = int((await session.execute(
+                    select(func.coalesce(func.sum(TeamAttachment.size), 0)).where(
+                        cast(Any, TeamAttachment.project_id) == project.id,
+                    )
+                )).scalar_one())
+                if used + len(content) > quota:
+                    raise HTTPException(status_code=413, detail="团队附件空间已达到配额")
+            token = uuid.uuid4().hex
+            storage_name = token
+            path = _team_attachment_root(settings) / storage_name
+            try:
+                descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(descriptor, "wb") as stream:
+                    stream.write(content)
+                attachment = TeamAttachment(
+                    token=token,
+                    project_id=cast(int, project.id),
+                    owner_human_id=cast(int, human.id),
+                    filename=filename,
+                    media_type=media_type,
+                    size=len(content),
+                    sha256=hashlib.sha256(content).hexdigest(),
+                    storage_name=storage_name,
+                )
+                session.add(attachment)
+                await session.commit()
+                await session.refresh(attachment)
+            except Exception:
+                with contextlib.suppress(OSError):
+                    path.unlink()
+                raise
+        return JSONResponse(_public_team_attachment(attachment), status_code=201)
+
+    @fastapi_app.delete(
+        "/hub/api/projects/{project_slug}/attachments/{attachment_token}",
+        response_class=JSONResponse,
+    )
+    async def hub_delete_team_attachment(
+        project_slug: str,
+        attachment_token: str,
+        request: Request,
+    ) -> JSONResponse:
+        """Delete only the caller's still-unattached upload."""
+        await ensure_schema()
+        if re.fullmatch(r"[0-9a-f]{32}", attachment_token) is None:
+            raise HTTPException(status_code=404, detail="附件不存在")
+        async with get_session() as session:
+            human = await _hub_human(request, session=session)
+            team_project = await _hub_team_project(project_slug, session=session)
+            project = await session.get(Project, team_project.routing_project_id)
+            if project is None or project.archived_at is not None:
+                raise HTTPException(status_code=404, detail="Project not found")
+            await _hub_active_membership(project, human, session=session)
+            row = (await session.execute(
+                select(TeamAttachment).where(
+                    cast(Any, TeamAttachment.token) == attachment_token,
+                    cast(Any, TeamAttachment.project_id) == project.id,
+                    cast(Any, TeamAttachment.owner_human_id) == human.id,
+                )
+            )).scalars().first()
+            if row is None:
+                raise HTTPException(status_code=404, detail="附件不存在")
+            if row.message_id is not None:
+                raise HTTPException(status_code=409, detail="已发送附件不能删除")
+            storage_name = row.storage_name
+            await session.delete(row)
+            await session.commit()
+        with contextlib.suppress(OSError):
+            (_team_attachment_root(settings) / storage_name).unlink()
+        return JSONResponse({"deleted": True})
+
+    @fastapi_app.get(
+        "/hub/api/projects/{project_slug}/attachments/{attachment_token}",
+        response_class=FileResponse,
+    )
+    async def hub_download_team_attachment(
+        project_slug: str,
+        attachment_token: str,
+        request: Request,
+    ) -> FileResponse:
+        """Download through membership authorization; never render inline."""
+        await ensure_schema()
+        if re.fullmatch(r"[0-9a-f]{32}", attachment_token) is None:
+            raise HTTPException(status_code=404, detail="附件不存在")
+        async with get_session() as session:
+            human = await _hub_human(request, session=session)
+            team_project = await _hub_team_project(project_slug, session=session)
+            project = await session.get(Project, team_project.routing_project_id)
+            if project is None or project.archived_at is not None:
+                raise HTTPException(status_code=404, detail="Project not found")
+            await _hub_active_membership(project, human, session=session)
+            row = (await session.execute(
+                select(TeamAttachment).where(
+                    cast(Any, TeamAttachment.token) == attachment_token,
+                    cast(Any, TeamAttachment.project_id) == project.id,
+                )
+            )).scalars().first()
+            if row is None or (
+                row.message_id is None and row.owner_human_id != human.id
+            ):
+                raise HTTPException(status_code=404, detail="附件不存在")
+            filename = row.filename
+            media_type = row.media_type
+            storage_name = row.storage_name
+        path = _team_attachment_root(settings) / storage_name
+        if not path.is_file():
+            raise HTTPException(status_code=404, detail="附件文件不存在")
+        return FileResponse(
+            path,
+            filename=filename,
+            media_type=media_type,
+            content_disposition_type="attachment",
+            headers={
+                "Cache-Control": "private, no-store",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+
     @fastapi_app.get(
         "/hub/api/projects/{project_slug}/chat/messages",
         response_class=JSONResponse,
@@ -2805,6 +3033,10 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     "id": message.id,
                     "subject": message.subject,
                     "body_md": body_md,
+                    "attachments": [
+                        item for item in message.attachments
+                        if isinstance(item, dict)
+                    ],
                     "mention_handles": mention_handles,
                     "importance": message.importance,
                     "created_ts": str(message.created_ts),
@@ -2852,12 +3084,26 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         """Post a real team support message as the Human or their default Agent."""
         await ensure_schema()
         body = await _hub_json_body(request)
-        allowed = {"subject", "body_md", "importance", "mention_handles"}
+        allowed = {
+            "subject", "body_md", "importance", "mention_handles", "attachment_ids",
+        }
         if not set(body).issubset(allowed):
             raise HTTPException(status_code=400, detail="Unsupported support request field")
         subject = body.get("subject")
         body_md = body.get("body_md")
         importance = body.get("importance", "normal")
+        attachment_ids = body.get("attachment_ids", [])
+        if (
+            not isinstance(attachment_ids, list)
+            or len(attachment_ids) > _TEAM_ATTACHMENT_MAX_PER_MESSAGE
+            or any(
+                not isinstance(item, str)
+                or re.fullmatch(r"[0-9a-f]{32}", item) is None
+                for item in attachment_ids
+            )
+            or len(set(attachment_ids)) != len(attachment_ids)
+        ):
+            raise HTTPException(status_code=400, detail="附件列表无效")
         if not isinstance(subject, str) or not subject.strip() or len(subject.strip()) > 512:
             raise HTTPException(status_code=400, detail="subject is required and must be at most 512 characters")
         if not isinstance(body_md, str) or not body_md.strip() or len(body_md) > 50_000:
@@ -2934,6 +3180,21 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 raise HTTPException(status_code=409, detail="No other active team members")
             mention_handles = [item.mention_handle for item in target_memberships]
 
+            attachment_rows: list[TeamAttachment] = []
+            if attachment_ids:
+                attachment_rows = list((await session.execute(
+                    select(TeamAttachment).where(
+                        cast(Any, TeamAttachment.token).in_(attachment_ids),
+                        cast(Any, TeamAttachment.project_id) == project.id,
+                        cast(Any, TeamAttachment.owner_human_id) == human.id,
+                        cast(Any, TeamAttachment.message_id).is_(None),
+                    )
+                )).scalars().all())
+                by_token = {item.token: item for item in attachment_rows}
+                if set(by_token) != set(attachment_ids):
+                    raise HTTPException(status_code=409, detail="附件不存在、已发送或不属于当前用户")
+                attachment_rows = [by_token[token] for token in attachment_ids]
+
             channel_insert = sqlite_insert(Channel).values(
                 project_id=project.id,
                 name="support",
@@ -2961,11 +3222,15 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     + body_md.strip()
                 ),
                 importance=importance,
-                attachments=[],
+                attachments=[_public_team_attachment(row) for row in attachment_rows],
             )
             sender.last_active_ts = datetime.now(timezone.utc).replace(tzinfo=None)
             session.add(sender)
             session.add(message)
+            await session.flush()
+            for attachment in attachment_rows:
+                attachment.message_id = cast(int, message.id)
+                session.add(attachment)
             await session.commit()
             await session.refresh(message)
 
@@ -2984,6 +3249,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 "sender_kind": sender_kind,
                 "sender_human": membership.mention_handle,
                 "mention_handles": mention_handles,
+                "attachments": message.attachments,
                 "deliveries": deliveries,
             },
             status_code=201,
@@ -4274,6 +4540,10 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                             "subject": message.subject,
                             "body_md": message.body_md,
                             "importance": message.importance,
+                            "attachments": [
+                                item for item in message.attachments
+                                if isinstance(item, dict)
+                            ],
                             "sender_name": (
                                 sender_human.display_name
                                 if sender_human is not None

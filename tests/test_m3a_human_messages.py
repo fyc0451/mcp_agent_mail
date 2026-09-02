@@ -33,6 +33,7 @@ from mcp_agent_mail.models import (
     MessageRecipient,
     Project,
     ProjectHumanMembership,
+    TeamAttachment,
     TeamProject,
 )
 
@@ -664,6 +665,160 @@ async def test_team_chat_messages_support_stable_cursor_pagination(
             headers=bob,
         )
         assert invalid.status_code == 422
+
+
+@pytest.mark.anyio
+async def test_team_attachment_upload_send_and_member_download(
+    isolated_env, monkeypatch,
+):
+    server = build_mcp_server()
+    async with Client(server) as client:
+        await _register(client, "/m3a/support-attachment", "BlueLake")
+        sender_id = await _agent_id("BlueLake")
+        await _mk_membership(
+            "/m3a/support-attachment", "oidc|alice", "alice", role="admin",
+            default_agent_id=sender_id,
+        )
+        await _mk_membership("/m3a/support-attachment", "oidc|bob", "bob")
+        await _mk_membership(
+            "/m3a/support-attachment", "oidc|mallory", "mallory", status="removed",
+        )
+        async with get_session() as session:
+            routing_project = (
+                await session.execute(
+                    select(Project).where(
+                        Project.human_key == "/m3a/support-attachment",
+                    )
+                )
+            ).scalars().one()
+            session.add(TeamProject(
+                slug="support-attachment",
+                name="Attachment Team",
+                routing_project_id=routing_project.id,
+            ))
+            await session.commit()
+
+    settings = _configure_hub_jwt(monkeypatch)
+    app = build_http_app(settings, build_mcp_server())
+    alice = _hub_headers(settings, "oidc|alice")
+    bob = _hub_headers(settings, "oidc|bob")
+    mallory = _hub_headers(settings, "oidc|mallory")
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as http:
+        uploaded = await http.post(
+            "/hub/api/projects/support-attachment/attachments",
+            headers=alice,
+            files={"file": ("报告.md", "中文内容".encode(), "text/markdown")},
+        )
+        assert uploaded.status_code == 201
+        attachment = uploaded.json()
+        assert attachment["filename"] == "报告.md"
+        assert attachment["media_type"] == "text/markdown"
+        assert attachment["size"] == len("中文内容".encode())
+
+        posted = await http.post(
+            "/hub/api/projects/support-attachment/support-requests",
+            headers=alice,
+            json={
+                "subject": "带附件消息",
+                "body_md": "请查看附件。",
+                "mention_handles": ["bob"],
+                "attachment_ids": [attachment["id"]],
+            },
+        )
+        assert posted.status_code == 201
+        assert posted.json()["attachments"] == [attachment]
+
+        chat = await http.get(
+            "/hub/api/projects/support-attachment/chat/messages", headers=bob,
+        )
+        assert chat.status_code == 200
+        assert chat.json()["messages"][0]["attachments"] == [attachment]
+
+        downloaded = await http.get(
+            f"/hub/api/projects/support-attachment/attachments/{attachment['id']}",
+            headers=bob,
+        )
+        assert downloaded.status_code == 200
+        assert downloaded.content == "中文内容".encode()
+        assert downloaded.headers["x-content-type-options"] == "nosniff"
+        assert downloaded.headers["content-disposition"].startswith("attachment;")
+
+        replay = await http.post(
+            "/hub/api/projects/support-attachment/support-requests",
+            headers=alice,
+            json={
+                "subject": "重复附件",
+                "body_md": "不能重复发送。",
+                "mention_handles": ["bob"],
+                "attachment_ids": [attachment["id"]],
+            },
+        )
+        assert replay.status_code == 409
+        forbidden = await http.get(
+            f"/hub/api/projects/support-attachment/attachments/{attachment['id']}",
+            headers=mallory,
+        )
+        assert forbidden.status_code == 403
+
+    async with get_session() as session:
+        stored = (await session.execute(select(TeamAttachment))).scalars().one()
+        assert stored.message_id == posted.json()["message_id"]
+
+
+@pytest.mark.anyio
+async def test_team_attachment_rejects_unsafe_type_and_can_delete_pending(
+    isolated_env, monkeypatch,
+):
+    server = build_mcp_server()
+    async with Client(server) as client:
+        await _register(client, "/m3a/support-attachment-delete", "BlueLake")
+        sender_id = await _agent_id("BlueLake")
+        await _mk_membership(
+            "/m3a/support-attachment-delete", "oidc|alice", "alice", role="admin",
+            default_agent_id=sender_id,
+        )
+        async with get_session() as session:
+            routing_project = (
+                await session.execute(select(Project).where(
+                    Project.human_key == "/m3a/support-attachment-delete",
+                ))
+            ).scalars().one()
+            session.add(TeamProject(
+                slug="support-attachment-delete",
+                name="Attachment Delete Team",
+                routing_project_id=routing_project.id,
+            ))
+            await session.commit()
+
+    settings = _configure_hub_jwt(monkeypatch)
+    app = build_http_app(settings, build_mcp_server())
+    alice = _hub_headers(settings, "oidc|alice")
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as http:
+        unsafe = await http.post(
+            "/hub/api/projects/support-attachment-delete/attachments",
+            headers=alice,
+            files={"file": ("payload.html", b"<script>x</script>", "text/html")},
+        )
+        assert unsafe.status_code == 415
+
+        uploaded = await http.post(
+            "/hub/api/projects/support-attachment-delete/attachments",
+            headers=alice,
+            files={"file": ("note.txt", b"draft", "text/plain")},
+        )
+        assert uploaded.status_code == 201
+        removed = await http.delete(
+            "/hub/api/projects/support-attachment-delete/attachments/"
+            + uploaded.json()["id"],
+            headers=alice,
+        )
+        assert removed.status_code == 200
+        assert removed.json() == {"deleted": True}
+
+    async with get_session() as session:
+        assert (await session.execute(select(TeamAttachment))).scalars().all() == []
 
 
 @pytest.mark.anyio

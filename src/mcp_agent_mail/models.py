@@ -324,6 +324,31 @@ class ChannelMessage(SQLModel, table=True):
     )
 
 
+class TeamAttachment(SQLModel, table=True):
+    """Opaque Hub-hosted attachment owned by one Human and Team project."""
+
+    __tablename__ = "team_attachments"
+    __table_args__ = (
+        UniqueConstraint("token", name="uq_team_attachment_token"),
+        Index("idx_team_attachments_project_message", "project_id", "message_id"),
+        Index("idx_team_attachments_owner_created", "owner_human_id", "created_ts"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    token: str = Field(index=True, max_length=64)
+    project_id: int = Field(foreign_key="projects.id", index=True)
+    owner_human_id: int = Field(foreign_key="humans.id", index=True)
+    message_id: Optional[int] = Field(
+        default=None, foreign_key="channel_messages.id", index=True,
+    )
+    filename: str = Field(max_length=255)
+    media_type: str = Field(max_length=127)
+    size: int
+    sha256: str = Field(max_length=64)
+    storage_name: str = Field(max_length=96)
+    created_ts: datetime = Field(default_factory=_utcnow_naive)
+
+
 class ChannelReadCursor(SQLModel, table=True):
     """Per-agent read cursor for a channel (uniquely keyed by channel+agent).
 
