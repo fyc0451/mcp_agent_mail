@@ -20,7 +20,7 @@ from typing import Any, Protocol, cast
 
 import structlog
 import uvicorn
-from fastapi import FastAPI, HTTPException, Request, status
+from fastapi import FastAPI, HTTPException, Query, Request, status
 from fastapi.exception_handlers import http_exception_handler
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
@@ -2737,8 +2737,10 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
     async def hub_list_chat_messages(
         project_slug: str,
         request: Request,
+        limit: int = Query(default=80, ge=1, le=200),
+        before_id: int | None = Query(default=None, ge=1),
     ) -> JSONResponse:
-        """Return recent shared support-channel history to active members."""
+        """Return one newest-first cursor page, rendered oldest-first."""
         await ensure_schema()
         async with get_session() as session:
             human = await _hub_human(request, session=session)
@@ -2755,7 +2757,16 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             )
             channel = channel_row.scalars().first()
             if channel is None:
-                return JSONResponse({"channel": "support", "messages": [], "count": 0})
+                return JSONResponse({
+                    "channel": "support",
+                    "messages": [],
+                    "count": 0,
+                    "has_more": False,
+                    "next_before_id": None,
+                })
+            conditions = [cast(Any, ChannelMessage.channel_id) == channel.id]
+            if before_id is not None:
+                conditions.append(cast(Any, ChannelMessage.id) < before_id)
             rows = await session.execute(
                 select(ChannelMessage, Agent, Human, SessionLeadBinding)
                 .join(Agent, cast(Any, Agent.id) == ChannelMessage.sender_id)
@@ -2764,12 +2775,15 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                     SessionLeadBinding,
                     cast(Any, SessionLeadBinding.agent_id) == Agent.id,
                 )
-                .where(cast(Any, ChannelMessage.channel_id) == channel.id)
+                .where(*conditions)
                 .order_by(cast(Any, ChannelMessage.id).desc())
-                .limit(200)
+                .limit(limit + 1)
             )
+            page_rows = rows.all()
+            has_more = len(page_rows) > limit
+            page_rows = page_rows[:limit]
             items = []
-            for message, sender, sender_human, lead_binding in rows.all():
+            for message, sender, sender_human, lead_binding in page_rows:
                 body_md = message.body_md
                 mention_handles: list[str] = []
                 prefix, separator, content = body_md.partition("\n\n")
@@ -2817,7 +2831,13 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 })
             items.reverse()
             return JSONResponse(
-                {"channel": "support", "messages": items, "count": len(items)}
+                {
+                    "channel": "support",
+                    "messages": items,
+                    "count": len(items),
+                    "has_more": has_more,
+                    "next_before_id": items[0]["id"] if has_more and items else None,
+                }
             )
 
     @fastapi_app.post(

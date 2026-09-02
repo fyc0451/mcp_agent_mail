@@ -592,6 +592,81 @@ async def test_human_support_request_broadcasts_via_default_agent(
 
 
 @pytest.mark.anyio
+async def test_team_chat_messages_support_stable_cursor_pagination(
+    isolated_env, monkeypatch,
+):
+    server = build_mcp_server()
+    async with Client(server) as client:
+        await _register(client, "/m3a/paged-support", "BlueLake")
+        sender_id = await _agent_id("BlueLake")
+        await _mk_membership(
+            "/m3a/paged-support", "oidc|alice", "alice", role="admin",
+            default_agent_id=sender_id,
+        )
+        await _mk_membership("/m3a/paged-support", "oidc|bob", "bob")
+        async with get_session() as session:
+            routing_project = (
+                await session.execute(
+                    select(Project).where(
+                        Project.human_key == "/m3a/paged-support",
+                    )
+                )
+            ).scalars().one()
+            session.add(
+                TeamProject(
+                    slug="paged-support",
+                    name="Paged Support",
+                    routing_project_id=routing_project.id,
+                )
+            )
+            await session.commit()
+
+    settings = _configure_hub_jwt(monkeypatch)
+    app = build_http_app(settings, build_mcp_server())
+    alice = _hub_headers(settings, "oidc|alice")
+    bob = _hub_headers(settings, "oidc|bob")
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as http:
+        for index in range(5):
+            posted = await http.post(
+                "/hub/api/projects/paged-support/support-requests",
+                headers=alice,
+                json={"subject": f"message-{index}", "body_md": f"body-{index}"},
+            )
+            assert posted.status_code == 201
+
+        latest = await http.get(
+            "/hub/api/projects/paged-support/chat/messages?limit=2",
+            headers=bob,
+        )
+        assert latest.status_code == 200
+        assert [row["subject"] for row in latest.json()["messages"]] == [
+            "message-3", "message-4",
+        ]
+        assert latest.json()["has_more"] is True
+        cursor = latest.json()["next_before_id"]
+
+        older = await http.get(
+            f"/hub/api/projects/paged-support/chat/messages?limit=2&before_id={cursor}",
+            headers=bob,
+        )
+        assert older.status_code == 200
+        assert [row["subject"] for row in older.json()["messages"]] == [
+            "message-1", "message-2",
+        ]
+        assert older.json()["has_more"] is True
+        assert {row["id"] for row in latest.json()["messages"]}.isdisjoint(
+            {row["id"] for row in older.json()["messages"]}
+        )
+
+        invalid = await http.get(
+            "/hub/api/projects/paged-support/chat/messages?limit=201",
+            headers=bob,
+        )
+        assert invalid.status_code == 422
+
+
+@pytest.mark.anyio
 async def test_human_support_request_can_target_member_without_sender_agent(
     isolated_env, monkeypatch,
 ):
