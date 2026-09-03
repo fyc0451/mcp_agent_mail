@@ -624,6 +624,17 @@ class SessionLeadBinding(SQLModel, table=True):
     reply_mode: str = Field(default="confirm", max_length=16)  # confirm | auto
     runtime_status: str = Field(default="unknown", max_length=16)
     runtime_seen_at: Optional[datetime] = Field(default=None, index=True)
+    # Ephemeral, capability-authenticated progress for the currently claimed
+    # Team message. It is never copied into chat history and readers ignore it
+    # after a short TTL.
+    progress_message_id: Optional[int] = Field(
+        default=None, foreign_key="channel_messages.id", index=True
+    )
+    progress_phase: Optional[str] = Field(default=None, max_length=16)
+    progress_summary: Optional[str] = Field(default=None, max_length=200)
+    progress_sequence: int = Field(default=0)
+    progress_started_at: Optional[datetime] = Field(default=None)
+    progress_seen_at: Optional[datetime] = Field(default=None, index=True)
     status: str = Field(default="active", max_length=16)  # active | unbound
     created_at: datetime = Field(default_factory=_utcnow_naive)
     updated_at: datetime = Field(default_factory=_utcnow_naive)

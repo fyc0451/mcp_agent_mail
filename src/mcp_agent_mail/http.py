@@ -3796,6 +3796,43 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         # 统一不透明: 不区分 未知 session / 已撤销 / 错 token
         return HTTPException(status_code=403, detail="Invalid reply credentials")
 
+    _TEAM_PROGRESS_PHASES = {"working", "waiting", "blocked"}
+    _TEAM_PROGRESS_UNSAFE_RE = re.compile(
+        r"(?:https?://|`|(?:^|\s)(?:ssh|sudo|curl|wget)\s|"
+        r"/(?:home|Users|root|etc|var|opt|mnt)/|"
+        r"\b(?:password|passwd|secret|token|api[_ -]?key|authorization)\b|"
+        r"(?:密码|密钥|令牌|凭据)|"
+        r"\b[A-Za-z_][A-Za-z0-9_]{2,}=\S+|"
+        r"\b(?:\d{1,3}\.){3}\d{1,3}\b|"
+        r"[A-Fa-f0-9]{32,}|[A-Za-z0-9_-]{48,})",
+        re.IGNORECASE,
+    )
+
+    def _safe_team_progress_summary(value: Any) -> str | None:
+        """Keep only a short user-facing sentence; fail closed on secrets/paths."""
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise HTTPException(status_code=400, detail="Invalid progress summary")
+        summary = re.sub(r"\s+", " ", value).strip()
+        if not summary:
+            return None
+        if (
+            len(summary) > 160
+            or any(ord(char) < 32 for char in summary)
+            or _TEAM_PROGRESS_UNSAFE_RE.search(summary)
+        ):
+            return None
+        return summary
+
+    def _clear_team_progress(binding: SessionLeadBinding) -> None:
+        binding.progress_message_id = None
+        binding.progress_phase = None
+        binding.progress_summary = None
+        binding.progress_sequence = 0
+        binding.progress_started_at = None
+        binding.progress_seen_at = None
+
     def _session_lead_credentials(body: dict[str, Any]) -> tuple[str, str]:
         raw_session_id = body.get("client_session_id")
         client_session_id = (
@@ -3865,10 +3902,11 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
         """Record a binding-scoped runtime heartbeat for the safe team roster."""
         await ensure_schema()
         body = await _hub_json_body(request)
-        if set(body) != {"client_session_id", "reply_token", "status"}:
+        required = {"client_session_id", "reply_token", "status"}
+        if not required.issubset(body) or not set(body).issubset(required | {"progress"}):
             raise HTTPException(
                 status_code=400,
-                detail="client_session_id, reply_token and status are required",
+                detail="client_session_id, reply_token and status are required; progress is optional",
             )
         client_session_id, reply_token = _session_lead_credentials(body)
         runtime_status = body.get("status")
@@ -3887,6 +3925,62 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             binding.runtime_status = cast(str, runtime_status)
             binding.runtime_seen_at = now
             binding.updated_at = now
+            if "progress" in body:
+                progress = body.get("progress")
+                if progress is None:
+                    _clear_team_progress(binding)
+                else:
+                    if not isinstance(progress, dict) or set(progress) != {
+                        "inbox_item_id", "phase", "summary", "sequence", "started_at"
+                    }:
+                        raise HTTPException(status_code=400, detail="Invalid progress payload")
+                    inbox_item_id = progress.get("inbox_item_id")
+                    sequence = progress.get("sequence")
+                    phase = progress.get("phase")
+                    started_at = progress.get("started_at")
+                    if (
+                        isinstance(inbox_item_id, bool)
+                        or not isinstance(inbox_item_id, int)
+                        or inbox_item_id < 1
+                        or isinstance(sequence, bool)
+                        or not isinstance(sequence, int)
+                        or not 1 <= sequence <= 2_147_483_647
+                        or phase not in _TEAM_PROGRESS_PHASES
+                        or isinstance(started_at, bool)
+                        or not isinstance(started_at, (int, float))
+                        or not now.replace(tzinfo=timezone.utc).timestamp() - 86_400
+                        <= float(started_at)
+                        <= now.replace(tzinfo=timezone.utc).timestamp() + 5
+                    ):
+                        raise HTTPException(status_code=400, detail="Invalid progress payload")
+                    item = await session.get(HumanInboxItem, inbox_item_id)
+                    if (
+                        item is None
+                        or item.project_id != _project.id
+                        or item.human_id != binding.human_id
+                        or item.kind != "session_lead"
+                        or item.claim_binding_id != binding.id
+                        or item.completed_at is not None
+                        or item.claim_expires_at is None
+                        or item.claim_expires_at <= now
+                        or item.source_channel_message_id is None
+                    ):
+                        raise HTTPException(status_code=409, detail="Progress claim is unavailable")
+                    if (
+                        binding.progress_message_id == item.source_channel_message_id
+                        and sequence < binding.progress_sequence
+                    ):
+                        raise HTTPException(status_code=409, detail="Progress sequence is stale")
+                    binding.progress_message_id = item.source_channel_message_id
+                    binding.progress_phase = cast(str, phase)
+                    binding.progress_summary = _safe_team_progress_summary(
+                        progress.get("summary")
+                    )
+                    binding.progress_sequence = sequence
+                    binding.progress_started_at = datetime.fromtimestamp(
+                        float(started_at), tz=timezone.utc
+                    ).replace(tzinfo=None)
+                    binding.progress_seen_at = now
             sender.last_active_ts = now
             session.add(binding)
             session.add(sender)
@@ -3895,6 +3989,51 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                 "status": binding.runtime_status,
                 "last_seen_at": _hub_presence_timestamp(binding.runtime_seen_at),
             })
+
+    @fastapi_app.get(
+        "/hub/api/projects/{project_slug}/progress",
+        response_class=JSONResponse,
+    )
+    async def hub_team_progress(project_slug: str, request: Request) -> JSONResponse:
+        """Return fresh, non-durable progress overlays to active team members."""
+        await ensure_schema()
+        async with get_session() as session:
+            team_project = await _hub_team_project(project_slug, session=session)
+            human = await _hub_human(request, session=session)
+            project = await session.get(Project, team_project.routing_project_id)
+            if project is None or project.archived_at is not None:
+                raise HTTPException(status_code=404, detail="Project not found")
+            await _hub_active_membership(project, human, session=session)
+            cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(
+                seconds=_SESSION_LEAD_RUNTIME_TTL_SECONDS
+            )
+            rows = (
+                await session.execute(
+                    select(SessionLeadBinding).where(
+                        cast(Any, SessionLeadBinding.team_project_id) == team_project.id,
+                        cast(Any, SessionLeadBinding.status) == "active",
+                        cast(Any, SessionLeadBinding.progress_message_id).is_not(None),
+                        cast(Any, SessionLeadBinding.progress_seen_at) >= cutoff,
+                    )
+                )
+            ).scalars().all()
+            progress_rows: list[dict[str, Any]] = []
+            for binding in rows:
+                membership = await _hub_membership(
+                    project.id, binding.human_id, session=session
+                )
+                if membership is None or membership.status != "active":
+                    continue
+                progress_rows.append({
+                    "message_id": binding.progress_message_id,
+                    "agent_name": binding.lead_label or None,
+                    "phase": binding.progress_phase,
+                    "summary": binding.progress_summary,
+                    "sequence": binding.progress_sequence,
+                    "started_at": _hub_presence_timestamp(binding.progress_started_at),
+                    "updated_at": _hub_presence_timestamp(binding.progress_seen_at),
+                })
+            return JSONResponse({"progress": progress_rows})
 
     @fastapi_app.post(
         "/hub/api/projects/{project_slug}/session-lead/reply",
@@ -4607,7 +4746,10 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             if item.claim_expires_at is None or item.claim_expires_at <= now:
                 raise HTTPException(status_code=409, detail="Inbox claim has expired")
             item.completed_at = now
+            if binding.progress_message_id == item.source_channel_message_id:
+                _clear_team_progress(binding)
             session.add(item)
+            session.add(binding)
             await session.commit()
             return JSONResponse(
                 {"status": "completed", "inbox_item_id": item.id}

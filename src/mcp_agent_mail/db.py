@@ -949,6 +949,13 @@ def _setup_fts(connection: Any) -> None:
         # Team roster: capability-authenticated minimal local runtime status.
         "ALTER TABLE session_lead_bindings ADD COLUMN runtime_status VARCHAR(16) DEFAULT 'unknown'",
         "ALTER TABLE session_lead_bindings ADD COLUMN runtime_seen_at DATETIME DEFAULT NULL",
+        # Team progress is an expiring operational overlay, never chat history.
+        "ALTER TABLE session_lead_bindings ADD COLUMN progress_message_id INTEGER DEFAULT NULL",
+        "ALTER TABLE session_lead_bindings ADD COLUMN progress_phase VARCHAR(16) DEFAULT NULL",
+        "ALTER TABLE session_lead_bindings ADD COLUMN progress_summary VARCHAR(200) DEFAULT NULL",
+        "ALTER TABLE session_lead_bindings ADD COLUMN progress_sequence INTEGER DEFAULT 0",
+        "ALTER TABLE session_lead_bindings ADD COLUMN progress_started_at DATETIME DEFAULT NULL",
+        "ALTER TABLE session_lead_bindings ADD COLUMN progress_seen_at DATETIME DEFAULT NULL",
         # M4 capability-scoped inbox claim lifecycle.
         "ALTER TABLE human_inbox_items ADD COLUMN claim_binding_id INTEGER DEFAULT NULL",
         "ALTER TABLE human_inbox_items ADD COLUMN claim_token_hash VARCHAR(64) DEFAULT NULL",
@@ -981,6 +988,10 @@ def _setup_fts(connection: Any) -> None:
         "ON human_inbox_items (reply_decision)",
         "CREATE INDEX IF NOT EXISTS ix_session_lead_bindings_runtime_seen_at "
         "ON session_lead_bindings (runtime_seen_at)",
+        "CREATE INDEX IF NOT EXISTS ix_session_lead_bindings_progress_message_id "
+        "ON session_lead_bindings (progress_message_id)",
+        "CREATE INDEX IF NOT EXISTS ix_session_lead_bindings_progress_seen_at "
+        "ON session_lead_bindings (progress_seen_at)",
     ]:
         connection.exec_driver_sql(index_sql)
 

@@ -13,6 +13,7 @@ Acceptance:
 from __future__ import annotations
 
 import asyncio
+import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -512,6 +513,87 @@ async def test_confirm_authorizes_before_claim_reply_and_complete(hub):
         assert claimed["message"]["inbox_item_id"] == inbox_item_id
         claim_token = claimed["claim_token"]
 
+        progress_payload = {
+            "client_session_id": "alice-1",
+            "reply_token": alice_token,
+            "status": "working",
+            "progress": {
+                "inbox_item_id": inbox_item_id,
+                "phase": "working",
+                "summary": "正在核对输入数据并准备安全的处理结果。",
+                "sequence": 1,
+                "started_at": time.time(),
+            },
+        }
+        progress_status = await client.post(
+            "/hub/api/projects/core/session-lead/status", json=progress_payload,
+        )
+        assert progress_status.status_code == 200, progress_status.text
+        visible_progress = await client.get(
+            "/hub/api/projects/core/progress", headers=bob,
+        )
+        assert visible_progress.status_code == 200
+        assert visible_progress.json()["progress"] == [{
+            "message_id": incoming.json()["message_id"],
+            "agent_name": "codex-main",
+            "phase": "working",
+            "summary": "正在核对输入数据并准备安全的处理结果。",
+            "sequence": 1,
+            "started_at": visible_progress.json()["progress"][0]["started_at"],
+            "updated_at": visible_progress.json()["progress"][0]["updated_at"],
+        }]
+
+        # Defense in depth: a pane adapter mistake must not publish secrets or paths.
+        unsafe = await client.post(
+            "/hub/api/projects/core/session-lead/status",
+            json={
+                **progress_payload,
+                "progress": {
+                    **progress_payload["progress"],
+                    "summary": "读取 /home/alice/.env token=super-secret-value",
+                    "sequence": 2,
+                },
+            },
+        )
+        assert unsafe.status_code == 200
+        sanitized = await client.get("/hub/api/projects/core/progress", headers=root)
+        assert sanitized.json()["progress"][0]["summary"] is None
+
+        # Progress is an ephemeral overlay. A silent worker must disappear rather
+        # than leave a stale "working" state in the Team timeline.
+        async with get_session() as session:
+            binding = (
+                await session.execute(
+                    select(SessionLeadBinding).where(
+                        SessionLeadBinding.client_session_id == "alice-1"
+                    )
+                )
+            ).scalars().one()
+            binding.progress_seen_at = (
+                datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=16)
+            )
+            session.add(binding)
+            await session.commit()
+        expired = await client.get("/hub/api/projects/core/progress", headers=bob)
+        assert expired.json() == {"progress": []}
+
+        refreshed = await client.post(
+            "/hub/api/projects/core/session-lead/status",
+            json={
+                **progress_payload,
+                "progress": {
+                    **progress_payload["progress"],
+                    "summary": "正在整理可公开展示的处理结果。",
+                    "sequence": 3,
+                },
+            },
+        )
+        assert refreshed.status_code == 200
+        stale_sequence = await client.post(
+            "/hub/api/projects/core/session-lead/status", json=progress_payload,
+        )
+        assert stale_sequence.status_code == 409
+
         retired_draft = await client.post(
             "/hub/api/projects/core/session-lead/reply-drafts",
             json={
@@ -583,6 +665,10 @@ async def test_confirm_authorizes_before_claim_reply_and_complete(hub):
         )
         assert completed.status_code == 200
         assert completed.json()["status"] == "completed"
+        cleared_progress = await client.get(
+            "/hub/api/projects/core/progress", headers=bob,
+        )
+        assert cleared_progress.json() == {"progress": []}
         completed_again = await client.post(
             f"/hub/api/projects/core/session-lead/inbox/{inbox_item_id}/complete",
             json={
