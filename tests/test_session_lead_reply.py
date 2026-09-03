@@ -543,6 +543,15 @@ async def test_confirm_authorizes_before_claim_reply_and_complete(hub):
             "updated_at": visible_progress.json()["progress"][0]["updated_at"],
         }]
 
+        invalid_phase = await client.post(
+            "/hub/api/projects/core/session-lead/status",
+            json={
+                **progress_payload,
+                "progress": {**progress_payload["progress"], "phase": ["working"]},
+            },
+        )
+        assert invalid_phase.status_code == 400
+
         # Defense in depth: a pane adapter mistake must not publish secrets or paths.
         unsafe = await client.post(
             "/hub/api/projects/core/session-lead/status",
@@ -558,6 +567,28 @@ async def test_confirm_authorizes_before_claim_reply_and_complete(hub):
         assert unsafe.status_code == 200
         sanitized = await client.get("/hub/api/projects/core/progress", headers=root)
         assert sanitized.json()["progress"][0]["summary"] is None
+
+        for sequence, secret_summary in enumerate((
+            "配置 AKIAIOSFODNN7EXAMPLE 到环境变量",
+            "使用 eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTYifQ.signaturevalue 登录",
+            "运行 npm test 并读取 src/mcp_agent_mail/http.py",
+        ), start=3):
+            secret_result = await client.post(
+                "/hub/api/projects/core/session-lead/status",
+                json={
+                    **progress_payload,
+                    "progress": {
+                        **progress_payload["progress"],
+                        "summary": secret_summary,
+                        "sequence": sequence,
+                    },
+                },
+            )
+            assert secret_result.status_code == 200
+            secret_visible = await client.get(
+                "/hub/api/projects/core/progress", headers=root,
+            )
+            assert secret_visible.json()["progress"][0]["summary"] is None
 
         # Progress is an ephemeral overlay. A silent worker must disappear rather
         # than leave a stale "working" state in the Team timeline.
@@ -584,11 +615,47 @@ async def test_confirm_authorizes_before_claim_reply_and_complete(hub):
                 "progress": {
                     **progress_payload["progress"],
                     "summary": "正在整理可公开展示的处理结果。",
-                    "sequence": 3,
+                    "sequence": 6,
                 },
             },
         )
         assert refreshed.status_code == 200
+
+        # A progress conflict must not roll back the roster heartbeat.
+        async with get_session() as session:
+            item = await session.get(HumanInboxItem, inbox_item_id)
+            assert item is not None
+            item.claim_expires_at = (
+                datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=1)
+            )
+            session.add(item)
+            await session.commit()
+        expired_claim = await client.post(
+            "/hub/api/projects/core/session-lead/status",
+            json={
+                **progress_payload,
+                "status": "blocked",
+                "progress": {**progress_payload["progress"], "sequence": 7},
+            },
+        )
+        assert expired_claim.status_code == 409
+        async with get_session() as session:
+            binding = (
+                await session.execute(
+                    select(SessionLeadBinding).where(
+                        SessionLeadBinding.client_session_id == "alice-1"
+                    )
+                )
+            ).scalars().one()
+            assert binding.runtime_status == "blocked"
+            assert binding.runtime_seen_at is not None
+            item = await session.get(HumanInboxItem, inbox_item_id)
+            assert item is not None
+            item.claim_expires_at = (
+                datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(minutes=5)
+            )
+            session.add(item)
+            await session.commit()
         stale_sequence = await client.post(
             "/hub/api/projects/core/session-lead/status", json=progress_payload,
         )

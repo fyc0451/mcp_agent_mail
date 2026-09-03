@@ -3798,12 +3798,19 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
 
     _TEAM_PROGRESS_PHASES = {"working", "waiting", "blocked"}
     _TEAM_PROGRESS_UNSAFE_RE = re.compile(
-        r"(?:https?://|`|(?:^|\s)(?:ssh|sudo|curl|wget)\s|"
+        r"(?:https?://|`|(?:^|\s)(?:ssh|sudo|curl|wget|git|python\d*|"
+        r"npm|npx|pnpm|yarn|node|docker|podman|kubectl|rm|cp|mv|cat|sed|"
+        r"awk|rg|grep|find|bash|sh|zsh)\s|"
         r"/(?:home|Users|root|etc|var|opt|mnt)/|"
+        r"(?:^|\s)(?:\.{0,2}/)?(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+|"
         r"\b(?:password|passwd|secret|token|api[_ -]?key|authorization)\b|"
         r"(?:密码|密钥|令牌|凭据)|"
         r"\b[A-Za-z_][A-Za-z0-9_]{2,}=\S+|"
         r"\b(?:\d{1,3}\.){3}\d{1,3}\b|"
+        r"\b(?:A3T[A-Z0-9]|AKIA|ASIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ASCA)"
+        r"[A-Z0-9]{16}\b|"
+        r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b|"
+        r"\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\b|"
         r"[A-Fa-f0-9]{32,}|[A-Za-z0-9_-]{48,})",
         re.IGNORECASE,
     )
@@ -3925,6 +3932,13 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
             binding.runtime_status = cast(str, runtime_status)
             binding.runtime_seen_at = now
             binding.updated_at = now
+
+            async def commit_runtime_status() -> None:
+                sender.last_active_ts = now
+                session.add(binding)
+                session.add(sender)
+                await session.commit()
+
             if "progress" in body:
                 progress = body.get("progress")
                 if progress is None:
@@ -3945,6 +3959,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                         or isinstance(sequence, bool)
                         or not isinstance(sequence, int)
                         or not 1 <= sequence <= 2_147_483_647
+                        or not isinstance(phase, str)
                         or phase not in _TEAM_PROGRESS_PHASES
                         or isinstance(started_at, bool)
                         or not isinstance(started_at, (int, float))
@@ -3965,11 +3980,13 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                         or item.claim_expires_at <= now
                         or item.source_channel_message_id is None
                     ):
+                        await commit_runtime_status()
                         raise HTTPException(status_code=409, detail="Progress claim is unavailable")
                     if (
                         binding.progress_message_id == item.source_channel_message_id
                         and sequence < binding.progress_sequence
                     ):
+                        await commit_runtime_status()
                         raise HTTPException(status_code=409, detail="Progress sequence is stale")
                     binding.progress_message_id = item.source_channel_message_id
                     binding.progress_phase = cast(str, phase)
@@ -3981,10 +3998,7 @@ def build_http_app(settings: Settings, server=None) -> FastAPI:
                         float(started_at), tz=timezone.utc
                     ).replace(tzinfo=None)
                     binding.progress_seen_at = now
-            sender.last_active_ts = now
-            session.add(binding)
-            session.add(sender)
-            await session.commit()
+            await commit_runtime_status()
             return JSONResponse({
                 "status": binding.runtime_status,
                 "last_seen_at": _hub_presence_timestamp(binding.runtime_seen_at),
